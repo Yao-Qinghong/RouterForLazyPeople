@@ -764,6 +764,13 @@ def cmd_service(args):
         sys.exit(1)
 
 
+def _print_service_next_steps():
+    """Show the shortest useful post-install path for people who skip the README."""
+    print("  Next steps:")
+    print("    ./router-start status   # confirm backends/models are visible")
+    print("    ./router-start bench    # run once to measure speed and improve routing")
+
+
 # ── macOS — launchd ───────────────────────────────────────────
 
 _LAUNCHD_LABEL = "com.llm-router"
@@ -813,6 +820,7 @@ def _service_macos(action: str):
             print(f"  On this machine  : http://localhost:{port}/v1")
             print(f"  From another PC  : http://{lan}:{port}/v1")
             print(f"  Logs: {log_out}")
+            _print_service_next_steps()
             print(f"  To remove: ./router-start service uninstall")
         else:
             print(f"launchctl load failed: {result.stderr.strip()}")
@@ -883,6 +891,7 @@ WantedBy=default.target
         print(f"  From another PC  : http://{lan}:{port}/v1")
         print(f"  Logs: journalctl --user -u {_SYSTEMD_UNIT} -f")
         _warn_firewall(port, lan)
+        _print_service_next_steps()
         print(f"  To remove: ./router-start service uninstall")
 
     elif action == "uninstall":
