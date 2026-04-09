@@ -437,6 +437,81 @@ def cmd_stop(args):
     _kill_port(port)
 
 
+def _status_bench_label(info: dict) -> str:
+    tg = info.get("bench_tg_tok_s")
+    pp = info.get("bench_pp_tok_s")
+    if tg is None and pp is None:
+        return "not benchmarked"
+
+    parts = []
+    if tg is not None:
+        parts.append(f"TG {tg:g} tok/s")
+    if pp is not None:
+        parts.append(f"PP {pp:g} tok/s")
+    if info.get("bench_tier_measured"):
+        parts.append(f"measured tier {info['bench_tier_measured']}")
+    if info.get("bench_mismatch"):
+        parts.append("tier mismatch")
+    return " | ".join(parts)
+
+
+def _print_empty_status():
+    print("Router is reachable, but no backends/models are registered.")
+    print()
+    print("Next checks:")
+    print("  ./router-start sysinfo")
+    print("  open http://localhost:9001/v1/models")
+    print("  edit config/settings.yaml scan_dirs, then run ./router-start rescan")
+
+
+def _print_status(data: dict):
+    if not data:
+        _print_empty_status()
+        return
+
+    running_count = sum(1 for info in data.values() if info.get("running"))
+    measured_count = sum(1 for info in data.values() if info.get("bench_tg_tok_s") is not None)
+    print(f"Router: {_router_url()}")
+    print(f"Registered backends: {len(data)} | running: {running_count} | benchmarked: {measured_count}")
+    print()
+
+    print(f"{'Tier':<6} {'Run':<3} {'Engine':<10} {'Port':<5} Backend key")
+    print(f"{'-' * 6} {'-' * 3} {'-' * 10} {'-' * 5} {'-' * 42}")
+
+    # Group by tier for clarity
+    tier_order = ["fast", "mid", "deep", None]
+    by_tier: dict = {t: [] for t in tier_order}
+    for key, info in data.items():
+        tier = info.get("tier")
+        by_tier.setdefault(tier, []).append((key, info))
+
+    for tier in tier_order:
+        entries = sorted(by_tier.get(tier, []))
+        if not entries:
+            continue
+        tier_label = tier or "—"
+        for key, info in entries:
+            running = "yes" if info.get("running") else "no"
+            engine = info.get("engine", "")
+            port = info.get("port", "")
+            desc = info.get("description", key)
+            print(f"{tier_label:<6} {running:<3} {_shorten(engine, 10):<10} {str(port):<5} {key}")
+            print(f"{'':6} {'':3} {'Model':<10} {'':5} {_shorten(desc, 92)}")
+            print(f"{'':6} {'':3} {'Bench':<10} {'':5} {_status_bench_label(info)}")
+        print()
+
+    if running_count:
+        print("Benchmark currently running backend(s):")
+        print("  ./router-start bench")
+    else:
+        print("No model backend is running. That is OK: the router lazy-loads one model per request.")
+        print("DGX Spark safe benchmark:")
+        print("  ./router-start bench --backend <backend-key> --start-stopped")
+
+    print()
+    print("If the list is wrong: edit config/settings.yaml scan_dirs, then run ./router-start rescan")
+
+
 def cmd_status(args):
     import urllib.request, urllib.error
     try:
@@ -446,31 +521,7 @@ def cmd_status(args):
         print(f"Router not reachable: {e}")
         sys.exit(1)
 
-    # Group by tier for clarity
-    tier_order = ["fast", "mid", "deep", None]
-    by_tier: dict = {t: [] for t in tier_order}
-    for key, info in data.items():
-        tier = info.get("tier")
-        by_tier.setdefault(tier, []).append((key, info))
-
-    print(f"{'Tier':<6} {'Backend':<22} {'Model / Description':<38} {'Running':<8} {'Engine'}")
-    print("─" * 90)
-
-    for tier in tier_order:
-        entries = by_tier.get(tier, [])
-        if not entries:
-            continue
-        tier_label = tier or "—"
-        for key, info in entries:
-            running = "yes" if info["running"] else "no "
-            desc    = info.get("description", key)[:38]
-            engine  = info.get("engine", "")
-            print(f"{tier_label:<6} {key:<22} {desc:<38} {running:<8} {engine}")
-        print()
-
-    print("Tier ranking criteria (size on disk):")
-    print("  fast = small models  |  mid = medium  |  deep = large")
-    print("  Adjust thresholds in config/settings.yaml → tier_thresholds_gb")
+    _print_status(data)
 
 
 def cmd_benchmark(args):

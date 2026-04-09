@@ -40,6 +40,30 @@ class TestLlamaBuildConfig:
 
 
 class TestUpdateAndSysinfo:
+    def test_status_print_keeps_long_backend_key_copyable(self, capsys):
+        long_key = "hf-nvidia-nvidia-nemotron-3-super-1-b6f6"
+        cli._print_status({
+            long_key: {
+                "tier": "mid",
+                "running": False,
+                "engine": "vllm",
+                "port": 8123,
+                "description": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B long description",
+                "bench_tg_tok_s": 12.5,
+                "bench_pp_tok_s": 222.0,
+                "bench_tier_measured": "mid",
+            },
+        })
+
+        out = capsys.readouterr().out
+        assert "Registered backends: 1 | running: 0 | benchmarked: 1" in out
+        assert f"8123  {long_key}" in out
+        assert "Model" in out
+        assert "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B" in out
+        assert "Bench" in out
+        assert "TG 12.5 tok/s" in out
+        assert "./router-start bench --backend <backend-key> --start-stopped" in out
+
     def test_bench_plan_prints_backend_table(self, capsys):
         backends = {
             "qwen3-5-35b-a3b-ud-q4-k-xl": {
