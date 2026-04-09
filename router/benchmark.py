@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 router/benchmark.py — Backend speed benchmarking
 

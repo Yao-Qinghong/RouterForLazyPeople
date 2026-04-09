@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 router/discovery.py — Model auto-discovery
 

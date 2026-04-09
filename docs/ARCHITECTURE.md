@@ -14,6 +14,7 @@ It describes module responsibilities, startup flow, routing flow, and configurat
 - `router/anthropic_compat.py`: Anthropic-to-OpenAI translation and reverse response adaptation
 - `router/gemini_compat.py`: Gemini-to-OpenAI translation and reverse response adaptation
 - `router/metrics.py`: in-memory request ring buffer plus persisted metrics history
+- `router/benchmark.py`: active PP/TG speed measurement, benchmark-cache persistence, and CLI summary formatting
 - `router/sysinfo.py`: platform, GPU, CUDA, engine version, and port-conflict diagnostics
 
 ## Startup Flow
@@ -21,20 +22,23 @@ It describes module responsibilities, startup flow, routing flow, and configurat
 1. `create_app()` loads the active settings file and the matching backends file.
 2. Logging is configured.
 3. The backend registry is built from manual config plus auto-discovery.
-4. `BackendManager`, `MetricsStore`, and the proxy semaphore are initialized.
-5. System diagnostics are captured and stored on `app.state`.
-6. Background tasks start for idle eviction and metrics flushing.
-7. Optional preload starts configured backends asynchronously.
+4. Cached benchmark results are loaded and passed to the routing classifier.
+5. `BackendManager`, `MetricsStore`, and the proxy semaphore are initialized.
+6. System diagnostics are captured and stored on `app.state`.
+7. Background tasks start for idle eviction and metrics flushing.
+8. Optional preload starts configured backends asynchronously.
 
 ## Request Routing
 
 1. A compatibility layer translates non-OpenAI payloads into an OpenAI-like shape when needed.
 2. The router resolves the backend using query param, alias, route prefix, and classifier precedence.
-3. Backpressure is applied through a shared semaphore.
-4. `BackendManager.ensure_running()` lazily starts the target backend if needed.
-5. The request is proxied to the local backend.
-6. Metrics and optional audit events are recorded.
-7. Response adaptation runs for Anthropic and Gemini surfaces.
+3. Tool/function-calling requests are treated as deep-tier work unless an explicit route overrides them.
+4. When benchmark data exists, tier fallbacks prefer faster measured engines over only using static engine priority.
+5. Backpressure is applied through a shared semaphore.
+6. `BackendManager.ensure_running()` lazily starts the target backend if needed.
+7. The request is proxied to the local backend.
+8. Metrics and optional audit events are recorded.
+9. Response adaptation runs for Anthropic and Gemini surfaces.
 
 ## Backend Lifecycle
 
@@ -71,6 +75,7 @@ Other config rules:
 - Middleware is constructed at app creation time. Auth and CORS are not hot-swapped by `/reload-config`.
 - `/reload-config` only updates mutable runtime structures already held on `app.state.config`.
 - Metrics are summarized from the in-memory ring buffer and persisted to JSONL on a flush loop.
+- Benchmark results are separate from request metrics: `bench` writes cache files, and startup/rescan load those files into the classifier.
 - WebSocket chat streaming bypasses parts of the normal HTTP response path but still uses routing and lazy backend start.
 
 ## Deliberate Non-Goals

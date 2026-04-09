@@ -2,7 +2,14 @@
 
 import pytest
 from unittest.mock import MagicMock
-from router.routing import classify, _extract_content, _token_estimate, _pick, _backends_for_tier
+from router.routing import (
+    classify,
+    set_benchmark_results,
+    _backends_for_tier,
+    _extract_content,
+    _pick,
+    _token_estimate,
+)
 
 
 # ── Fixtures ──────────────────────────────────────────────────
@@ -115,6 +122,9 @@ class TestClassify:
 # ── _pick (load balancing) ────────────────────────────────────
 
 class TestPick:
+    def setup_method(self):
+        set_benchmark_results({})
+
     def test_single_backend(self):
         assert _pick(BACKENDS_BASIC, "fast") == "fast"
 
@@ -136,6 +146,18 @@ class TestPick:
         results = [_pick(backends, "fast") for _ in range(4)]
         assert "fast-1" in results
         assert "fast-2" in results
+
+    def test_prefers_faster_measured_backend(self):
+        backends = {
+            "fast-slow": {"tier": "fast", "port": 8080},
+            "fast-quick": {"tier": "fast", "port": 8081},
+        }
+        set_benchmark_results({
+            "fast-slow": {"tg_tok_s": 12.0},
+            "fast-quick": {"tg_tok_s": 55.0},
+        })
+
+        assert _pick(backends, "fast") == "fast-quick"
 
 
 # ── _backends_for_tier ────────────────────────────────────────

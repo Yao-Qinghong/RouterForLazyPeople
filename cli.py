@@ -25,6 +25,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -40,6 +41,28 @@ REQUIREMENTS = PROJECT_DIR / "requirements.txt"
 PID_FILE    = Path.home() / ".llm-router" / "router.pid"
 LOG_DIR     = Path.home() / ".llm-router" / "logs"
 ROUTER_LOG  = LOG_DIR / "router.log"
+MIN_PYTHON = (3, 10)
+
+
+def _python_version_text(version_info=None) -> str:
+    version_info = sys.version_info if version_info is None else version_info
+    return f"{version_info[0]}.{version_info[1]}.{version_info[2]}"
+
+
+def _ensure_supported_python(version_info=None):
+    """Fail before creating a venv from an interpreter the router cannot run on."""
+    version_info = sys.version_info if version_info is None else version_info
+    if version_info >= MIN_PYTHON:
+        return
+
+    required = ".".join(str(part) for part in MIN_PYTHON)
+    current = _python_version_text(version_info)
+    print(
+        f"RouterForLazyPeople requires Python {required}+; current interpreter is {current}.",
+        file=sys.stderr,
+    )
+    print("Re-run with python3.10+ or install a newer Python, then delete any old .venv.", file=sys.stderr)
+    sys.exit(2)
 
 # Read port from config if available, otherwise use default
 def _router_port() -> int:
@@ -105,6 +128,8 @@ def _lan_ip() -> str:
 
 def ensure_venv():
     """Create venv and install requirements if not already set up."""
+    _ensure_supported_python()
+
     if not VENV_DIR.exists():
         print("Creating virtual environment...")
         subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)], check=True)
@@ -130,21 +155,26 @@ def update_pip():
 # llama.cpp update
 # ─────────────────────────────────────────────────────────────
 
-def _llama_dir() -> Path | None:
-    """Try to read llama_bin from config and derive the repo dir."""
+def _llama_bin() -> Path:
+    """Read the configured llama-server binary path, even if it does not exist yet."""
     config_path = PROJECT_DIR / "config" / "settings.yaml"
     if config_path.exists():
         try:
             import yaml
             with open(config_path) as f:
                 raw = yaml.safe_load(f) or {}
-            llama_bin = Path(os.path.expanduser(raw.get("llama_bin", "~/llama.cpp/build/bin/llama-server")))
-            # Walk up to find the repo root (has a CMakeLists.txt)
-            for parent in llama_bin.parents:
-                if (parent / "CMakeLists.txt").exists():
-                    return parent
+            return Path(os.path.expanduser(raw.get("llama_bin", "~/llama.cpp/build/bin/llama-server")))
         except Exception:
             pass
+    return Path.home() / "llama.cpp" / "build" / "bin" / "llama-server"
+
+def _llama_dir() -> Path | None:
+    """Try to read llama_bin from config and derive the repo dir."""
+    llama_bin = _llama_bin()
+    # Walk up to find the repo root (has a CMakeLists.txt)
+    for parent in llama_bin.parents:
+        if (parent / "CMakeLists.txt").exists():
+            return parent
     default = Path.home() / "llama.cpp"
     return default if default.exists() else None
 
@@ -175,7 +205,7 @@ def _llama_build_config() -> tuple[str, list[str]]:
 
 
 def update_llama():
-    """Pull and rebuild llama.cpp if there are new commits upstream."""
+    """Pull and rebuild llama.cpp, rolling back the checkout/binary on build failure."""
     llama_dir = _llama_dir()
     if not llama_dir or not llama_dir.exists():
         print("llama.cpp directory not found — skipping update.")
@@ -209,20 +239,43 @@ def update_llama():
         print(f"llama.cpp already up to date ({tag})")
         return
 
-    print("Pulling latest changes...")
-    subprocess.run(["git", "pull", "--quiet"], cwd=llama_dir, check=True)
-
     nproc = os.cpu_count() or 4
     build_mode, configure_cmd = _llama_build_config()
-    print(f"Rebuilding for {build_mode} (using {nproc} cores — this may take a few minutes)...")
-    subprocess.run(
-        configure_cmd,
-        cwd=llama_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    subprocess.run(
-        ["cmake", "--build", "build", "--config", "Release", f"-j{nproc}"],
-        cwd=llama_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+    llama_bin = _llama_bin()
+    backup_dir = None
+    binary_backup = None
+
+    # The Git checkout and runnable llama-server are separate. Keep a binary
+    # copy so a failed compile does not replace the user's last working server.
+    if llama_bin.exists():
+        backup_dir = Path(tempfile.mkdtemp(prefix="router-llama-update-"))
+        binary_backup = backup_dir / llama_bin.name
+        shutil.copy2(llama_bin, binary_backup)
+
+    try:
+        print("Pulling latest changes...")
+        subprocess.run(["git", "pull", "--ff-only", "--quiet"], cwd=llama_dir, check=True)
+
+        print(f"Rebuilding for {build_mode} (using {nproc} cores — this may take a few minutes)...")
+        subprocess.run(
+            configure_cmd,
+            cwd=llama_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["cmake", "--build", "build", "--config", "Release", f"-j{nproc}"],
+            cwd=llama_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError:
+        print("llama.cpp update failed — rolling source checkout back to the previous commit...")
+        subprocess.run(["git", "checkout", "--quiet", local], cwd=llama_dir, check=False)
+        if binary_backup and llama_bin.parent.exists():
+            shutil.copy2(binary_backup, llama_bin)
+            print(f"Restored previous llama-server binary: {llama_bin}")
+        print("Rollback complete. Fix the build error, then run update again.")
+        raise
+    finally:
+        if backup_dir:
+            shutil.rmtree(backup_dir, ignore_errors=True)
 
     try:
         tag = subprocess.check_output(
@@ -523,6 +576,18 @@ def cmd_bench(args):
 
         print()
         print(format_results(results))
+
+        # The router reads benchmark cache at startup and during rescan. Refresh
+        # after saving so speed-informed routing is active immediately.
+        try:
+            req = urllib.request.Request(
+                f"{_router_url()}/rescan", method="POST",
+                headers={"Content-Type": "application/json"}, data=b"{}",
+            )
+            urllib.request.urlopen(req, timeout=30).read()
+            print("\nBenchmark cache saved and router routing data refreshed.")
+        except Exception as e:
+            print(f"\nBenchmark cache saved. Run './router-start rescan' before relying on it for routing ({e}).")
 
         # Suggest fixes for mismatches
         mismatches = [r for r in results if r.get("tier_mismatch")]
@@ -848,6 +913,8 @@ def _section(title: str):
 # ─────────────────────────────────────────────────────────────
 
 def main():
+    _ensure_supported_python()
+
     parser = argparse.ArgumentParser(
         prog="python cli.py",
         description="LLM Router — local LLM proxy for lazy people",

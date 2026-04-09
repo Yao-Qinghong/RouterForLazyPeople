@@ -1,16 +1,20 @@
 #!/bin/sh
 # LLM Router — run this to start: ./router-start
-# Finds the right Python automatically (venv > python3 > python)
+# Finds the right Python automatically (venv > python3.12/3.11/3.10 > python3 > python)
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VENV_PY="${SCRIPT_DIR}/.venv/bin/python"
 if [ -x "$VENV_PY" ]; then
     PYTHON="$VENV_PY"
-elif command -v python3 > /dev/null 2>&1; then
-    PYTHON="python3"
-elif command -v python > /dev/null 2>&1; then
-    PYTHON="python"
 else
-    echo "Error: Python not found. Install python3 and try again."
-    exit 1
+    for CANDIDATE in python3.12 python3.11 python3.10 python3 python; do
+        if command -v "$CANDIDATE" > /dev/null 2>&1; then
+            PYTHON="$CANDIDATE"
+            break
+        fi
+    done
+    if [ -z "$PYTHON" ]; then
+        echo "Error: Python not found. Install Python 3.10+ and try again."
+        exit 1
+    fi
 fi
 exec "$PYTHON" "${SCRIPT_DIR}/cli.py" "$@"

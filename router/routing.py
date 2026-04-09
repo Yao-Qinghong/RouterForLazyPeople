@@ -84,10 +84,10 @@ def _backends_for_tier(backends: dict, tier: str) -> list[str]:
     return [k for k, v in backends.items() if v.get("tier") == tier]
 
 
-def _engine_score(key: str, backends: dict) -> tuple[float, int, str]:
+def _engine_score(key: str, backends: dict) -> tuple[float, int]:
     """
     Sorting key for a backend — lower is better.
-    (negative_tg_speed, engine_priority, key)
+    (negative_tg_speed, engine_priority)
 
     Backends with benchmark data are ranked by measured TG tok/s.
     Backends without benchmarks are ranked by engine priority.
@@ -100,10 +100,10 @@ def _engine_score(key: str, backends: dict) -> tuple[float, int, str]:
 
     if tg:
         # Negative so higher tok/s sorts first
-        return (-tg, priority, key)
-    else:
-        # No benchmark: use engine priority, treat speed as 0
-        return (0.0, priority, key)
+        return (-tg, priority)
+
+    # No benchmark: use engine priority, treat speed as 0
+    return (0.0, priority)
 
 
 def _pick(backends: dict, preferred: str) -> str:

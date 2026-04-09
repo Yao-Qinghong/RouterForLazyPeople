@@ -31,35 +31,57 @@ Your App (OpenAI / Anthropic SDK / OpenClaw / Open WebUI)
 
 ---
 
-## Quick Start
+## Quick Start: DGX Spark / NVIDIA Workstation
+
+Run this in a terminal on the DGX Spark. SSH is fine; the router prints a LAN URL after startup.
 
 ```bash
 git clone https://github.com/Yao-Qinghong/RouterForLazyPeople
 cd RouterForLazyPeople
-python cli.py start
+
+# Must be 3.10 or newer. The CLI refuses to build .venv on older Python.
+python3 --version
+
+# First start creates .venv, installs dependencies, scans for models, and starts the router.
+./router-start start
+
+# Success check: router is reachable and backends/models are visible.
+./router-start status
 ```
-
-On first run it creates a `.venv`, installs dependencies, and starts the router.
-
-If your models already live in a default scan directory such as `~/.lmstudio/models`, `~/models`, `~/llm-models`, `~/.cache/huggingface/hub`, or `~/trt-engines`, you can often stop here.
-
-If not, do one of these:
-- Edit `config/backends.yaml` to point `fast`, `mid`, and `deep` at specific models
-- Edit `config/settings.yaml` to add your model directories to `scan_dirs`, then run `python cli.py rescan` after startup
 
 After startup:
 - OpenAI-compatible clients: `http://localhost:9001/v1`
 - Anthropic-compatible clients: `http://localhost:9001/anthropic`
-- Model list: `http://localhost:9001/v1/models`
+- Model list in a browser: `http://localhost:9001/v1/models`
+
+If your models already live in a default scan directory such as `~/.lmstudio/models`, `~/models`, `~/llm-models`, `~/.cache/huggingface/hub`, or `~/trt-engines`, you can often stop here.
+
+If `./router-start status` works but the model list is empty:
+- Run `./router-start sysinfo` and check whether GPU / CUDA / llama.cpp were detected
+- Edit `config/settings.yaml` and add your model folders to `scan_dirs`
+- Or edit `config/backends.yaml` and point `fast`, `mid`, and `deep` at exact model files
+- Run `./router-start rescan`, then check `./router-start status` again
+
+When the model list looks right, run the speed benchmark once:
+
+```bash
+./router-start bench
+```
+
+`bench` starts each router-managed backend, measures prompt-processing / generation speed, caches the result, and refreshes router state so benchmark-informed routing can use it.
 
 ---
 
 ## Requirements
 
 - Python 3.10+
-- Linux or macOS (Windows untested)
+- Current focus: NVIDIA DGX Spark or another NVIDIA CUDA Linux machine
+- Also supported: macOS with llama.cpp/Metal; CPU-only llama.cpp for small models
+- Windows: not currently supported or tested
 - NVIDIA GPU recommended (CPU-only works for llama.cpp)
 - [llama.cpp](https://github.com/ggerganov/llama.cpp) built locally for GGUF models
+
+If you connect from a laptop to a DGX Spark, run the router on the Spark and put the printed LAN base URL into your client app. Keep `localhost` only for clients running on the same machine as the router.
 
 ---
 
@@ -110,11 +132,13 @@ The `rate_limit` section is reserved for future use and is not enforced by the r
 ## CLI
 
 ```bash
-python cli.py start              # start the router (creates venv on first run)
+./router-start start             # beginner-safe launcher; creates venv on first run
+python cli.py start              # same CLI if you already selected Python 3.10+
 python cli.py start --update     # update llama.cpp first, then start
 python cli.py stop               # stop the router
 python cli.py status             # show which backends are running
-python cli.py benchmark          # show TTFT / latency / tok/s per backend
+python cli.py bench              # measure PP/TG speed for each backend and refresh routing data
+python cli.py benchmark          # show request metrics from real router traffic
 python cli.py benchmark --export report.csv
 python cli.py sysinfo            # GPU, CUDA, CPU, engine versions, install hints
 python cli.py sysinfo --all      # include all auto-discovered models
@@ -128,6 +152,8 @@ python cli.py logs               # tail the router log
 - CUDA on systems with a usable CUDA toolchain
 - Metal on macOS
 - CPU-only everywhere else
+
+llama.cpp updates are transactional: if the pull/build fails, the CLI checks the source tree back out to the previous commit and restores the previous `llama-server` binary when one existed.
 
 ## More Docs
 
@@ -257,9 +283,10 @@ The most commonly used endpoints are:
 | `GET` | `/v1/models` | OpenAI-compatible model list |
 | `GET` | `/v1/models/{model_id}` | OpenAI-compatible model detail |
 | `GET` | `/engines` | Installed engine availability |
-| `GET` | `/metrics` | Benchmark stats (TTFT, latency, tok/s per backend) |
+| `GET` | `/metrics` | Request metrics from live router traffic |
 | `GET` | `/metrics/export` | Download full history as CSV |
 | `GET` | `/metrics/prometheus` | Prometheus text exposition |
+| `GET` | `/benchmarks` | Cached speed-test results from `bench` |
 | `GET` | `/sysinfo` | GPU, CUDA, CPU, engine versions, recommendations |
 | `POST` | `/start/{key}` | Start a backend |
 | `POST` | `/stop/{key}` | Stop a backend |

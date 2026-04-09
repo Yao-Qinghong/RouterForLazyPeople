@@ -4,16 +4,19 @@ This document is the operational spec for installation, startup, updates, suppor
 
 ## First Run
 
-Default path:
+Default DGX Spark / NVIDIA workstation path:
 
 ```bash
 git clone https://github.com/Yao-Qinghong/RouterForLazyPeople
 cd RouterForLazyPeople
-python cli.py start
+python3 --version      # must be 3.10+
+./router-start start
+./router-start status
 ```
 
 What happens on first run:
 
+- The CLI verifies that the selected Python is 3.10 or newer
 - A local `.venv` is created if missing
 - Python dependencies are installed
 - The router starts on the configured port
@@ -23,7 +26,15 @@ When manual config is needed:
 
 - Edit `config/backends.yaml` if you want fixed `fast` / `mid` / `deep` backends
 - Edit `config/settings.yaml` if your models live outside the default `scan_dirs`
-- After changing scan directories while the router is running, call `python cli.py rescan`
+- After changing scan directories while the router is running, call `./router-start rescan`
+
+After backends appear in `./router-start status`, run:
+
+```bash
+./router-start bench
+```
+
+This starts each router-managed backend, measures prompt-processing (PP) and token-generation (TG) speed, saves results under the configured data directory, then asks the live router to rescan so speed-informed routing can use the new cache immediately.
 
 ## Supported Platforms And Engines
 
@@ -40,6 +51,7 @@ When manual config is needed:
 ## Startup And Shutdown
 
 - `python cli.py start` creates `.venv` on first run, installs requirements, and launches the router.
+- `./router-start start` is the preferred beginner entrypoint; it picks the project `.venv` first and otherwise searches common Python 3.10+ executable names.
 - `python cli.py stop` stops the router process and frees its port when possible.
 - `python cli.py status` reports backend runtime state from the live router.
 - `python cli.py logs` tails the router log file.
@@ -52,6 +64,10 @@ When manual config is needed:
 
 - `python cli.py update` refreshes llama.cpp and Python dependencies.
 - `python cli.py update --restart` performs the update path and then restarts the router.
+- llama.cpp source is pulled with fast-forward-only Git semantics.
+- Before rebuilding, an existing configured `llama-server` binary is copied to a temporary backup.
+- If the pull/configure/build path fails, the CLI checks llama.cpp back out to the previous commit and restores the backed-up binary.
+- If a rollback message appears, keep running the old router, fix the CUDA/CMake/toolchain problem, then retry `python cli.py update`.
 - llama.cpp rebuild mode is chosen from the local machine:
   - CUDA when a usable CUDA toolchain is detected
   - Metal on macOS
@@ -66,6 +82,9 @@ When manual config is needed:
 ## Diagnostics And Monitoring
 
 - `python cli.py sysinfo` works against the live router when available and falls back to local detection otherwise.
+- `python cli.py bench` is an active speed test. It starts managed backends, sends fixed prompts, caches PP/TG speeds, and refreshes router routing data.
+- `python cli.py benchmark` is a passive metrics view. It reports request metrics from traffic the router has already served.
+- `GET /benchmarks` returns the cached active speed-test results.
 - `GET /metrics` provides aggregated request metrics.
 - `GET /metrics/export` exports historical metrics as CSV.
 - `GET /metrics/prometheus` exposes Prometheus-compatible metrics for scraping.

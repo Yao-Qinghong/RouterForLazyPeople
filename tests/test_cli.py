@@ -39,6 +39,18 @@ class TestLlamaBuildConfig:
 
 
 class TestUpdateAndSysinfo:
+    def test_python_guard_exits_before_creating_unsupported_venv(self, capsys):
+        try:
+            cli._ensure_supported_python((3, 9, 6))
+        except SystemExit as exc:
+            assert exc.code == 2
+        else:
+            raise AssertionError("old Python should be rejected")
+
+        err = capsys.readouterr().err
+        assert "requires Python 3.10+" in err
+        assert "delete any old .venv" in err
+
     def test_update_restart_uses_clean_start_args(self, monkeypatch):
         calls = []
 
@@ -93,3 +105,43 @@ class TestUpdateAndSysinfo:
         assert commands[0][0] == sys.executable
         assert "System Info" in out
         assert "router not running" in out.lower()
+
+    def test_llama_update_rolls_back_checkout_and_binary_on_build_failure(self, monkeypatch, tmp_path):
+        llama_dir = tmp_path / "llama.cpp"
+        llama_dir.mkdir()
+        llama_bin = llama_dir / "build" / "bin" / "llama-server"
+        llama_bin.parent.mkdir(parents=True)
+        llama_bin.write_text("old-binary")
+        run_calls = []
+
+        def fake_check_output(cmd, **kwargs):
+            if cmd == ["git", "rev-parse", "HEAD"]:
+                return "oldsha\n"
+            if cmd == ["git", "rev-parse", "@{u}"]:
+                return "newsha\n"
+            raise AssertionError(f"unexpected check_output command: {cmd}")
+
+        def fake_run(cmd, **kwargs):
+            run_calls.append(cmd)
+            if cmd == ["cmake", "--build", "build", "--config", "Release", f"-j{cli.os.cpu_count() or 4}"]:
+                llama_bin.write_text("partial-new-binary")
+                raise subprocess.CalledProcessError(1, cmd)
+            return subprocess.CompletedProcess(cmd, 0)
+
+        monkeypatch.setattr(cli, "_llama_dir", lambda: llama_dir)
+        monkeypatch.setattr(cli, "_llama_bin", lambda: llama_bin)
+        monkeypatch.setattr(cli, "_llama_build_config", lambda: ("CPU", ["cmake", "-B", "build"]))
+        monkeypatch.setattr(cli.subprocess, "check_output", fake_check_output)
+        monkeypatch.setattr(cli.subprocess, "run", fake_run)
+        monkeypatch.setattr(cli.shutil, "which", lambda name: f"/usr/bin/{name}")
+
+        try:
+            cli.update_llama()
+        except subprocess.CalledProcessError:
+            pass
+        else:
+            raise AssertionError("build failure should propagate")
+
+        assert ["git", "pull", "--ff-only", "--quiet"] in run_calls
+        assert ["git", "checkout", "--quiet", "oldsha"] in run_calls
+        assert llama_bin.read_text() == "old-binary"

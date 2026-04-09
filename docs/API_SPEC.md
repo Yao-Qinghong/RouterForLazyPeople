@@ -32,6 +32,8 @@ Automatic classification behavior:
 - Prompts above `routing.token_threshold_mid` route to the `mid` tier.
 - `routing.deep_keywords` prefer the `deep` tier.
 - `routing.mid_keywords` prefer the `mid` tier.
+- Tool/function-calling requests prefer the `deep` tier.
+- Cached `bench` results are used to prefer faster measured backends when the router must choose among compatible fallbacks.
 - Everything else falls back to `fast`.
 - If a tier is missing, routing falls back to any available backend.
 
@@ -50,6 +52,7 @@ Automatic classification behavior:
   - `GET /metrics`
   - `GET /metrics/export`
   - `GET /metrics/prometheus`
+  - `GET /benchmarks`
 - Inference routes require `inference` or `all` scope.
 - Admin/control routes require `admin` or `all` scope.
 
@@ -67,6 +70,7 @@ Automatic classification behavior:
 | `GET` | `/metrics` | Aggregated request metrics |
 | `GET` | `/metrics/export` | CSV export of metrics history |
 | `GET` | `/metrics/prometheus` | Prometheus exposition format |
+| `GET` | `/benchmarks` | Cached PP/TG speed benchmark results written by `python cli.py bench` |
 | `POST` | `/start/{key}` | Start a backend |
 | `POST` | `/stop/{key}` | Stop a backend |
 | `POST` | `/restart/{key}` | Restart a backend |
@@ -87,6 +91,8 @@ Automatic classification behavior:
 
 - `POST /reload-config` reloads mutable runtime settings only. It does not rebuild middleware or mutate already-running backend process flags in place.
 - `POST /rescan` preserves already-running processes while updating the backend registry.
+- `POST /rescan` also refreshes the cached benchmark data used by automatic routing.
+- `GET /benchmarks` returns cached active speed-test results. Request-traffic metrics stay under `/metrics`.
 - `POST /v1/{path}` is the generic catch-all for OpenAI-compatible inference paths not exposed as dedicated route helpers.
 - `GET /v1/models` includes configured aliases when they resolve to a registered backend.
 
