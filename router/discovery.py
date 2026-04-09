@@ -76,7 +76,53 @@ def _slug(name: str, path: str) -> str:
     return slug
 
 
-def _classify_tier(size_gb: float, config: "AppConfig") -> str:
+def _moe_active_params(name: str) -> float | None:
+    """
+    Extract the active (routed) parameter count from a MoE model name.
+    Returns None if the model is not recognisably MoE.
+
+    Patterns handled:
+      35B-A3B   → 3.0   (Qwen MoE format: total-Aactive)
+      122B-A10B → 10.0
+      8x7B      → 7.0   (Mixtral format: experts x params_per_expert)
+      8x22B     → 22.0
+    """
+    # Qwen / DeepSeek style: <total>B-A<active>B
+    m = re.search(r'\d+(?:\.\d+)?[Bb]-[Aa](\d+(?:\.\d+)?)[Bb]', name)
+    if m:
+        return float(m.group(1))
+    # Mixtral style: <n>x<size>B  (one expert active per token)
+    m = re.search(r'\d+x(\d+(?:\.\d+)?)[Bb]', name)
+    if m:
+        return float(m.group(1))
+    return None
+
+
+def _classify_tier(size_gb: float, config: "AppConfig", name: str = "") -> str:
+    """
+    Classify a model into fast / mid / deep.
+
+    MoE models are classified by their *active* parameter count, not total
+    file size — a 35B-A3B MoE activates only ~3B params and is as fast as
+    a dense 3B model.
+
+    Dense models fall back to file-size thresholds (configurable in
+    settings.yaml → tier_thresholds_gb).
+
+    MoE active-param thresholds (not yet configurable — sensible defaults):
+      < 7B active  → fast
+      7–20B active → mid
+      > 20B active → deep
+    """
+    active = _moe_active_params(name)
+    if active is not None:
+        if active < 7:
+            return "fast"
+        elif active < 20:
+            return "mid"
+        return "deep"
+
+    # Dense model — use file size as proxy for parameter count
     if size_gb < config.tier_thresholds.fast:
         return "fast"
     elif size_gb < config.tier_thresholds.mid:
@@ -186,7 +232,12 @@ def discover_gguf_models(config: "AppConfig", port_counter: list[int]) -> dict:
 
                 name = _model_name_from_path(full_path)
                 slug = _slug(name, full_path)
-                tier = _classify_tier(size_gb, config)
+                tier = _classify_tier(size_gb, config, name)
+                active = _moe_active_params(name)
+                if active is not None:
+                    tier_reason = f"MoE, {active:.0f}B active"
+                else:
+                    tier_reason = f"{size_gb:.1f} GB"
 
                 discovered[slug] = {
                     "engine":        ENGINE_LLAMA,
@@ -199,7 +250,7 @@ def discover_gguf_models(config: "AppConfig", port_counter: list[int]) -> dict:
                     "reasoning":     _has_reasoning_kw(name),
                     "idle_timeout":  _estimate_idle(tier, config),
                     "startup_wait":  _estimate_startup(size_gb),
-                    "description":   f"{name} ({size_gb:.1f} GB) [gguf, auto]",
+                    "description":   f"{name} ({tier_reason})",
                     "auto_discovered": True,
                     "tier":          tier,
                     "size_gb":       round(size_gb, 2),
@@ -271,7 +322,7 @@ def discover_hf_models(config: "AppConfig", port_counter: list[int]) -> dict:
                         break
 
             slug = _slug(f"hf-{dir_name}", path)
-            tier = _classify_tier(size_gb, config)
+            tier = _classify_tier(size_gb, config, dir_name)
 
             discovered[slug] = {
                 "engine":              preferred_engine,
@@ -438,7 +489,23 @@ def _guess_engine_label(port: int) -> str:
 
 
 def _tier_from_model_name(name: str) -> str:
-    """Heuristic tier assignment from model name size tokens."""
+    """
+    Tier assignment from model name alone (used for Ollama and other
+    sources where file size is not available).
+
+    MoE models are detected first via active-param count.
+    Dense models fall back to total-param size tokens.
+    """
+    # MoE: use active params
+    active = _moe_active_params(name)
+    if active is not None:
+        if active < 7:
+            return "fast"
+        elif active < 20:
+            return "mid"
+        return "deep"
+
+    # Dense: classify by total param count in name
     n = name.lower()
     for token in ("70b", "72b", "65b", "80b", "110b", "122b", "123b", "178b", "671b"):
         if token in n:
