@@ -356,15 +356,31 @@ def cmd_status(args):
         print(f"Router not reachable: {e}")
         sys.exit(1)
 
-    print(f"{'Backend':<20} {'Engine':<12} {'Running':<8} {'PID':<8} {'Idle (s)':<10} Description")
-    print("─" * 80)
+    # Group by tier for clarity
+    tier_order = ["fast", "mid", "deep", None]
+    by_tier: dict = {t: [] for t in tier_order}
     for key, info in data.items():
-        running = "yes" if info["running"] else "no"
-        pid     = str(info.get("pid") or "")
-        idle    = str(info.get("idle_seconds") or "")
-        desc    = info.get("description", "")[:35]
-        engine  = info.get("engine", "")
-        print(f"{key:<20} {engine:<12} {running:<8} {pid:<8} {idle:<10} {desc}")
+        tier = info.get("tier")
+        by_tier.setdefault(tier, []).append((key, info))
+
+    print(f"{'Tier':<6} {'Backend':<22} {'Model / Description':<38} {'Running':<8} {'Engine'}")
+    print("─" * 90)
+
+    for tier in tier_order:
+        entries = by_tier.get(tier, [])
+        if not entries:
+            continue
+        tier_label = tier or "—"
+        for key, info in entries:
+            running = "yes" if info["running"] else "no "
+            desc    = info.get("description", key)[:38]
+            engine  = info.get("engine", "")
+            print(f"{tier_label:<6} {key:<22} {desc:<38} {running:<8} {engine}")
+        print()
+
+    print("Tier ranking criteria (size on disk):")
+    print("  fast = small models  |  mid = medium  |  deep = large")
+    print("  Adjust thresholds in config/settings.yaml → tier_thresholds_gb")
 
 
 def cmd_benchmark(args):

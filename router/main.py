@@ -156,13 +156,34 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
             logger.info("  GPU: none detected (CPU-only mode)")
         logger.info(f"  Available engines: {engines}")
         logger.info(f"  Backends: {manual} manual + {discovered} auto-discovered = {len(backends)} total")
-        if not backends:
+
+        # ── Tier table ────────────────────────────────────────
+        if backends:
+            logger.info(
+                f"  Tier ranking: fast < {config.tier_thresholds.fast:.0f} GB "
+                f"< mid < {config.tier_thresholds.mid:.0f} GB < deep  "
+                f"(set in config/settings.yaml → tier_thresholds_gb)"
+            )
+            for tier in ("fast", "mid", "deep", None):
+                tier_backends = [
+                    (k, v) for k, v in backends.items()
+                    if v.get("tier") == tier
+                ]
+                if not tier_backends:
+                    continue
+                label = tier if tier else "untiered"
+                for k, v in tier_backends:
+                    desc = v.get("description", k)
+                    size = f"  {v['size_gb']:.1f} GB" if v.get("size_gb") else ""
+                    logger.info(f"  [{label:>5}]  {k:<22} {desc}{size}")
+        else:
             logger.warning(
                 "No backends found. Quick options:\n"
                 "  • Start LM Studio or Ollama — the router will detect them automatically\n"
                 "  • Place GGUF files in ~/models and restart\n"
                 "  • Edit config/backends.yaml to add backends manually"
             )
+
         if config.model_aliases:
             logger.info(f"  Model aliases: {config.model_aliases}")
         if config.auth.enabled:
