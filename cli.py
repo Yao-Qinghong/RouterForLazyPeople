@@ -660,6 +660,66 @@ def _print_no_running_bench_help(backends: dict):
     print("  ./router-start bench --list")
 
 
+def _speed_label(value, unit: str) -> str:
+    return f"{value:g} {unit}" if isinstance(value, (int, float)) else "not measured"
+
+
+def _benchmark_result_sort_key(result: dict) -> tuple:
+    tier_order = {"fast": 0, "mid": 1, "deep": 2}
+    measured = result.get("tier_measured") or "unmeasured"
+    tg = result.get("tg_tok_s")
+    return (
+        tier_order.get(measured, 3),
+        -(tg if isinstance(tg, (int, float)) else -1),
+        result.get("backend_key", ""),
+    )
+
+
+def _print_benchmark_leaderboard(results_by_key: dict):
+    """Print cached active-benchmark results as a speed tier list."""
+    results = sorted(results_by_key.values(), key=_benchmark_result_sort_key)
+    measured = [r for r in results if r.get("validated") and not r.get("error")]
+    failures = [r for r in results if r.get("error")]
+
+    if not measured and not failures:
+        print("No cached benchmark results yet.")
+        print("Benchmark one model:")
+        print("  ./router-start bench --backend <backend-key> --start-stopped")
+        return
+
+    print("Benchmark results (cached)")
+    print("Sorted by measured tier, then token-generation speed.")
+    print()
+
+    current_tier = None
+    for result in measured:
+        tier = result.get("tier_measured") or "unmeasured"
+        if tier != current_tier:
+            current_tier = tier
+            print(f"{tier.upper()}")
+        key = result.get("backend_key", "unknown")
+        print(f"  {key}")
+        print(
+            f"    TG={_speed_label(result.get('tg_tok_s'), 'tok/s')}  "
+            f"PP={_speed_label(result.get('pp_tok_s'), 'tok/s')}  "
+            f"TTFT={_speed_label(result.get('ttft_ms'), 'ms')}  "
+            f"think={result.get('thinking_mode', '—')}  "
+            f"engine={result.get('engine', '—')}"
+        )
+        print(f"    {result.get('description', '')}")
+    if failures:
+        print()
+        print("FAILED / INCOMPLETE")
+        for result in failures:
+            print(f"  {result.get('backend_key', 'unknown')}: {result.get('error')}")
+
+
+def _fetch_benchmark_results() -> dict:
+    import urllib.request
+    with urllib.request.urlopen(f"{_router_url()}/benchmarks", timeout=5) as r:
+        return json.loads(r.read())
+
+
 def _bench_thinking_mode(args) -> str:
     if getattr(args, "thinking", False):
         return "think"
@@ -723,6 +783,15 @@ def cmd_bench(args):
     Results are cached to ~/.llm-router/benchmarks/ and shown in status.
     """
     import urllib.request
+
+    if getattr(args, "results", False):
+        try:
+            _print_benchmark_leaderboard(_fetch_benchmark_results())
+        except Exception as e:
+            print(f"Could not fetch benchmark results: {_router_exception_text(e)}")
+            print("Start the router first with: ./router-start service install")
+            sys.exit(1)
+        return
 
     # Fetch backend list from router
     try:
@@ -1295,6 +1364,8 @@ def main():
                           help="Benchmark all router-managed backends; combine with --start-stopped for stopped models")
     p_bench2.add_argument("--list", action="store_true",
                           help="List backend keys that can be passed to --backend")
+    p_bench2.add_argument("--results", action="store_true",
+                          help="Show cached benchmark tier list without starting models")
     thinking_group = p_bench2.add_mutually_exclusive_group()
     thinking_group.add_argument("--thinking", action="store_true",
                                 help="Add /think to benchmark prompts and measure reasoning-mode speed")

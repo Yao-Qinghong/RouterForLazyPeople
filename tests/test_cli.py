@@ -144,6 +144,40 @@ class TestUpdateAndSysinfo:
 
         assert cli._router_exception_text(FakeHTTPError()) == "HTTP Error 503: plain failure"
 
+    def test_benchmark_leaderboard_prints_cached_tier_list(self, capsys):
+        cli._print_benchmark_leaderboard({
+            "slow": {
+                "backend_key": "slow",
+                "validated": True,
+                "engine": "llama.cpp",
+                "thinking_mode": "no_think",
+                "tier_measured": "deep",
+                "tg_tok_s": 8.0,
+                "pp_tok_s": 80.0,
+                "ttft_ms": 900.0,
+                "description": "slow model",
+            },
+            "quick": {
+                "backend_key": "quick",
+                "validated": True,
+                "engine": "llama.cpp",
+                "thinking_mode": "no_think",
+                "tier_measured": "fast",
+                "tg_tok_s": 61.0,
+                "pp_tok_s": 750.0,
+                "ttft_ms": 573.0,
+                "description": "quick model",
+            },
+        })
+
+        out = capsys.readouterr().out
+        assert "Benchmark results (cached)" in out
+        assert "FAST" in out
+        assert "DEEP" in out
+        assert "quick" in out
+        assert "TG=61 tok/s" in out
+        assert out.index("quick") < out.index("slow")
+
     def test_bench_thinking_mode_defaults_to_no_think(self):
         assert cli._bench_thinking_mode(argparse.Namespace()) == "no_think"
         assert cli._bench_thinking_mode(argparse.Namespace(thinking=True)) == "think"
