@@ -62,13 +62,16 @@ If `./router-start status` works but the model list is empty:
 - Or edit `config/backends.yaml` and point `fast`, `mid`, and `deep` at exact model files
 - Run `./router-start rescan`, then check `./router-start status` again
 
-When the model list looks right, run the speed benchmark once:
+When the model list looks right, benchmark one model at a time:
 
 ```bash
-./router-start bench
+./router-start status
+./router-start bench --backend <backend-key> --start-stopped
 ```
 
-`bench` starts each router-managed backend, measures prompt-processing / generation speed, caches the result, and refreshes router state so benchmark-informed routing can use it.
+Use a backend key from `status`, for example `qwen3-5-35b-a3b-ud-q4-k-xl`.
+
+DGX Spark safety: `bench` no longer starts every discovered model automatically. It measures running models by default. `--start-stopped` allows starting the named model for the benchmark, and the CLI stops that model again afterward.
 
 ---
 
@@ -137,7 +140,8 @@ python cli.py start              # same CLI if you already selected Python 3.10+
 python cli.py start --update     # update llama.cpp first, then start
 python cli.py stop               # stop the router
 python cli.py status             # show which backends are running
-python cli.py bench              # measure PP/TG speed for each backend and refresh routing data
+python cli.py bench              # measure PP/TG speed for currently running backends
+python cli.py bench --backend KEY --start-stopped
 python cli.py bench --thinking   # measure with /think prompt directive instead of default /no_think
 python cli.py benchmark          # show request metrics from real router traffic
 python cli.py benchmark --export report.csv
@@ -325,7 +329,7 @@ The router does not secretly rewrite normal chat requests. If your model support
 
 Backend config can set `reasoning: true` for llama.cpp so reasoning tags are parsed and returned correctly. That is separate from telling a Qwen-style model to think.
 
-`./router-start bench` benchmarks direct-answer speed by adding `/no_think` to its fixed prompts. Use `./router-start bench --thinking --backend <key>` when you specifically want to measure reasoning-mode speed.
+`./router-start bench` benchmarks direct-answer speed by adding `/no_think` to its fixed prompts. Use `./router-start bench --thinking --backend <key> --start-stopped` when you specifically want to measure reasoning-mode speed for a stopped backend.
 
 ## Auth And Limits
 

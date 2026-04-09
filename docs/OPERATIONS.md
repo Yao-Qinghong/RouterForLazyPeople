@@ -28,13 +28,15 @@ When manual config is needed:
 - Edit `config/settings.yaml` if your models live outside the default `scan_dirs`
 - After changing scan directories while the router is running, call `./router-start rescan`
 
-After backends appear in `./router-start status`, run:
+After backends appear in `./router-start status`, benchmark one model at a time:
 
 ```bash
-./router-start bench
+./router-start bench --backend <backend-key> --start-stopped
 ```
 
-This starts each router-managed backend, measures prompt-processing (PP) and token-generation (TG) speed, saves results under the configured data directory, then asks the live router to rescan so speed-informed routing can use the new cache immediately.
+This starts the named backend, measures prompt-processing (PP) and token-generation (TG) speed, saves results under the configured data directory, asks the live router to rescan so speed-informed routing can use the new cache immediately, then stops the backend if bench started it.
+
+DGX Spark safety: `python cli.py bench` measures currently running backends by default. It does not bulk-start discovered models. Use `--backend <key> --start-stopped` for one stopped model, or `--all --start-stopped` only when you have verified that every discovered backend can fit.
 
 ## Supported Platforms And Engines
 
@@ -82,7 +84,8 @@ This starts each router-managed backend, measures prompt-processing (PP) and tok
 ## Diagnostics And Monitoring
 
 - `python cli.py sysinfo` works against the live router when available and falls back to local detection otherwise.
-- `python cli.py bench` is an active speed test. It starts managed backends, sends fixed prompts, caches PP/TG speeds, and refreshes router routing data.
+- `python cli.py bench` is an active speed test for currently running managed backends. It sends fixed prompts, caches PP/TG speeds, and refreshes router routing data.
+- `python cli.py bench --backend <key> --start-stopped` intentionally starts one stopped backend for measurement and stops it afterward unless `--keep-running` is supplied.
 - `python cli.py benchmark` is a passive metrics view. It reports request metrics from traffic the router has already served.
 - `GET /benchmarks` returns the cached active speed-test results.
 - `GET /metrics` provides aggregated request metrics.

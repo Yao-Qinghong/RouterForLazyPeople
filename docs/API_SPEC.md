@@ -43,6 +43,7 @@ Thinking / reasoning behavior:
 - Client-supplied `/think` and `/no_think` prompt text is forwarded unchanged.
 - Backend config field `reasoning` is an engine startup / parsing setting for supported engines; it is not the same thing as injecting a prompt-level thinking directive.
 - `bench` uses a `/no_think` prompt directive by default so cached routing speed reflects direct-answer throughput. CLI users may opt into `bench --thinking` for a reasoning-mode speed check.
+- `bench` measures currently running backends by default. Starting stopped backends for measurement requires the explicit CLI option `--start-stopped`.
 
 ## Auth Behavior
 

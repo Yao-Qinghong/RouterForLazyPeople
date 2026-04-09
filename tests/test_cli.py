@@ -67,6 +67,15 @@ class TestUpdateAndSysinfo:
         assert cli._bench_thinking_mode(argparse.Namespace(thinking=True)) == "think"
         assert cli._bench_thinking_mode(argparse.Namespace(default_thinking=True)) == "default"
 
+    def test_running_backend_keys(self):
+        status = {
+            "fast": {"running": True},
+            "mid": {"running": False},
+            "deep": {},
+        }
+
+        assert cli._running_backend_keys(status) == {"fast"}
+
     def test_python_guard_exits_before_creating_unsupported_venv(self, capsys):
         try:
             cli._ensure_supported_python((3, 9, 6))

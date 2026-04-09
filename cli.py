@@ -583,6 +583,27 @@ def _bench_thinking_mode(args) -> str:
     return "no_think"
 
 
+def _running_backend_keys(status: dict) -> set[str]:
+    return {key for key, info in status.items() if info.get("running")}
+
+
+def _fetch_router_status() -> dict:
+    import urllib.request
+    with urllib.request.urlopen(f"{_router_url()}/status", timeout=5) as r:
+        return json.loads(r.read())
+
+
+def _post_router(path: str, timeout: int = 30):
+    import urllib.request
+    req = urllib.request.Request(
+        f"{_router_url()}{path}",
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        data=b"{}",
+    )
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
 def cmd_bench(args):
     """
     Run PP and TG speed benchmarks against registered backends.
@@ -595,17 +616,46 @@ def cmd_bench(args):
     try:
         with urllib.request.urlopen(f"{_router_url()}/backends", timeout=5) as r:
             backends = json.loads(r.read())
+        status = _fetch_router_status()
     except Exception as e:
         print(f"Router not reachable: {e}")
         print("Start it first with: ./router-start")
         sys.exit(1)
 
-    targets = list(backends.keys())
+    running_before = _running_backend_keys(status)
+    if getattr(args, "all", False):
+        targets = list(backends.keys())
+    else:
+        targets = [k for k in backends if k in running_before]
+
     if getattr(args, "backend", None):
         if args.backend not in backends:
             print(f"Unknown backend '{args.backend}'. Available: {', '.join(targets)}")
             sys.exit(1)
         targets = [args.backend]
+
+    stopped_targets = [k for k in targets if k not in running_before]
+    if stopped_targets and not getattr(args, "start_stopped", False):
+        print("Benchmark did not start a stopped backend.")
+        print("DGX Spark safety: loading the wrong large model can exhaust memory and require a hardware restart.")
+        print(f"Requested stopped backend(s): {', '.join(stopped_targets)}")
+        print()
+        print(f"Safe one-model command:")
+        print(f"  ./router-start bench --backend {stopped_targets[0]} --start-stopped")
+        print()
+        print("If you intentionally want to benchmark every backend one by one:")
+        print("  ./router-start bench --all --start-stopped")
+        return
+
+    if not targets and not getattr(args, "backend", None):
+        print("No running router-managed backends to benchmark.")
+        print("DGX Spark safety: benchmark no longer auto-starts every discovered model.")
+        print()
+        print("Registered backends:")
+        _print_bench_plan(backends, list(backends.keys()))
+        print("Start and benchmark exactly one backend:")
+        print("  ./router-start bench --backend <backend-key> --start-stopped")
+        return
 
     # Skip external servers (LM Studio, Ollama managed externally)
     skippable = {"openai", "ollama"}
@@ -620,6 +670,8 @@ def cmd_bench(args):
         return
 
     print(f"Benchmarking {len(runnable)} router backend(s) — this takes ~30s per backend.")
+    if getattr(args, "start_stopped", False):
+        print("Stopped targets may be started one at a time. Anything bench starts is stopped after measurement.")
     print("This tests the local backend servers directly; it is not testing Open WebUI, Cursor, or another client app.\n")
     thinking_mode = _bench_thinking_mode(args)
     print(f"Thinking mode for this benchmark: {thinking_mode}")
@@ -650,32 +702,39 @@ def cmd_bench(args):
             print(f"[{index}/{len(runnable)}] {key}")
             print(f"      engine={engine}  tier={tier}  port={port}")
             print(f"      model={_bench_model_label(cfg)}")
+            started_by_bench = key not in running_before
 
             # Ensure backend is running first
-            print("      start...", end=" ", flush=True)
             try:
-                req = urllib.request.Request(
-                    f"{_router_url()}/start/{key}", method="POST",
-                    headers={"Content-Type": "application/json"}, data=b"{}",
-                )
-                urllib.request.urlopen(req, timeout=120)
-                print("up", end="  ", flush=True)
+                if started_by_bench:
+                    print("      start...", end=" ", flush=True)
+                    _post_router(f"/start/{key}", timeout=120).read()
+                    print("up", end="  ", flush=True)
+                else:
+                    print("      start... already running  ", end="", flush=True)
+
+                print("benchmark...", end=" ", flush=True)
+                r = await measure_backend(key, cfg, config, thinking_mode=thinking_mode)
+                save_result(r, config)
+                results.append(r)
+
+                if r.get("error"):
+                    print(f"ERROR: {r['error']}")
+                elif r.get("tier_mismatch"):
+                    print(f"done  ⚠  TG={r['tg_tok_s']:.0f} tok/s  (tier mismatch)")
+                else:
+                    print(f"done  TG={r['tg_tok_s']:.0f} tok/s  PP={r['pp_tok_s']:.0f} tok/s")
             except Exception as e:
-                print(f"failed to start: {e}")
+                print(f"failed: {e}")
                 results.append({"backend_key": key, "thinking_mode": thinking_mode, "error": str(e)})
-                continue
-
-            print("benchmark...", end=" ", flush=True)
-            r = await measure_backend(key, cfg, config, thinking_mode=thinking_mode)
-            save_result(r, config)
-            results.append(r)
-
-            if r.get("error"):
-                print(f"ERROR: {r['error']}")
-            elif r.get("tier_mismatch"):
-                print(f"done  ⚠  TG={r['tg_tok_s']:.0f} tok/s  (tier mismatch)")
-            else:
-                print(f"done  TG={r['tg_tok_s']:.0f} tok/s  PP={r['pp_tok_s']:.0f} tok/s")
+            finally:
+                if started_by_bench and not getattr(args, "keep_running", False):
+                    print("      stop...", end=" ", flush=True)
+                    try:
+                        _post_router(f"/stop/{key}", timeout=30).read()
+                        print("stopped")
+                    except Exception as e:
+                        print(f"stop failed: {e}")
 
         print()
         print(format_results(results))
@@ -871,7 +930,8 @@ def _print_service_next_steps():
     """Show the shortest useful post-install path for people who skip the README."""
     print("  Next steps:")
     print("    ./router-start status   # confirm backends/models are visible")
-    print("    ./router-start bench    # run once to measure speed and improve routing")
+    print("    ./router-start bench --backend <key> --start-stopped")
+    print("                         # benchmark one model safely; get <key> from status")
 
 
 def _require_service_health(log_hint: str):
@@ -1102,6 +1162,12 @@ def main():
     # bench
     p_bench2 = sub.add_parser("bench", help="Benchmark PP and TG speed for each backend")
     p_bench2.add_argument("--backend", metavar="KEY", help="Benchmark a single backend only")
+    p_bench2.add_argument("--start-stopped", action="store_true",
+                          help="Allow bench to start stopped backend(s); stopped again by default")
+    p_bench2.add_argument("--keep-running", action="store_true",
+                          help="Leave backend(s) running after bench started them")
+    p_bench2.add_argument("--all", action="store_true",
+                          help="Benchmark all router-managed backends; combine with --start-stopped for stopped models")
     thinking_group = p_bench2.add_mutually_exclusive_group()
     thinking_group.add_argument("--thinking", action="store_true",
                                 help="Add /think to benchmark prompts and measure reasoning-mode speed")
