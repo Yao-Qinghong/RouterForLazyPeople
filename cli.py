@@ -64,6 +64,29 @@ def _local_python() -> str:
     return str(VENV_PYTHON if VENV_PYTHON.exists() else Path(sys.executable))
 
 
+def _warn_firewall(port: int, lan: str):
+    """
+    Print a firewall warning + fix command if the port is likely blocked.
+    Checks UFW on Linux. Skips silently on macOS or if ufw is not installed.
+    """
+    if platform.system() != "Linux":
+        return
+    try:
+        result = subprocess.run(["ufw", "status"], capture_output=True, text=True)
+        if "Status: active" not in result.stdout:
+            return   # UFW inactive — no block
+        # Port allowed if the port number appears in the status output
+        if str(port) in result.stdout:
+            return   # already open
+        print(f"  NOTE: UFW firewall is active and port {port} is not open.")
+        print(f"  Other PCs cannot connect until you run:")
+        print(f"    sudo ufw allow {port}/tcp")
+        print(f"  After that, they can use: {lan}:{port}/v1")
+        print()
+    except FileNotFoundError:
+        pass   # ufw not installed — nothing to check
+
+
 def _lan_ip() -> str:
     """Return the machine's LAN IP (no traffic sent — just resolves local interface)."""
     try:
@@ -280,33 +303,35 @@ def cmd_start(args):
     )
 
     _save_pid(proc.pid)
-    base = _router_url()
-    lan  = _lan_ip()
-    lan_base = f"http://{lan}:{port}/v1"
-    w = 60  # banner width
+    base    = _router_url()
+    lan     = _lan_ip()
+    same_pc = f"http://localhost:{port}/v1"
+    other_pc = f"http://{lan}:{port}/v1"
 
     print(f"\nStarted with PID {proc.pid}\n")
-    print("┌─ Connect your LLM client to " + "─" * (w - 30) + "┐")
-    print(f"│  OpenAI base URL : {base}/v1" + " " * (w - 22 - len(f'{base}/v1')) + "│")
-    print(f"│  LAN / remote    : {lan_base}" + " " * (w - 22 - len(lan_base)) + "│")
-    print(f"│  API key         : any string (no auth required)" + " " * (w - 51) + "│")
+
+    w = max(len(same_pc), len(other_pc)) + 24
+    def _row(label, value):
+        pad = w - 4 - len(label) - len(value)
+        print(f"│  {label}{value}" + " " * max(pad, 1) + "│")
+
+    print("┌─ Connect your LLM client ─" + "─" * (w - 28) + "┐")
+    _row("On this machine  : ", same_pc)
+    _row("From another PC  : ", other_pc)
+    _row("API key          : ", "any string  (no auth by default)")
     print("└" + "─" * (w - 1) + "┘")
     print()
-    print("  Works with: Open WebUI · OpenClaw · LM Studio API · Cursor · Continue · Jan · Anything OpenAI-compatible")
+
+    _warn_firewall(port, lan)
+
+    print("  Works with: Open WebUI · LM Studio · Cursor · Continue · Jan")
+    print("              OpenClaw · anything OpenAI-compatible")
     print()
-    print("  Anthropic SDK (Claude Code, @anthropic-ai/sdk):")
-    print(f"    base_url  : {base}/anthropic")
-    print(f"    api_key   : any string")
+    print("  Anthropic SDK (Claude Code, claude.ai/code):")
+    print(f"    base_url = {base}/anthropic    api_key = any string")
     print()
-    print("  Router endpoints:")
-    print(f"    Status   : {base}/status")
-    print(f"    Models   : {base}/v1/models   (OpenAI model list)")
-    print(f"    Backends : {base}/backends")
-    print(f"    Metrics  : {base}/metrics")
-    print(f"    Sys info : {base}/sysinfo")
-    print()
-    print(f"  Logs : ./router-start logs")
-    print(f"  Stop : ./router-start stop")
+    print("  Logs : ./router-start logs")
+    print("  Stop : ./router-start stop")
 
 
 def cmd_stop(args):
