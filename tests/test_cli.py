@@ -86,6 +86,37 @@ class TestUpdateAndSysinfo:
         assert "Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf" in out
         assert cli._shorten("abcdefghijklmnopqrstuvwxyz", 8) == "abcdefg…"
 
+    def test_no_running_bench_help_shows_copyable_commands(self, capsys):
+        backends = {
+            "slow-deep": {
+                "engine": "llama.cpp",
+                "tier": "deep",
+                "size_gb": 80.0,
+                "description": "Slow deep model",
+            },
+            "fast-choice": {
+                "engine": "llama.cpp",
+                "tier": "fast",
+                "size_gb": 20.0,
+                "description": "Fast choice",
+            },
+            "hf-choice": {
+                "engine": "vllm",
+                "tier": "fast",
+                "size_gb": 18.0,
+                "description": "HF choice",
+            },
+        }
+
+        cli._print_no_running_bench_help(backends)
+
+        out = capsys.readouterr().out
+        assert "No model is running" in out
+        assert "./router-start bench --backend fast-choice --start-stopped" in out
+        assert "./router-start bench --backend hf-choice --start-stopped" in out
+        assert "bench --list" in out
+        assert out.index("fast-choice") < out.index("hf-choice")
+
     def test_bench_thinking_mode_defaults_to_no_think(self):
         assert cli._bench_thinking_mode(argparse.Namespace()) == "no_think"
         assert cli._bench_thinking_mode(argparse.Namespace(thinking=True)) == "think"

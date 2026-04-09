@@ -626,6 +626,40 @@ def _print_bench_plan(backends: dict, runnable: list[str]):
     print()
 
 
+def _suggest_bench_keys(backends: dict, limit: int = 3) -> list[str]:
+    """Prefer fast llama.cpp backends for beginner-safe one-model benchmark suggestions."""
+    priority = {"fast": 0, "mid": 1, "deep": 2}
+
+    def score(key: str) -> tuple:
+        cfg = backends[key]
+        engine_score = 0 if cfg.get("engine") == "llama.cpp" else 1
+        size = cfg.get("size_gb")
+        size_score = size if isinstance(size, (int, float)) else 9999
+        return (
+            priority.get(cfg.get("tier"), 3),
+            engine_score,
+            size_score,
+            key,
+        )
+
+    return sorted(backends, key=score)[:limit]
+
+
+def _print_no_running_bench_help(backends: dict):
+    print("No model is running, so nothing was benchmarked.")
+    print()
+    print("Safest next step: benchmark ONE model. Copy one command:")
+    for key in _suggest_bench_keys(backends):
+        cfg = backends[key]
+        print()
+        print(f"  # {cfg.get('tier', 'unknown')} | {cfg.get('engine', 'unknown')} | {_shorten(_bench_model_label(cfg), 70)}")
+        print(f"  ./router-start bench --backend {key} --start-stopped")
+    print()
+    print("Need the full backend list?")
+    print("  ./router-start status")
+    print("  ./router-start bench --list")
+
+
 def _bench_thinking_mode(args) -> str:
     if getattr(args, "thinking", False):
         return "think"
@@ -681,9 +715,17 @@ def cmd_bench(args):
 
     if getattr(args, "backend", None):
         if args.backend not in backends:
-            print(f"Unknown backend '{args.backend}'. Available: {', '.join(targets)}")
+            print(f"Unknown backend '{args.backend}'.")
+            print("Run ./router-start status to copy a backend key.")
             sys.exit(1)
         targets = [args.backend]
+
+    if getattr(args, "list", False):
+        print("Registered benchmarkable backends:")
+        _print_bench_plan(backends, list(backends.keys()))
+        print("Benchmark exactly one:")
+        print("  ./router-start bench --backend <backend-key> --start-stopped")
+        return
 
     stopped_targets = [k for k in targets if k not in running_before]
     if stopped_targets and not getattr(args, "start_stopped", False):
@@ -699,13 +741,7 @@ def cmd_bench(args):
         return
 
     if not targets and not getattr(args, "backend", None):
-        print("No running router-managed backends to benchmark.")
-        print("DGX Spark safety: benchmark no longer auto-starts every discovered model.")
-        print()
-        print("Registered backends:")
-        _print_bench_plan(backends, list(backends.keys()))
-        print("Start and benchmark exactly one backend:")
-        print("  ./router-start bench --backend <backend-key> --start-stopped")
+        _print_no_running_bench_help(backends)
         return
 
     # Skip external servers (LM Studio, Ollama managed externally)
@@ -1219,6 +1255,8 @@ def main():
                           help="Leave backend(s) running after bench started them")
     p_bench2.add_argument("--all", action="store_true",
                           help="Benchmark all router-managed backends; combine with --start-stopped for stopped models")
+    p_bench2.add_argument("--list", action="store_true",
+                          help="List backend keys that can be passed to --backend")
     thinking_group = p_bench2.add_mutually_exclusive_group()
     thinking_group.add_argument("--thinking", action="store_true",
                                 help="Add /think to benchmark prompts and measure reasoning-mode speed")
