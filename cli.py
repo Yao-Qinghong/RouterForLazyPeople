@@ -305,8 +305,8 @@ def cmd_start(args):
     print(f"    Metrics  : {base}/metrics")
     print(f"    Sys info : {base}/sysinfo")
     print()
-    print(f"  Logs : python cli.py logs")
-    print(f"  Stop : python cli.py stop")
+    print(f"  Logs : ./router-start logs")
+    print(f"  Stop : ./router-start stop")
 
 
 def cmd_stop(args):
@@ -564,7 +564,7 @@ def cmd_service(args):
         _service_linux(args.action)
     else:
         print(f"Service management is not supported on {system}.")
-        print("Start the router manually with: python cli.py")
+        print("Start the router manually with: ./router-start")
         sys.exit(1)
 
 
@@ -572,11 +572,10 @@ def cmd_service(args):
 
 _LAUNCHD_LABEL = "com.llm-router"
 _LAUNCHD_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{_LAUNCHD_LABEL}.plist"
+_ROUTER_START  = PROJECT_DIR / "router-start"
 
 
 def _service_macos(action: str):
-    python  = _local_python()
-    cli     = str(PROJECT_DIR / "cli.py")
     port    = _router_port()
     log_out = str(LOG_DIR / "service-stdout.log")
     log_err = str(LOG_DIR / "service-stderr.log")
@@ -593,19 +592,13 @@ def _service_macos(action: str):
   <key>Label</key>             <string>{_LAUNCHD_LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>{python}</string>
-    <string>{cli}</string>
+    <string>{_ROUTER_START}</string>
   </array>
   <key>WorkingDirectory</key>  <string>{PROJECT_DIR}</string>
   <key>RunAtLoad</key>         <true/>
   <key>KeepAlive</key>         <true/>
   <key>StandardOutPath</key>   <string>{log_out}</string>
   <key>StandardErrorPath</key> <string>{log_err}</string>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>PATH</key>
-    <string>{str(VENV_DIR / 'bin')}:/usr/local/bin:/usr/bin:/bin</string>
-  </dict>
 </dict>
 </plist>
 """
@@ -619,10 +612,10 @@ def _service_macos(action: str):
                                 capture_output=True, text=True)
         if result.returncode == 0:
             print(f"Service installed and started.")
-            print(f"  The router will auto-start at every login.")
+            print(f"  Auto-starts at every login.")
             print(f"  OpenAI base URL: http://localhost:{port}/v1")
             print(f"  Logs: {log_out}")
-            print(f"  To remove: python cli.py service uninstall")
+            print(f"  To remove: ./router-start service uninstall")
         else:
             print(f"launchctl load failed: {result.stderr.strip()}")
             sys.exit(1)
@@ -660,9 +653,7 @@ _SYSTEMD_FILE = _SYSTEMD_DIR / _SYSTEMD_UNIT
 
 
 def _service_linux(action: str):
-    python = _local_python()
-    cli    = str(PROJECT_DIR / "cli.py")
-    port   = _router_port()
+    port = _router_port()
 
     if action == "install":
         LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -675,10 +666,9 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory={PROJECT_DIR}
-ExecStart={python} {cli}
+ExecStart={_ROUTER_START}
 Restart=on-failure
 RestartSec=5
-Environment=PATH={VENV_DIR / 'bin'}:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target
@@ -689,10 +679,10 @@ WantedBy=default.target
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
         subprocess.run(["systemctl", "--user", "enable", "--now", _SYSTEMD_UNIT], check=True)
         print(f"Service installed and started.")
-        print(f"  The router will auto-start at every login.")
+        print(f"  Auto-starts at every login.")
         print(f"  OpenAI base URL: http://localhost:{port}/v1")
         print(f"  Logs: journalctl --user -u {_SYSTEMD_UNIT} -f")
-        print(f"  To remove: python cli.py service uninstall")
+        print(f"  To remove: ./router-start service uninstall")
 
     elif action == "uninstall":
         if not _SYSTEMD_FILE.exists():

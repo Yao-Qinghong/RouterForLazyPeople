@@ -9,15 +9,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 pip install -r requirements.txt
 
 # Start / stop the router
-python cli.py               # start (default when no subcommand given)
-python cli.py start         # same as above
-python cli.py stop
-python cli.py status
+./router-start              # start (shell wrapper — works on any system)
+./router-start stop
+./router-start status
 
 # Install as a system service (auto-starts on every login — macOS launchd or Linux systemd)
-python cli.py service install
-python cli.py service uninstall
-python cli.py service status
+./router-start service install
+./router-start service uninstall
+./router-start service status
 
 # Run tests
 pytest                        # all tests
