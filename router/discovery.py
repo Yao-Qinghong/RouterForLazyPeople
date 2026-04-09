@@ -71,6 +71,24 @@ def _model_name_from_path(path: str) -> str:
     return name
 
 
+def _is_auxiliary_gguf(filename: str) -> bool:
+    """
+    Return True for GGUF sidecar files that llama-server should not run as LLMs.
+
+    Multimodal models often ship projector files named like mmproj-f16.gguf
+    beside the real text model. They are GGUF, but starting them as a backend
+    fails; they should stay attached to a future multimodal config path.
+    """
+    stem = Path(filename).stem.lower()
+    return (
+        stem == "mmproj"
+        or stem.startswith("mmproj-")
+        or stem.startswith("mmproj_")
+        or stem.endswith("-mmproj")
+        or "-mmproj-" in stem
+    )
+
+
 def _slug(name: str, path: str) -> str:
     slug = re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')
     if len(slug) > 40:
@@ -203,7 +221,7 @@ def discover_gguf_models(config: "AppConfig", port_counter: list[int]) -> dict:
         if not os.path.isdir(scan_dir):
             continue
         for root, dirs, files in os.walk(scan_dir):
-            gguf_files = [f for f in files if f.endswith('.gguf')]
+            gguf_files = [f for f in files if f.endswith('.gguf') and not _is_auxiliary_gguf(f)]
             if not gguf_files:
                 continue
 

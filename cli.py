@@ -535,6 +535,18 @@ def cmd_rescan(args):
         sys.exit(1)
 
 
+def _bench_model_label(cfg: dict) -> str:
+    """Readable model identity for benchmark progress output."""
+    model = cfg.get("model")
+    if not model:
+        return str(cfg.get("description") or "model not specified")
+
+    path = Path(str(model))
+    if path.name:
+        return path.name
+    return str(model)
+
+
 def cmd_bench(args):
     """
     Run PP and TG speed benchmarks against registered backends.
@@ -571,7 +583,8 @@ def cmd_bench(args):
         print("No benchmarkable backends found.")
         return
 
-    print(f"Benchmarking {len(runnable)} backend(s) — this takes ~30s per backend...\n")
+    print(f"Benchmarking {len(runnable)} router backend(s) — this takes ~30s per backend.")
+    print("This tests the local backend servers directly; it is not testing Open WebUI, Cursor, or another client app.\n")
 
     import asyncio
 
@@ -583,10 +596,17 @@ def cmd_bench(args):
         config = load_config()
 
         results = []
-        for key in runnable:
+        for index, key in enumerate(runnable, start=1):
             cfg = backends[key]
+            engine = cfg.get("engine", "unknown")
+            tier = cfg.get("tier", "unknown")
+            port = cfg.get("port", "unknown")
+            print(f"[{index}/{len(runnable)}] {key}")
+            print(f"      engine={engine}  tier={tier}  port={port}")
+            print(f"      model={_bench_model_label(cfg)}")
+
             # Ensure backend is running first
-            print(f"  Starting {key}...", end=" ", flush=True)
+            print("      start...", end=" ", flush=True)
             try:
                 req = urllib.request.Request(
                     f"{_router_url()}/start/{key}", method="POST",
@@ -599,7 +619,7 @@ def cmd_bench(args):
                 results.append({"backend_key": key, "error": str(e)})
                 continue
 
-            print(f"benchmarking...", end=" ", flush=True)
+            print("benchmark...", end=" ", flush=True)
             r = await measure_backend(key, cfg, config)
             save_result(r, config)
             results.append(r)
