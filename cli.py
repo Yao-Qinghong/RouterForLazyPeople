@@ -689,6 +689,33 @@ def _post_router(path: str, timeout: int = 30):
     return urllib.request.urlopen(req, timeout=timeout)
 
 
+def _router_exception_text(exc: Exception) -> str:
+    """Return a useful one-line error, including FastAPI JSON detail/log fields when present."""
+    body = None
+    if hasattr(exc, "read"):
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:
+            body = None
+
+    if body:
+        try:
+            payload = json.loads(body)
+        except Exception:
+            return f"{exc}: {body[:300]}"
+
+        detail = payload.get("detail")
+        error = payload.get("error")
+        log = payload.get("log")
+        parts = [str(value) for value in [detail, error] if value]
+        if log:
+            parts.append(f"log: {log}")
+        if parts:
+            return " | ".join(parts)
+
+    return str(exc)
+
+
 def cmd_bench(args):
     """
     Run PP and TG speed benchmarks against registered backends.
@@ -781,6 +808,7 @@ def cmd_bench(args):
         config = load_config()
 
         results = []
+        saved_count = 0
         for index, key in enumerate(runnable, start=1):
             cfg = backends[key]
             engine = cfg.get("engine", "unknown")
@@ -790,19 +818,25 @@ def cmd_bench(args):
             print(f"      engine={engine}  tier={tier}  port={port}")
             print(f"      model={_bench_model_label(cfg)}")
             started_by_bench = key not in running_before
+            attempted_start = False
+            start_ok = False
 
             # Ensure backend is running first
             try:
                 if started_by_bench:
                     print("      start...", end=" ", flush=True)
+                    attempted_start = True
                     _post_router(f"/start/{key}", timeout=120).read()
+                    start_ok = True
                     print("up", end="  ", flush=True)
                 else:
+                    start_ok = True
                     print("      start... already running  ", end="", flush=True)
 
                 print("benchmark...", end=" ", flush=True)
                 r = await measure_backend(key, cfg, config, thinking_mode=thinking_mode)
                 save_result(r, config)
+                saved_count += 1
                 results.append(r)
 
                 if r.get("error"):
@@ -812,31 +846,35 @@ def cmd_bench(args):
                 else:
                     print(f"done  TG={r['tg_tok_s']:.0f} tok/s  PP={r['pp_tok_s']:.0f} tok/s")
             except Exception as e:
-                print(f"failed: {e}")
-                results.append({"backend_key": key, "thinking_mode": thinking_mode, "error": str(e)})
+                error_text = _router_exception_text(e)
+                print(f"failed: {error_text}")
+                results.append({"backend_key": key, "thinking_mode": thinking_mode, "error": error_text})
             finally:
-                if started_by_bench and not getattr(args, "keep_running", False):
-                    print("      stop...", end=" ", flush=True)
+                if started_by_bench and attempted_start and not getattr(args, "keep_running", False):
+                    action = "stop" if start_ok else "cleanup"
+                    print(f"      {action}...", end=" ", flush=True)
                     try:
                         _post_router(f"/stop/{key}", timeout=30).read()
-                        print("stopped")
+                        if start_ok:
+                            print("stopped")
+                        else:
+                            print("cleanup requested")
                     except Exception as e:
-                        print(f"stop failed: {e}")
+                        print(f"{action} failed: {_router_exception_text(e)}")
 
         print()
         print(format_results(results))
 
-        # The router reads benchmark cache at startup and during rescan. Refresh
-        # after saving so speed-informed routing is active immediately.
-        try:
-            req = urllib.request.Request(
-                f"{_router_url()}/rescan", method="POST",
-                headers={"Content-Type": "application/json"}, data=b"{}",
-            )
-            urllib.request.urlopen(req, timeout=30).read()
-            print("\nBenchmark cache saved and router routing data refreshed.")
-        except Exception as e:
-            print(f"\nBenchmark cache saved. Run './router-start rescan' before relying on it for routing ({e}).")
+        if saved_count:
+            # The router reads benchmark cache at startup and during rescan. Refresh
+            # after saving so speed-informed routing is active immediately.
+            try:
+                _post_router("/rescan", timeout=30).read()
+                print(f"\nBenchmark cache saved ({saved_count}) and router routing data refreshed.")
+            except Exception as e:
+                print(f"\nBenchmark cache saved ({saved_count}). Run './router-start rescan' before relying on it for routing ({_router_exception_text(e)}).")
+        else:
+            print("\nNo benchmark result was saved. Fix the start/health error above, then rerun the one-backend bench command.")
 
         # Suggest fixes for mismatches
         mismatches = [r for r in results if r.get("tier_mismatch")]

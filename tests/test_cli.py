@@ -117,6 +117,33 @@ class TestUpdateAndSysinfo:
         assert "bench --list" in out
         assert out.index("fast-choice") < out.index("hf-choice")
 
+    def test_router_exception_text_decodes_json_detail_and_log(self):
+        class FakeHTTPError(Exception):
+            def read(self):
+                return json.dumps({
+                    "detail": "backend failed health check",
+                    "log": "/tmp/backend.log",
+                }).encode()
+
+            def __str__(self):
+                return "HTTP Error 503"
+
+        text = cli._router_exception_text(FakeHTTPError())
+
+        assert "backend failed health check" in text
+        assert "log: /tmp/backend.log" in text
+        assert "HTTP Error 503" not in text
+
+    def test_router_exception_text_falls_back_to_http_body(self):
+        class FakeHTTPError(Exception):
+            def read(self):
+                return b"plain failure"
+
+            def __str__(self):
+                return "HTTP Error 503"
+
+        assert cli._router_exception_text(FakeHTTPError()) == "HTTP Error 503: plain failure"
+
     def test_bench_thinking_mode_defaults_to_no_think(self):
         assert cli._bench_thinking_mode(argparse.Namespace()) == "no_think"
         assert cli._bench_thinking_mode(argparse.Namespace(thinking=True)) == "think"
