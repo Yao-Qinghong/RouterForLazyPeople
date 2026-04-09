@@ -40,6 +40,28 @@ class TestLlamaBuildConfig:
 
 
 class TestUpdateAndSysinfo:
+    def test_bench_plan_prints_backend_table(self, capsys):
+        backends = {
+            "qwen3-5-35b-a3b-ud-q4-k-xl": {
+                "engine": "llama.cpp",
+                "tier": "fast",
+                "port": 8080,
+                "model": "/models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
+            }
+        }
+
+        cli._print_bench_plan(backends, list(backends))
+
+        out = capsys.readouterr().out
+        assert "Benchmark plan:" in out
+        assert "Backend" in out
+        assert "Engine" in out
+        assert "Tier" in out
+        assert "Port" in out
+        assert "qwen3-5-35b-a3b-ud-q4-k-xl" in out
+        assert "Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf" in out
+        assert cli._shorten("abcdefghijklmnopqrstuvwxyz", 8) == "abcdefg…"
+
     def test_python_guard_exits_before_creating_unsupported_venv(self, capsys):
         try:
             cli._ensure_supported_python((3, 9, 6))

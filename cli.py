@@ -547,6 +547,34 @@ def _bench_model_label(cfg: dict) -> str:
     return str(model)
 
 
+def _shorten(text, width: int) -> str:
+    """Keep terminal tables readable without hiding the start of model names."""
+    text = str(text)
+    if len(text) <= width:
+        return text
+    if width <= 1:
+        return "…"[:width]
+    return text[:width - 1] + "…"
+
+
+def _print_bench_plan(backends: dict, runnable: list[str]):
+    """Print the benchmark target list before slow model startup begins."""
+    print("Benchmark plan:")
+    print(f"{'#':>2}  {'Backend':<26} {'Engine':<10} {'Tier':<6} {'Port':<6} {'Model'}")
+    print(f"{'--':>2}  {'-' * 26} {'-' * 10} {'-' * 6} {'-' * 6} {'-' * 32}")
+    for index, key in enumerate(runnable, start=1):
+        cfg = backends[key]
+        print(
+            f"{index:>2}  "
+            f"{_shorten(key, 26):<26} "
+            f"{_shorten(cfg.get('engine', 'unknown'), 10):<10} "
+            f"{_shorten(cfg.get('tier', 'unknown'), 6):<6} "
+            f"{str(cfg.get('port', '')):<6} "
+            f"{_shorten(_bench_model_label(cfg), 48)}"
+        )
+    print()
+
+
 def cmd_bench(args):
     """
     Run PP and TG speed benchmarks against registered backends.
@@ -585,6 +613,7 @@ def cmd_bench(args):
 
     print(f"Benchmarking {len(runnable)} router backend(s) — this takes ~30s per backend.")
     print("This tests the local backend servers directly; it is not testing Open WebUI, Cursor, or another client app.\n")
+    _print_bench_plan(backends, runnable)
 
     import asyncio
 
