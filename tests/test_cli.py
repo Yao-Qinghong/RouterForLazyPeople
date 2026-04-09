@@ -62,6 +62,11 @@ class TestUpdateAndSysinfo:
         assert "Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf" in out
         assert cli._shorten("abcdefghijklmnopqrstuvwxyz", 8) == "abcdefg…"
 
+    def test_bench_thinking_mode_defaults_to_no_think(self):
+        assert cli._bench_thinking_mode(argparse.Namespace()) == "no_think"
+        assert cli._bench_thinking_mode(argparse.Namespace(thinking=True)) == "think"
+        assert cli._bench_thinking_mode(argparse.Namespace(default_thinking=True)) == "default"
+
     def test_python_guard_exits_before_creating_unsupported_venv(self, capsys):
         try:
             cli._ensure_supported_python((3, 9, 6))

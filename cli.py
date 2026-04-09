@@ -575,6 +575,14 @@ def _print_bench_plan(backends: dict, runnable: list[str]):
     print()
 
 
+def _bench_thinking_mode(args) -> str:
+    if getattr(args, "thinking", False):
+        return "think"
+    if getattr(args, "default_thinking", False):
+        return "default"
+    return "no_think"
+
+
 def cmd_bench(args):
     """
     Run PP and TG speed benchmarks against registered backends.
@@ -613,6 +621,15 @@ def cmd_bench(args):
 
     print(f"Benchmarking {len(runnable)} router backend(s) — this takes ~30s per backend.")
     print("This tests the local backend servers directly; it is not testing Open WebUI, Cursor, or another client app.\n")
+    thinking_mode = _bench_thinking_mode(args)
+    print(f"Thinking mode for this benchmark: {thinking_mode}")
+    if thinking_mode == "no_think":
+        print("  Adds /no_think to the benchmark prompt so speed reflects direct-answer mode.")
+    elif thinking_mode == "think":
+        print("  Adds /think to the benchmark prompt. Expect lower tok/s on reasoning models.")
+    else:
+        print("  Sends the benchmark prompt without a /think or /no_think directive.")
+    print()
     _print_bench_plan(backends, runnable)
 
     import asyncio
@@ -620,7 +637,7 @@ def cmd_bench(args):
     async def _run_all():
         # Dynamic import inside async context to avoid circular imports
         sys.path.insert(0, str(PROJECT_DIR))
-        from router.benchmark import measure_backend, save_result, format_results, load_result
+        from router.benchmark import measure_backend, save_result, format_results
         from router.config import load_config
         config = load_config()
 
@@ -645,11 +662,11 @@ def cmd_bench(args):
                 print("up", end="  ", flush=True)
             except Exception as e:
                 print(f"failed to start: {e}")
-                results.append({"backend_key": key, "error": str(e)})
+                results.append({"backend_key": key, "thinking_mode": thinking_mode, "error": str(e)})
                 continue
 
             print("benchmark...", end=" ", flush=True)
-            r = await measure_backend(key, cfg, config)
+            r = await measure_backend(key, cfg, config, thinking_mode=thinking_mode)
             save_result(r, config)
             results.append(r)
 
@@ -1085,6 +1102,11 @@ def main():
     # bench
     p_bench2 = sub.add_parser("bench", help="Benchmark PP and TG speed for each backend")
     p_bench2.add_argument("--backend", metavar="KEY", help="Benchmark a single backend only")
+    thinking_group = p_bench2.add_mutually_exclusive_group()
+    thinking_group.add_argument("--thinking", action="store_true",
+                                help="Add /think to benchmark prompts and measure reasoning-mode speed")
+    thinking_group.add_argument("--default-thinking", action="store_true",
+                                help="Do not add /think or /no_think to benchmark prompts")
     p_bench2.set_defaults(func=cmd_bench)
 
     # sysinfo

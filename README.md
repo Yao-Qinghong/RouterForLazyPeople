@@ -138,6 +138,7 @@ python cli.py start --update     # update llama.cpp first, then start
 python cli.py stop               # stop the router
 python cli.py status             # show which backends are running
 python cli.py bench              # measure PP/TG speed for each backend and refresh routing data
+python cli.py bench --thinking   # measure with /think prompt directive instead of default /no_think
 python cli.py benchmark          # show request metrics from real router traffic
 python cli.py benchmark --export report.csv
 python cli.py sysinfo            # GPU, CUDA, CPU, engine versions, install hints
@@ -317,6 +318,14 @@ The router classifies each request automatically:
 | Everything else | fast |
 
 Override any time with `[route:key]` prefix or `?backend=key` query param.
+
+### Thinking / no-thinking mode
+
+The router does not secretly rewrite normal chat requests. If your model supports prompt directives such as `/think` or `/no_think`, send that in your client prompt when you want to control reasoning mode.
+
+Backend config can set `reasoning: true` for llama.cpp so reasoning tags are parsed and returned correctly. That is separate from telling a Qwen-style model to think.
+
+`./router-start bench` benchmarks direct-answer speed by adding `/no_think` to its fixed prompts. Use `./router-start bench --thinking --backend <key>` when you specifically want to measure reasoning-mode speed.
 
 ## Auth And Limits
 

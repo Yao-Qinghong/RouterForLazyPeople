@@ -37,6 +37,13 @@ Automatic classification behavior:
 - Everything else falls back to `fast`.
 - If a tier is missing, routing falls back to any available backend.
 
+Thinking / reasoning behavior:
+
+- Normal proxied chat requests are passed through. The router does not add `/think`, `/no_think`, `reasoning_effort`, or chain-of-thought instructions.
+- Client-supplied `/think` and `/no_think` prompt text is forwarded unchanged.
+- Backend config field `reasoning` is an engine startup / parsing setting for supported engines; it is not the same thing as injecting a prompt-level thinking directive.
+- `bench` uses a `/no_think` prompt directive by default so cached routing speed reflects direct-answer throughput. CLI users may opt into `bench --thinking` for a reasoning-mode speed check.
+
 ## Auth Behavior
 
 - Auth is optional and configured in `config/settings.yaml`.

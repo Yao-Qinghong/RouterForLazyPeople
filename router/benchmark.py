@@ -50,6 +50,15 @@ _TG_PROMPT = (
     "Do not write more or less than 80 words."
 )
 
+_THINKING_PROMPT_SUFFIX = {
+    "default": "",
+    # Qwen-style directives are intentional here: they make benchmark mode
+    # explicit when the model/template supports thinking, and are harmlessly
+    # treated as plain user text by backends that do not.
+    "no_think": "\n\n/no_think\nAnswer directly. Do not include chain-of-thought.",
+    "think": "\n\n/think\nUse your reasoning mode before answering.",
+}
+
 # Tier boundaries based on measured TG speed (tok/s)
 # These reflect practical usability, not arbitrary file-size thresholds:
 #   fast  ≥ 30 tok/s  → snappy, suitable for interactive chat and quick tasks
@@ -66,6 +75,7 @@ async def measure_backend(
     key: str,
     cfg: dict,
     config: "AppConfig",
+    thinking_mode: str = "no_think",
 ) -> dict:
     """
     Run PP and TG benchmarks against a single backend.
@@ -78,6 +88,8 @@ async def measure_backend(
     port  = cfg.get("port")
     engine = cfg.get("engine", "llama.cpp")
     base  = f"http://localhost:{port}/v1"
+    if thinking_mode not in _THINKING_PROMPT_SUFFIX:
+        raise ValueError(f"Unknown thinking_mode '{thinking_mode}'")
 
     result = {
         "backend_key":  key,
@@ -91,14 +103,15 @@ async def measure_backend(
         "error":        None,
         "tier_measured": None,
         "tier_mismatch": False,
+        "thinking_mode": thinking_mode,
     }
 
     try:
-        pp = await _run_pp(base)
+        pp = await _run_pp(base, thinking_mode)
         result["pp_tok_s"] = pp["pp_tok_s"]
         result["ttft_ms"]  = pp["ttft_ms"]
 
-        tg = await _run_tg(base)
+        tg = await _run_tg(base, thinking_mode)
         result["tg_tok_s"] = tg["tg_tok_s"]
 
         result["validated"]    = True
@@ -114,14 +127,18 @@ async def measure_backend(
     return result
 
 
-async def _run_pp(base: str) -> dict:
+def _benchmark_prompt(prompt: str, thinking_mode: str) -> str:
+    return prompt + _THINKING_PROMPT_SUFFIX[thinking_mode]
+
+
+async def _run_pp(base: str, thinking_mode: str = "no_think") -> dict:
     """
     PP benchmark: long prompt, max_tokens=1, streaming.
     Measures time-to-first-token which equals prompt processing time.
     """
     payload = {
         "model":      "benchmark",
-        "messages":   [{"role": "user", "content": _PP_PROMPT}],
+        "messages":   [{"role": "user", "content": _benchmark_prompt(_PP_PROMPT, thinking_mode)}],
         "max_tokens": 1,
         "stream":     True,
         "temperature": 0.0,
@@ -145,14 +162,14 @@ async def _run_pp(base: str) -> dict:
     return {"ttft_ms": round(ttft_ms, 1), "pp_tok_s": pp_tok_s}
 
 
-async def _run_tg(base: str) -> dict:
+async def _run_tg(base: str, thinking_mode: str = "no_think") -> dict:
     """
     TG benchmark: short prompt, max_tokens=80, streaming.
     Measures token generation speed after the first token.
     """
     payload = {
         "model":       "benchmark",
-        "messages":    [{"role": "user", "content": _TG_PROMPT}],
+        "messages":    [{"role": "user", "content": _benchmark_prompt(_TG_PROMPT, thinking_mode)}],
         "max_tokens":  80,
         "stream":      True,
         "temperature": 0.0,
@@ -243,14 +260,15 @@ def load_all_results(config: "AppConfig") -> dict[str, dict]:
 def format_results(results: list[dict]) -> str:
     lines = []
     lines.append(
-        f"{'Backend':<22} {'PP tok/s':>9} {'TG tok/s':>9} "
+        f"{'Backend':<22} {'Think':<8} {'PP tok/s':>9} {'TG tok/s':>9} "
         f"{'TTFT ms':>8} {'Tier set':>9} {'Measured':>9} {'Status'}"
     )
-    lines.append("─" * 90)
+    lines.append("─" * 100)
 
     for r in results:
+        thinking = r.get("thinking_mode", "—")
         if r.get("error"):
-            lines.append(f"{r['backend_key']:<22}  ERROR: {r['error'][:55]}")
+            lines.append(f"{r['backend_key']:<22} {thinking:<8}  ERROR: {r['error'][:55]}")
             continue
 
         pp   = f"{r['pp_tok_s']:.0f}" if r.get("pp_tok_s") else "—"
@@ -265,11 +283,12 @@ def format_results(results: list[dict]) -> str:
             status = "✓"
 
         lines.append(
-            f"{r['backend_key']:<22} {pp:>9} {tg:>9} {ttft:>8} "
+            f"{r['backend_key']:<22} {thinking:<8} {pp:>9} {tg:>9} {ttft:>8} "
             f"{assigned:>9} {measured:>9}  {status}"
         )
 
     lines.append("")
     lines.append("TG speed tiers:  fast ≥ 30 tok/s  |  mid ≥ 10 tok/s  |  deep < 10 tok/s")
     lines.append("PP = prompt processing speed   TG = token generation speed")
+    lines.append("Think = benchmark prompt mode: no_think adds /no_think, think adds /think")
     return "\n".join(lines)
