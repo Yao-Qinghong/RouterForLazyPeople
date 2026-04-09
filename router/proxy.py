@@ -54,6 +54,13 @@ def _resolve_model_alias(payload: dict, config: "AppConfig") -> str | None:
     return config.model_aliases.get(model)
 
 
+def _model_name_as_backend(payload: dict, backends: dict) -> str | None:
+    """If the model field exactly matches a backend key, use it directly.
+    Lets clients pick backends by name (e.g. model='fast', model='deep')."""
+    model = payload.get("model", "")
+    return model if model in backends else None
+
+
 def _audit_request(request_id: str, backend_key: str, endpoint: str,
                    payload: dict, config: "AppConfig", api_key_name: str = ""):
     """Log request metadata for audit trail."""
@@ -128,9 +135,11 @@ async def handle_proxy(
         )
 
     # ── Determine backend ─────────────────────────────────────
+    # Priority: ?backend= param → model alias → model name IS a backend key → content classifier
     backend_key = (
         request.query_params.get("backend")
         or _resolve_model_alias(payload, config)
+        or _model_name_as_backend(payload, manager.backends)
         or classify(payload, manager.backends, config)
     )
 
