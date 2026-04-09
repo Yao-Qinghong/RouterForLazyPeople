@@ -303,7 +303,25 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
 
     @app.get("/status", summary="Backend run-state")
     async def status(request: Request):
-        return request.app.state.manager.status()
+        mgr     = request.app.state.manager
+        cfg     = request.app.state.config
+        state   = mgr.status()
+        from router.benchmark import load_result
+        for key, info in state.items():
+            bench = load_result(key, cfg)
+            if bench:
+                info["bench_pp_tok_s"]  = bench.get("pp_tok_s")
+                info["bench_tg_tok_s"]  = bench.get("tg_tok_s")
+                info["bench_ttft_ms"]   = bench.get("ttft_ms")
+                info["bench_tier_measured"] = bench.get("tier_measured")
+                info["bench_mismatch"]  = bench.get("tier_mismatch", False)
+                info["bench_timestamp"] = bench.get("timestamp")
+        return state
+
+    @app.get("/benchmarks", summary="Cached benchmark results for all backends")
+    async def benchmarks(request: Request):
+        from router.benchmark import load_all_results
+        return load_all_results(request.app.state.config)
 
     @app.get("/backends", summary="List all registered backends")
     async def list_backends(request: Request):

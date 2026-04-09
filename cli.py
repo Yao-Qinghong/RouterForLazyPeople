@@ -445,6 +445,96 @@ def cmd_rescan(args):
         sys.exit(1)
 
 
+def cmd_bench(args):
+    """
+    Run PP and TG speed benchmarks against registered backends.
+    Requires the router to be running (./router-start first).
+    Results are cached to ~/.llm-router/benchmarks/ and shown in status.
+    """
+    import urllib.request
+
+    # Fetch backend list from router
+    try:
+        with urllib.request.urlopen(f"{_router_url()}/backends", timeout=5) as r:
+            backends = json.loads(r.read())
+    except Exception as e:
+        print(f"Router not reachable: {e}")
+        print("Start it first with: ./router-start")
+        sys.exit(1)
+
+    targets = list(backends.keys())
+    if getattr(args, "backend", None):
+        if args.backend not in backends:
+            print(f"Unknown backend '{args.backend}'. Available: {', '.join(targets)}")
+            sys.exit(1)
+        targets = [args.backend]
+
+    # Skip external servers (LM Studio, Ollama managed externally)
+    skippable = {"openai", "ollama"}
+    runnable  = [k for k in targets if backends[k].get("engine") not in skippable]
+    skipped   = [k for k in targets if backends[k].get("engine") in skippable]
+
+    if skipped:
+        print(f"Skipping external servers (not managed by router): {', '.join(skipped)}")
+
+    if not runnable:
+        print("No benchmarkable backends found.")
+        return
+
+    print(f"Benchmarking {len(runnable)} backend(s) — this takes ~30s per backend...\n")
+
+    import asyncio
+
+    async def _run_all():
+        # Dynamic import inside async context to avoid circular imports
+        sys.path.insert(0, str(PROJECT_DIR))
+        from router.benchmark import measure_backend, save_result, format_results, load_result
+        from router.config import load_config
+        config = load_config()
+
+        results = []
+        for key in runnable:
+            cfg = backends[key]
+            # Ensure backend is running first
+            print(f"  Starting {key}...", end=" ", flush=True)
+            try:
+                req = urllib.request.Request(
+                    f"{_router_url()}/start/{key}", method="POST",
+                    headers={"Content-Type": "application/json"}, data=b"{}",
+                )
+                urllib.request.urlopen(req, timeout=120)
+                print("up", end="  ", flush=True)
+            except Exception as e:
+                print(f"failed to start: {e}")
+                results.append({"backend_key": key, "error": str(e)})
+                continue
+
+            print(f"benchmarking...", end=" ", flush=True)
+            r = await measure_backend(key, cfg, config)
+            save_result(r, config)
+            results.append(r)
+
+            if r.get("error"):
+                print(f"ERROR: {r['error']}")
+            elif r.get("tier_mismatch"):
+                print(f"done  ⚠  TG={r['tg_tok_s']:.0f} tok/s  (tier mismatch)")
+            else:
+                print(f"done  TG={r['tg_tok_s']:.0f} tok/s  PP={r['pp_tok_s']:.0f} tok/s")
+
+        print()
+        print(format_results(results))
+
+        # Suggest fixes for mismatches
+        mismatches = [r for r in results if r.get("tier_mismatch")]
+        if mismatches:
+            print("\nTo fix tier assignments, edit config/backends.yaml and set tier: explicitly.")
+            for r in mismatches:
+                print(f"  {r['backend_key']}: assigned={r['tier_assigned']}  "
+                      f"measured speed suggests tier={r['tier_measured']}")
+
+    asyncio.run(_run_all())
+
+
 def cmd_logs(args):
     if not ROUTER_LOG.exists():
         print(f"Log file not found: {ROUTER_LOG}")
@@ -794,6 +884,11 @@ def main():
     # logs
     p_logs = sub.add_parser("logs", help="Tail the router log")
     p_logs.set_defaults(func=cmd_logs)
+
+    # bench
+    p_bench2 = sub.add_parser("bench", help="Benchmark PP and TG speed for each backend")
+    p_bench2.add_argument("--backend", metavar="KEY", help="Benchmark a single backend only")
+    p_bench2.set_defaults(func=cmd_bench)
 
     # sysinfo
     p_sys = sub.add_parser("sysinfo", help="Show hardware, engine versions, and install recommendations")
