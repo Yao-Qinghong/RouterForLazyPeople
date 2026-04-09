@@ -4,6 +4,8 @@ A local LLM routing proxy for people who want things to just work.
 
 Sits between your chat apps and your local models — starts them on demand, stops them when idle, routes requests to the right size model automatically, and benchmarks performance over time.
 
+> **Current status:** active pre-release development, focused first on one operator-owned DGX Spark / CUDA Linux workstation. Core router and CLI paths have automated tests, but the project has **not** completed a public-release QA matrix across engines, clients, operating systems, GPUs, and OOM cases. See [`docs/POSITIONING.md`](docs/POSITIONING.md) for scope, related projects, and release-readiness notes.
+
 ```
 Your App (OpenAI / Anthropic SDK / OpenClaw / Open WebUI)
          ↓

@@ -7,6 +7,7 @@ This repo separates onboarding, public behavior, internal design, and operations
 - [`API_SPEC.md`](API_SPEC.md): public/functional behavior, supported endpoints, routing rules, auth behavior, and compatibility surfaces
 - [`ARCHITECTURE.md`](ARCHITECTURE.md): internal technical design, component boundaries, data flow, and configuration precedence
 - [`OPERATIONS.md`](OPERATIONS.md): install/update/reload behavior, supported platforms and engines, and operational non-goals
+- [`POSITIONING.md`](POSITIONING.md): project positioning, related tools, current QA status, and public-release checklist
 
 Guideline:
 
@@ -14,3 +15,4 @@ Guideline:
 - Put public route and behavior guarantees in `API_SPEC.md`
 - Put internal implementation and module boundaries in `ARCHITECTURE.md`
 - Put installation, update, reload, and monitoring runbooks in `OPERATIONS.md`
+- Put project positioning, public-release scope, and QA gates in `POSITIONING.md`
