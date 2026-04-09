@@ -2,6 +2,29 @@
 
 This document is the operational spec for installation, startup, updates, supported environments, and day-2 maintenance.
 
+## First Run
+
+Default path:
+
+```bash
+git clone https://github.com/Yao-Qinghong/RouterForLazyPeople
+cd RouterForLazyPeople
+python cli.py start
+```
+
+What happens on first run:
+
+- A local `.venv` is created if missing
+- Python dependencies are installed
+- The router starts on the configured port
+- Common model directories are scanned automatically
+
+When manual config is needed:
+
+- Edit `config/backends.yaml` if you want fixed `fast` / `mid` / `deep` backends
+- Edit `config/settings.yaml` if your models live outside the default `scan_dirs`
+- After changing scan directories while the router is running, call `python cli.py rescan`
+
 ## Supported Platforms And Engines
 
 - Supported platforms: Linux and macOS
@@ -20,6 +43,10 @@ This document is the operational spec for installation, startup, updates, suppor
 - `python cli.py stop` stops the router process and frees its port when possible.
 - `python cli.py status` reports backend runtime state from the live router.
 - `python cli.py logs` tails the router log file.
+- Default client endpoints after startup:
+  - OpenAI-compatible: `http://localhost:9001/v1`
+  - Anthropic-compatible: `http://localhost:9001/anthropic`
+  - Model discovery: `http://localhost:9001/v1/models`
 
 ## Update Behavior
 
@@ -55,3 +82,4 @@ This document is the operational spec for installation, startup, updates, suppor
 - Treat `API_SPEC.md` as the public contract for clients and integrators.
 - Treat `ARCHITECTURE.md` as the internal technical source of truth.
 - Treat this document as the runbook for install, update, reload, and monitoring behavior.
+- Keep docs structure details in `docs/README.md`, not in the middle of the README quick-start flow.

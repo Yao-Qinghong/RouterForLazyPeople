@@ -36,20 +36,21 @@ Your App (OpenAI / Anthropic SDK / OpenClaw / Open WebUI)
 ```bash
 git clone https://github.com/Yao-Qinghong/RouterForLazyPeople
 cd RouterForLazyPeople
-
-# 1. Edit your model paths
-nano config/backends.yaml
-
-# 2. Start
 python cli.py start
 ```
 
-On first run it creates a `.venv` and installs dependencies automatically.
+On first run it creates a `.venv`, installs dependencies, and starts the router.
 
-Documentation is now split by responsibility:
-- Public API and functional contract: [`docs/API_SPEC.md`](docs/API_SPEC.md)
-- Internal technical design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-- Operations and runtime behavior: [`docs/OPERATIONS.md`](docs/OPERATIONS.md)
+If your models already live in a default scan directory such as `~/.lmstudio/models`, `~/models`, `~/llm-models`, `~/.cache/huggingface/hub`, or `~/trt-engines`, you can often stop here.
+
+If not, do one of these:
+- Edit `config/backends.yaml` to point `fast`, `mid`, and `deep` at specific models
+- Edit `config/settings.yaml` to add your model directories to `scan_dirs`, then run `python cli.py rescan` after startup
+
+After startup:
+- OpenAI-compatible clients: `http://localhost:9001/v1`
+- Anthropic-compatible clients: `http://localhost:9001/anthropic`
+- Model list: `http://localhost:9001/v1/models`
 
 ---
 
@@ -127,6 +128,14 @@ python cli.py logs               # tail the router log
 - CUDA on systems with a usable CUDA toolchain
 - Metal on macOS
 - CPU-only everywhere else
+
+## More Docs
+
+- Overview and onboarding: this README
+- Public API and functional contract: [`docs/API_SPEC.md`](docs/API_SPEC.md)
+- Internal technical design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- Operations and runtime behavior: [`docs/OPERATIONS.md`](docs/OPERATIONS.md)
+- Docs index: [`docs/README.md`](docs/README.md)
 
 ### Startup output
 
