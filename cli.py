@@ -555,6 +555,163 @@ def cmd_sysinfo(args):
         print("  No conflicts detected.")
 
 
+def cmd_service(args):
+    """Install / uninstall the router as a system service (auto-start on boot)."""
+    system = platform.system()
+    if system == "Darwin":
+        _service_macos(args.action)
+    elif system == "Linux":
+        _service_linux(args.action)
+    else:
+        print(f"Service management is not supported on {system}.")
+        print("Start the router manually with: python cli.py")
+        sys.exit(1)
+
+
+# ── macOS — launchd ───────────────────────────────────────────
+
+_LAUNCHD_LABEL = "com.llm-router"
+_LAUNCHD_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{_LAUNCHD_LABEL}.plist"
+
+
+def _service_macos(action: str):
+    python  = _local_python()
+    cli     = str(PROJECT_DIR / "cli.py")
+    port    = _router_port()
+    log_out = str(LOG_DIR / "service-stdout.log")
+    log_err = str(LOG_DIR / "service-stderr.log")
+
+    if action == "install":
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ensure_venv()
+
+        plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>             <string>{_LAUNCHD_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{python}</string>
+    <string>{cli}</string>
+  </array>
+  <key>WorkingDirectory</key>  <string>{PROJECT_DIR}</string>
+  <key>RunAtLoad</key>         <true/>
+  <key>KeepAlive</key>         <true/>
+  <key>StandardOutPath</key>   <string>{log_out}</string>
+  <key>StandardErrorPath</key> <string>{log_err}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>{str(VENV_DIR / 'bin')}:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+</dict>
+</plist>
+"""
+        _LAUNCHD_PLIST.parent.mkdir(parents=True, exist_ok=True)
+        _LAUNCHD_PLIST.write_text(plist)
+
+        # Unload first in case an old version is registered
+        subprocess.run(["launchctl", "unload", str(_LAUNCHD_PLIST)],
+                       capture_output=True)
+        result = subprocess.run(["launchctl", "load", "-w", str(_LAUNCHD_PLIST)],
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            print(f"Service installed and started.")
+            print(f"  The router will auto-start at every login.")
+            print(f"  OpenAI base URL: http://localhost:{port}/v1")
+            print(f"  Logs: {log_out}")
+            print(f"  To remove: python cli.py service uninstall")
+        else:
+            print(f"launchctl load failed: {result.stderr.strip()}")
+            sys.exit(1)
+
+    elif action == "uninstall":
+        if not _LAUNCHD_PLIST.exists():
+            print("Service is not installed.")
+            return
+        subprocess.run(["launchctl", "unload", "-w", str(_LAUNCHD_PLIST)],
+                       capture_output=True)
+        _LAUNCHD_PLIST.unlink(missing_ok=True)
+        print("Service uninstalled. Router will no longer auto-start.")
+
+    elif action == "status":
+        if not _LAUNCHD_PLIST.exists():
+            print("Service: not installed")
+            return
+        result = subprocess.run(
+            ["launchctl", "list", _LAUNCHD_LABEL],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            print("Service: installed and running")
+            print(result.stdout.strip())
+        else:
+            print("Service: installed but not running")
+            print(f"  Start with: launchctl load -w {_LAUNCHD_PLIST}")
+
+
+# ── Linux — systemd user service ─────────────────────────────
+
+_SYSTEMD_UNIT = "llm-router.service"
+_SYSTEMD_DIR  = Path.home() / ".config" / "systemd" / "user"
+_SYSTEMD_FILE = _SYSTEMD_DIR / _SYSTEMD_UNIT
+
+
+def _service_linux(action: str):
+    python = _local_python()
+    cli    = str(PROJECT_DIR / "cli.py")
+    port   = _router_port()
+
+    if action == "install":
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ensure_venv()
+
+        unit = f"""[Unit]
+Description=LLM Router — local LLM proxy
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory={PROJECT_DIR}
+ExecStart={python} {cli}
+Restart=on-failure
+RestartSec=5
+Environment=PATH={VENV_DIR / 'bin'}:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
+"""
+        _SYSTEMD_DIR.mkdir(parents=True, exist_ok=True)
+        _SYSTEMD_FILE.write_text(unit)
+
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        subprocess.run(["systemctl", "--user", "enable", "--now", _SYSTEMD_UNIT], check=True)
+        print(f"Service installed and started.")
+        print(f"  The router will auto-start at every login.")
+        print(f"  OpenAI base URL: http://localhost:{port}/v1")
+        print(f"  Logs: journalctl --user -u {_SYSTEMD_UNIT} -f")
+        print(f"  To remove: python cli.py service uninstall")
+
+    elif action == "uninstall":
+        if not _SYSTEMD_FILE.exists():
+            print("Service is not installed.")
+            return
+        subprocess.run(["systemctl", "--user", "disable", "--now", _SYSTEMD_UNIT],
+                       capture_output=True)
+        _SYSTEMD_FILE.unlink(missing_ok=True)
+        subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+        print("Service uninstalled. Router will no longer auto-start.")
+
+    elif action == "status":
+        result = subprocess.run(
+            ["systemctl", "--user", "status", _SYSTEMD_UNIT],
+            capture_output=True, text=True,
+        )
+        print(result.stdout.strip() or result.stderr.strip())
+
+
 def _section(title: str):
     print()
     print(f"── {title} " + "─" * max(0, 50 - len(title)))
@@ -569,7 +726,7 @@ def main():
         prog="python cli.py",
         description="LLM Router — local LLM proxy for lazy people",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
 
     # start
     p_start = sub.add_parser("start", help="Start the router")
@@ -607,7 +764,19 @@ def main():
     p_sys.add_argument("--all", action="store_true", help="Show all discovered backends (not just first 5)")
     p_sys.set_defaults(func=cmd_sysinfo)
 
+    # service
+    p_svc = sub.add_parser("service", help="Install or remove the router as a system service (auto-start on boot)")
+    p_svc.add_argument("action", choices=["install", "uninstall", "status"],
+                       help="install: register service  |  uninstall: remove it  |  status: show state")
+    p_svc.set_defaults(func=cmd_service)
+
     args = parser.parse_args()
+
+    # Default: no subcommand → start
+    if args.command is None:
+        cmd_start(argparse.Namespace(update=False))
+        return
+
     args.func(args)
 
 
