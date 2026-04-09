@@ -77,8 +77,13 @@ def classify(payload: dict, backends: dict, config: "AppConfig") -> str:
     """
     Classify a request payload and return the backend key to use.
 
-    Backends dict is passed in so routing can fall back gracefully
-    when "fast" / "mid" / "deep" aren't defined.
+    Priority order:
+      1. [route:key] explicit prefix in message
+      2. Tool use / function calling → deep  (agentic tasks need capable models)
+      3. Long prompt → deep
+      4. Deep keywords → deep
+      5. Mid keywords or medium prompt → mid
+      6. Default → fast
     """
     content = _extract_content(payload)
     messages = payload.get("messages", [])
@@ -91,21 +96,27 @@ def classify(payload: dict, backends: dict, config: "AppConfig") -> str:
             if key in backends:
                 return key
 
+    # 2. Tool use / function calling → deep
+    #    Small models produce unreliable JSON for tool calls and often
+    #    fail multi-step agentic tasks entirely.
+    if payload.get("tools") or payload.get("functions"):
+        return _pick(backends, "deep")
+
     token_count = _token_estimate(content)
 
-    # 2. Long prompt → deep
+    # 3. Long prompt → deep
     if token_count > config.routing.token_threshold_deep:
         return _pick(backends, "deep")
 
-    # 3. Deep keywords → deep
+    # 4. Deep keywords → deep
     if any(kw in content for kw in config.routing.deep_keywords):
         return _pick(backends, "deep")
 
-    # 4. Mid keywords → mid
+    # 5. Mid keywords → mid
     if token_count > config.routing.token_threshold_mid:
         return _pick(backends, "mid")
     if any(kw in content for kw in config.routing.mid_keywords):
         return _pick(backends, "mid")
 
-    # 5. Default: fast
+    # 6. Default: fast
     return _pick(backends, "fast")

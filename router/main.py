@@ -107,6 +107,52 @@ def setup_logging(config: AppConfig):
 # App factory
 # ─────────────────────────────────────────────────────────────
 
+def _quality_warning(cfg: dict) -> str:
+    """
+    Return a short warning string if a backend is likely too small for
+    code generation or agentic (tool-use) tasks. Empty string = no warning.
+
+    Thresholds (conservative — better to warn than to silently produce bad output):
+      Dense model  < 5 GB  → probably < 4-5B params → unreliable for code/agents
+      MoE model    < 3B active → same concern
+    """
+    from router.discovery import _moe_active_params
+    desc = cfg.get("description", "")
+    size_gb = cfg.get("size_gb")
+
+    active = _moe_active_params(desc)
+    if active is not None:
+        if active < 3:
+            return "too small for reliable code/tool-use (< 3B active params)"
+    elif size_gb is not None and size_gb < 5:
+        return "too small for reliable code/tool-use (< 5 GB)"
+    return ""
+
+
+def _log_routing_guidance(backends: dict, log) -> None:
+    """Log a one-time note explaining how requests are routed to tiers."""
+    has_deep = any(v.get("tier") == "deep" for v in backends.values())
+    has_mid  = any(v.get("tier") == "mid"  for v in backends.values())
+
+    log.info("  Routing rules:")
+    log.info("    tool_use / function_calling  → deep  (agentic tasks always need the best model)")
+    log.info("    long prompt / deep keywords  → deep")
+    log.info("    code keywords / medium prompt → mid")
+    log.info("    everything else              → fast")
+
+    if not has_deep and not has_mid:
+        log.warning(
+            "  No mid or deep backends available — all requests will go to fast tier.\n"
+            "  Code generation and agentic tasks may produce poor results.\n"
+            "  Add a larger model to config/backends.yaml or start a larger Ollama model."
+        )
+    elif not has_deep:
+        log.warning(
+            "  No deep backend available — tool-use and agentic requests will fall back to mid.\n"
+            "  For best agentic results, add a 70B+ model."
+        )
+
+
 def create_app(settings_path: Path | None = None) -> FastAPI:
     """
     FastAPI app factory. Called by uvicorn --factory flag.
@@ -174,8 +220,11 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
                 label = tier if tier else "untiered"
                 for k, v in tier_backends:
                     desc = v.get("description", k)
-                    size = f"  {v['size_gb']:.1f} GB" if v.get("size_gb") else ""
-                    logger.info(f"  [{label:>5}]  {k:<22} {desc}{size}")
+                    warn = _quality_warning(v)
+                    suffix = f"  ⚠ {warn}" if warn else ""
+                    logger.info(f"  [{label:>5}]  {k:<22} {desc}{suffix}")
+
+            _log_routing_guidance(backends, logger)
         else:
             logger.warning(
                 "No backends found. Quick options:\n"
