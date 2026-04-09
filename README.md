@@ -23,6 +23,7 @@ Your App (OpenAI / Anthropic SDK / OpenClaw / Open WebUI)
 - **Auto-discovery** — scans your model directories and registers GGUF / HF / TRT-LLM models automatically
 - **OpenAI-compatible** — drop-in for any OpenAI SDK client, Open WebUI, OpenClaw, Cursor, Continue, Jan
 - **Anthropic-compatible** — drop-in for Anthropic SDK, Claude Code, `@anthropic-ai/sdk`
+- **Gemini-compatible** — supports Google Gemini `generateContent` and `streamGenerateContent` payloads
 - **Benchmarking** — tracks TTFT, latency, tokens/sec per backend; export as CSV
 - **System diagnostics** — detects GPU, CUDA, CPU architecture, engine versions, install recommendations
 - **Auto-update** — one command updates llama.cpp and Python deps
@@ -44,6 +45,11 @@ python cli.py start
 ```
 
 On first run it creates a `.venv` and installs dependencies automatically.
+
+Documentation is now split by responsibility:
+- Public API and functional contract: [`docs/API_SPEC.md`](docs/API_SPEC.md)
+- Internal technical design: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- Operations and runtime behavior: [`docs/OPERATIONS.md`](docs/OPERATIONS.md)
 
 ---
 
@@ -95,6 +101,9 @@ Commented examples for vLLM, SGLang, HuggingFace TGI, and TensorRT-LLM are inclu
 
 Ports, log rotation, model scan directories, routing keywords, tier thresholds, proxy concurrency — all editable without touching Python code.
 
+It also contains optional auth, CORS, audit logging, model aliases, and preload settings.
+The `rate_limit` section is reserved for future use and is not enforced by the router yet.
+
 ---
 
 ## CLI
@@ -113,6 +122,11 @@ python cli.py update --restart   # update and restart router
 python cli.py rescan             # re-scan for new model files (no restart needed)
 python cli.py logs               # tail the router log
 ```
+
+`python cli.py update` chooses a llama.cpp rebuild mode automatically:
+- CUDA on systems with a usable CUDA toolchain
+- Metal on macOS
+- CPU-only everywhere else
 
 ### Startup output
 
@@ -175,6 +189,20 @@ Model name → backend mapping:
 | `claude-3-sonnet-*`, `claude-3-5-sonnet-*` | mid |
 | `claude-3-opus-*`, `claude-4-*` | deep |
 
+### Gemini API
+
+```bash
+curl -X POST \
+  "http://localhost:9001/gemini/v1beta/models/gemini-2.0-flash-latest:generateContent" \
+  -H "Content-Type: application/json" \
+  -H "x-goog-api-key: anything" \
+  -d '{
+    "contents": [
+      {"role": "user", "parts": [{"text": "Hello"}]}
+    ]
+  }'
+```
+
 ### OpenClaw
 
 In `openclaw.json`:
@@ -207,24 +235,37 @@ Or use a query parameter: `POST /v1/chat/completions?backend=fast`
 
 ---
 
-## API Endpoints
+## API Summary
+
+The full public route contract now lives in [`docs/API_SPEC.md`](docs/API_SPEC.md).
+The most commonly used endpoints are:
 
 | Method | Path | Description |
 |---|---|---|
+| `GET` | `/health` | Health check |
 | `GET` | `/status` | Backend run-state (running, idle seconds, PID) |
 | `GET` | `/backends` | All registered backends |
 | `GET` | `/v1/models` | OpenAI-compatible model list |
+| `GET` | `/v1/models/{model_id}` | OpenAI-compatible model detail |
 | `GET` | `/engines` | Installed engine availability |
 | `GET` | `/metrics` | Benchmark stats (TTFT, latency, tok/s per backend) |
 | `GET` | `/metrics/export` | Download full history as CSV |
+| `GET` | `/metrics/prometheus` | Prometheus text exposition |
 | `GET` | `/sysinfo` | GPU, CUDA, CPU, engine versions, recommendations |
 | `POST` | `/start/{key}` | Start a backend |
 | `POST` | `/stop/{key}` | Stop a backend |
+| `POST` | `/restart/{key}` | Restart a backend |
 | `POST` | `/rescan` | Re-discover models and reload config |
+| `POST` | `/reload-config` | Reload mutable router settings from `settings.yaml` without restart |
 | `POST` | `/retune/{key}` | Force re-tune a TRT-LLM backend |
+| `POST` | `/v1/chat/completions` | OpenAI-compatible chat completions |
+| `POST` | `/v1/completions` | OpenAI-compatible legacy completions |
+| `POST` | `/v1/embeddings` | OpenAI-compatible embeddings |
 | `POST` | `/v1/{path}` | OpenAI-compatible inference proxy |
 | `POST` | `/anthropic/v1/messages` | Anthropic Messages API proxy |
 | `POST` | `/v1/messages` | Anthropic Messages API (alias) |
+| `POST` | `/gemini/v1beta/models/{model}:generateContent` | Gemini-compatible generation |
+| `WS` | `/v1/chat/completions/ws` | WebSocket chat streaming bridge |
 
 ---
 
@@ -240,6 +281,14 @@ The router classifies each request automatically:
 | Everything else | fast |
 
 Override any time with `[route:key]` prefix or `?backend=key` query param.
+
+## Auth And Limits
+
+Authentication is optional and configured in `config/settings.yaml`.
+When enabled, inference and admin routes require either `Authorization: Bearer ...` or `x-api-key`.
+
+Built-in rate limiting is not enforced yet, even though the parser accepts a `rate_limit` section for forward compatibility.
+If you need throttling today, put the router behind a reverse proxy or API gateway.
 
 ---
 
@@ -359,6 +408,8 @@ RouterForLazyPeople/
 ├── cli.py                  # command-line interface
 └── requirements.txt        # pinned dependencies
 ```
+
+For the stricter spec split, see [`docs/README.md`](docs/README.md).
 
 ---
 

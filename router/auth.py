@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 router/auth.py — Optional API key authentication middleware
 

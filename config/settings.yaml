@@ -185,9 +185,10 @@ audit:
   log_response_body: false   # log full response body (privacy risk!)
   redact_content: true       # strip message content, keep metadata only
 
-# ── Rate limiting ─────────────────────────────────────────────
-# Per-API-key rate limiting. Requires auth to be enabled.
-# Disabled by default.
+# ── Rate limiting (reserved, not yet enforced) ───────────────
+# Parsed for future compatibility, but the router does NOT enforce
+# these limits yet. Do not rely on this section for protection.
+# Use a reverse proxy or API gateway if you need real throttling.
 rate_limit:
   enabled: false
   default_rpm: 60           # requests per minute per key

@@ -143,6 +143,7 @@ class AppConfig:
     rate_limit: RateLimitConfig
     llama_bin: Path
     data_dir: Path
+    settings_file: Path
     backends_file: Path
     model_aliases: dict[str, str] = field(default_factory=dict)
     preload: list[str] = field(default_factory=list)
@@ -344,6 +345,7 @@ def load_config(
         rate_limit=rate_limit,
         llama_bin=llama_bin,
         data_dir=data_dir,
+        settings_file=sf,
         backends_file=bf,
         model_aliases=model_aliases,
         preload=preload,

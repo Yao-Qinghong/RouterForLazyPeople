@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 router/lifecycle.py — Backend lifecycle manager
 

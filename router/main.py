@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 router/main.py — FastAPI application factory
 
@@ -9,6 +11,7 @@ Or via cli.py:
 """
 
 import asyncio
+import httpx
 import json
 import logging
 import logging.handlers
@@ -157,6 +160,11 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
             logger.info(f"  Model aliases: {config.model_aliases}")
         if config.auth.enabled:
             logger.info(f"  Auth: enabled ({len(config.auth.api_keys)} keys)")
+        if config.rate_limit.enabled:
+            logger.warning(
+                "Rate limiting is configured but not enforced in this release. "
+                "Use an external proxy or gateway for request throttling."
+            )
 
         # Store shared objects on app.state for route handlers
         app.state.manager = manager
@@ -389,14 +397,20 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
     async def reload_config(request: Request):
         """Hot-reload settings.yaml. Does NOT restart running backends."""
         try:
-            new_config = load_config()
-            # Update mutable config references
             app_config = request.app.state.config
+            new_config = load_config(app_config.settings_file, app_config.backends_file)
+            # Update mutable config references
             app_config.routing = new_config.routing
             app_config.proxy = new_config.proxy
             app_config.model_aliases = new_config.model_aliases
             app_config.idle_timeouts = new_config.idle_timeouts
             app_config.tier_thresholds = new_config.tier_thresholds
+            app_config.rate_limit = new_config.rate_limit
+            if new_config.rate_limit.enabled:
+                logger.warning(
+                    "Rate limiting was enabled in settings.yaml, but enforcement is not "
+                    "implemented. Use an external proxy or gateway for throttling."
+                )
             logger.info("Config hot-reloaded from settings.yaml")
             return {"status": "reloaded", "model_aliases": new_config.model_aliases}
         except Exception as e:
@@ -634,5 +648,7 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
     return app
 
 
-# Allow direct launch: python -m router.main
-app = create_app()
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("router.main:create_app", factory=True, host="0.0.0.0", port=9001)

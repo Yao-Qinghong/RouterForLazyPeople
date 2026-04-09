@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 router/proxy.py — OpenAI-compatible /v1/ request proxy
 

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 router/trt_tuner.py — TensorRT-LLM memory auto-tuner
 

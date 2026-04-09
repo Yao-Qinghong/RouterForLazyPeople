@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 cli.py — LLM Router command-line interface
 
@@ -18,6 +20,7 @@ Usage:
 import argparse
 import json
 import os
+import platform
 import shutil
 import socket
 import subprocess
@@ -54,6 +57,11 @@ def _router_port() -> int:
 
 def _router_url() -> str:
     return f"http://localhost:{_router_port()}"
+
+
+def _local_python() -> str:
+    """Prefer the project venv when present; otherwise use the current interpreter."""
+    return str(VENV_PYTHON if VENV_PYTHON.exists() else Path(sys.executable))
 
 
 def _lan_ip() -> str:
@@ -118,6 +126,31 @@ def _llama_dir() -> Path | None:
     return default if default.exists() else None
 
 
+def _cuda_compiler() -> str | None:
+    """Return a usable nvcc path when a CUDA toolchain is available."""
+    candidates = [
+        os.environ.get("CUDACXX"),
+        str(Path(os.environ["CUDA_HOME"]) / "bin" / "nvcc") if os.environ.get("CUDA_HOME") else None,
+        str(Path(os.environ["CUDA_PATH"]) / "bin" / "nvcc") if os.environ.get("CUDA_PATH") else None,
+        shutil.which("nvcc"),
+        "/usr/local/cuda/bin/nvcc",
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return candidate
+    return None
+
+
+def _llama_build_config() -> tuple[str, list[str]]:
+    """Choose a llama.cpp build profile that matches the local environment."""
+    system = platform.system()
+    if system == "Darwin":
+        return ("Metal", ["cmake", "-B", "build", "-DGGML_METAL=ON"])
+    if _cuda_compiler():
+        return ("CUDA", ["cmake", "-B", "build", "-DGGML_CUDA=ON", "-DCMAKE_CUDA_ARCHITECTURES=native"])
+    return ("CPU", ["cmake", "-B", "build"])
+
+
 def update_llama():
     """Pull and rebuild llama.cpp if there are new commits upstream."""
     llama_dir = _llama_dir()
@@ -157,9 +190,10 @@ def update_llama():
     subprocess.run(["git", "pull", "--quiet"], cwd=llama_dir, check=True)
 
     nproc = os.cpu_count() or 4
-    print(f"Rebuilding with CUDA (using {nproc} cores — this may take a few minutes)...")
+    build_mode, configure_cmd = _llama_build_config()
+    print(f"Rebuilding for {build_mode} (using {nproc} cores — this may take a few minutes)...")
     subprocess.run(
-        ["cmake", "-B", "build", "-DGGML_CUDA=ON", "-DCMAKE_CUDA_ARCHITECTURES=native"],
+        configure_cmd,
         cwd=llama_dir, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     subprocess.run(
@@ -219,7 +253,7 @@ def _read_pid() -> int | None:
 # ─────────────────────────────────────────────────────────────
 
 def cmd_start(args):
-    if args.update:
+    if getattr(args, "update", False):
         update_llama()
 
     ensure_venv()
@@ -349,7 +383,7 @@ def cmd_update(args):
         print("Restarting router...")
         cmd_stop(args)
         time.sleep(2)
-        cmd_start(args)
+        cmd_start(argparse.Namespace(update=False))
 
 
 def cmd_rescan(args):
@@ -392,7 +426,7 @@ def cmd_sysinfo(args):
         # Router not running — detect directly via venv Python
         try:
             result = subprocess.run(
-                [str(VENV_PYTHON), "-c",
+                [_local_python(), "-c",
                  "import sys; sys.path.insert(0, '.'); "
                  "from router.sysinfo import detect_system; "
                  "import json; print(json.dumps(detect_system()))"],
