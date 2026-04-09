@@ -636,9 +636,11 @@ def _service_macos(action: str):
         result = subprocess.run(["launchctl", "load", "-w", str(_LAUNCHD_PLIST)],
                                 capture_output=True, text=True)
         if result.returncode == 0:
+            lan = _lan_ip()
             print(f"Service installed and started.")
             print(f"  Auto-starts at every login.")
-            print(f"  OpenAI base URL: http://localhost:{port}/v1")
+            print(f"  On this machine  : http://localhost:{port}/v1")
+            print(f"  From another PC  : http://{lan}:{port}/v1")
             print(f"  Logs: {log_out}")
             print(f"  To remove: ./router-start service uninstall")
         else:
@@ -703,10 +705,13 @@ WantedBy=default.target
 
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
         subprocess.run(["systemctl", "--user", "enable", "--now", _SYSTEMD_UNIT], check=True)
+        lan = _lan_ip()
         print(f"Service installed and started.")
         print(f"  Auto-starts at every login.")
-        print(f"  OpenAI base URL: http://localhost:{port}/v1")
+        print(f"  On this machine  : http://localhost:{port}/v1")
+        print(f"  From another PC  : http://{lan}:{port}/v1")
         print(f"  Logs: journalctl --user -u {_SYSTEMD_UNIT} -f")
+        _warn_firewall(port, lan)
         print(f"  To remove: ./router-start service uninstall")
 
     elif action == "uninstall":
