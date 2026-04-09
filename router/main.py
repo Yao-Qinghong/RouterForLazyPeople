@@ -243,6 +243,28 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
                 "Use an external proxy or gateway for request throttling."
             )
 
+        # Inject cached benchmark results into the router so best-engine
+        # selection uses measured TG speed from previous bench runs.
+        from router.benchmark import load_all_results
+        from router.routing import set_benchmark_results
+        _bench_results = load_all_results(config)
+        set_benchmark_results(_bench_results)
+        if _bench_results:
+            logger.info(f"  Benchmarks loaded: {len(_bench_results)} backend(s) have measured TG speed")
+            for bkey, br in _bench_results.items():
+                if br.get("tg_tok_s"):
+                    logger.info(
+                        f"    {bkey:<22} TG={br['tg_tok_s']:.0f} tok/s  "
+                        f"PP={br.get('pp_tok_s', 0):.0f} tok/s  "
+                        f"(tier assigned={br.get('tier_assigned')})"
+                    )
+        else:
+            logger.info(
+                "  No benchmark data found. Run: python cli.py bench\n"
+                "  Without benchmarks, routing picks best engine by capability rank "
+                "(trt-llm > vllm > sglang > llama.cpp > openai > ollama)"
+            )
+
         # Store shared objects on app.state for route handlers
         app.state.manager = manager
         app.state.metrics_store = metrics_store
@@ -479,6 +501,10 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
         running_before = {k for k in manager.backends if manager.is_running(k)}
         new_backends = build_backend_registry(cfg)
         manager.update_registry(new_backends)
+        # Refresh benchmark data so new/renamed backends get correct routing weights
+        from router.benchmark import load_all_results
+        from router.routing import set_benchmark_results
+        set_benchmark_results(load_all_results(cfg))
         discovered = sum(1 for v in new_backends.values() if v.get("auto_discovered"))
         return {
             "total":     len(new_backends),

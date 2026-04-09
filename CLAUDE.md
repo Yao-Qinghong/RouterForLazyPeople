@@ -22,12 +22,14 @@ pip install -r requirements.txt
 pytest                        # all tests
 pytest tests/test_routing.py  # single file
 
-# Lint / type check (not yet configured — add ruff/mypy if needed)
+# Benchmark all backends (measures real PP/TG tok/s, saves to ~/.llm-router/benchmarks/)
+python cli.py bench
+python cli.py bench --backend fast   # single backend only
 
-# Hardware diagnostics
+# Hardware diagnostics (GPU, CUDA, CPU, installed engine versions, install recommendations)
 python cli.py sysinfo
 
-# Force backend rescan
+# Force backend rescan (re-detect running servers + re-scan model dirs)
 python cli.py rescan
 
 # Rebuild TRT-LLM config from scratch
@@ -53,16 +55,36 @@ client → router/main.py (FastAPI)
 
 proxy.py:
   1. resolve model alias (config.model_aliases: "gpt-4" → "deep")
-  2. routing.classify(payload, backends, config) → backend key
-  3. lifecycle.BackendManager.ensure_running(key)  ← lazy-starts subprocess
-  4. forward request via httpx (streaming or buffered)
-  5. record metrics (metrics.MetricsStore.record)
+  2. model name → backend key direct match (if payload.model == a backend key)
+  3. routing.classify(payload, backends, config) → tier → _pick() → backend key
+  4. lifecycle.BackendManager.ensure_running(key)  ← lazy-starts subprocess
+  5. forward request via httpx (streaming or buffered)
+  6. record metrics (metrics.MetricsStore.record)
 ```
+
+### Routing classification (router/routing.py)
+
+`classify()` assigns a tier in priority order:
+
+1. `[route:key]` prefix in any message → exact backend key
+2. Tool use / function calling → `deep` (small models produce unreliable tool JSON)
+3. Token count > `token_threshold_deep` → `deep`
+4. Deep keywords match → `deep`
+5. Token count > `token_threshold_mid` or mid keywords → `mid`
+6. Default → `fast`
+
+`_pick(backends, tier)` selects the best backend within a tier:
+
+1. Highest measured TG tok/s from `python cli.py bench` results (cached in `_bench`)
+2. Engine capability rank fallback: `trt-llm > vllm > sglang > llama.cpp > huggingface > openai > ollama`
+3. Round-robin only among backends with identical score (load balancing)
+
+Benchmark data is injected at startup via `set_benchmark_results(load_all_results(config))` and refreshed after `/rescan`. Without benchmarks, routing falls back to engine rank silently.
 
 ### Configuration (no Python editing for operators)
 
 - **`config/settings.yaml`** — all tunable knobs: host/port, logging, llama_bin, scan_dirs, routing thresholds, keywords, timeouts, proxy settings, metrics, model_aliases, preload list, auth, CORS, rate limiting.
-- **`config/backends.yaml`** — manual backend definitions (slug → port, model path, engine, tier, idle_timeout, etc.).
+- **`config/backends.yaml`** — manual backend definitions (slug → port, model path, engine, tier, idle_timeout, etc.). Empty by default; auto-discovery handles fresh installs.
 
 `router/config.py` loads both files into `AppConfig` dataclasses. Search order for settings.yaml: CLI arg → `$LLM_ROUTER_CONFIG` → `./config/settings.yaml` → `~/.llm-router/settings.yaml`.
 
@@ -76,14 +98,36 @@ All modules accept `config: AppConfig` as a parameter — no globals. The config
 - **Lazy start**: `ensure_running(key)` is called on every request; if the process isn't running, it spawns it and polls `/health` until ready or `startup_wait` expires.
 - **Per-backend asyncio.Lock** prevents duplicate starts from concurrent requests.
 - **Idle eviction**: `idle_watchdog()` runs every 30s and calls `stop(key)` for backends silent longer than `idle_timeout`.
-- **Ollama exception**: uses `_OllamaSentinel` instead of a real `Popen` object; `poll()` pings the Ollama HTTP API to test liveness.
+- **External servers** (LM Studio, custom OpenAI-compatible): uses `_ExternalSentinel` instead of `Popen`; `poll()` pings `/v1/models` to test liveness; `kill()`/`terminate()` are no-ops (we don't own them).
+- **Ollama**: uses `_OllamaSentinel`; `poll()` pings the Ollama HTTP API.
 - **TRT-LLM**: delegates to `trt_tuner.TRTLLMTuner` which searches 6 progressively-smaller memory configs until health check passes, then saves the winning config to `data_dir/tuning/<key>.json`.
+
+### Auto-detection of running servers (router/discovery.py)
+
+`detect_running_servers(config)` is called by `build_backend_registry()` on every start and rescan:
+- Probes LM Studio at `localhost:1234/v1/models` → registers as `engine=openai`
+- Probes Ollama at `localhost:11434/api/tags` → registers one backend per model
+- Parallel-probes `config.discovery.probe_ports` (default: 8080, 8000, 8001, 8002, 30000) for any OpenAI-compatible server
+
+MoE tier classification: names like `35B-A3B` or `8x7B` extract active params instead of using file size. Thresholds: `< 7B active → fast`, `7–20B active → mid`, `> 20B active → deep`.
 
 ### Adding a new engine
 
 1. Add constants + `is_engine_available()` branch + `build_<engine>_cmd()` in `router/engines.py`.
 2. Add `elif engine == "..."` branch in `BackendManager._build_cmd()` (`lifecycle.py`).
 3. Add version detection in `_detect_engine_versions()` and a row in `COMPATIBILITY` (`sysinfo.py`).
+
+### Benchmarking (router/benchmark.py)
+
+`measure_backend(key, cfg, config)` runs two streaming requests directly to the backend (bypassing the router):
+- **PP benchmark**: ~400-token prompt, `max_tokens=1` — TTFT measures prefill speed
+- **TG benchmark**: short prompt, `max_tokens=80` — measures tok/s after first token
+
+Results saved to `~/.llm-router/benchmarks/<key>.json`. `load_all_results()` reads all cached results; `set_benchmark_results()` injects them into `routing.py`'s `_bench` cache. Tier thresholds: `≥ 30 tok/s → fast`, `≥ 10 → mid`, `< 10 → deep`.
+
+### System detection (router/sysinfo.py)
+
+`detect_system()` returns a dict with OS, CPU arch/model/cores, RAM, GPU (name, VRAM total/free), CUDA version, installed engine versions, stable version recommendations with install commands, and any port conflicts. Used by `GET /sysinfo` and `python cli.py sysinfo`. Never raises — all fields have safe fallbacks.
 
 ### Format compatibility layers
 
@@ -97,12 +141,14 @@ Both translators handle streaming (SSE) and non-streaming paths separately.
 
 ### Discovery (router/discovery.py + router/registry.py)
 
-`build_backend_registry(config)` merges manually-defined backends with auto-discovered ones:
-- GGUF files in `config.scan_dirs.gguf`
-- HuggingFace checkpoints in `config.scan_dirs.hf`
-- TRT-LLM engines in `config.scan_dirs.trtllm`
+`build_backend_registry(config)` merges in priority order (manual wins on key collision):
+1. Manually-defined backends from `config/backends.yaml`
+2. Auto-detected running servers (`detect_running_servers`)
+3. GGUF files in `config.scan_dirs.gguf`
+4. HuggingFace checkpoints in `config.scan_dirs.hf`
+5. TRT-LLM engines in `config.scan_dirs.trtllm`
 
-Tier assignment uses `config.tier_thresholds` (file size bins). Applies overrides from `~/.llm-router/overrides.json` (exclude/patch individual backends).
+Applies overrides from `~/.llm-router/overrides.json` (exclude/patch individual backends).
 
 ### Metrics (router/metrics.py)
 
@@ -110,7 +156,20 @@ Tier assignment uses `config.tier_thresholds` (file size bins). Applies override
 - Flushed to `~/.llm-router/metrics/YYYY-MM-DD.jsonl` every `flush_interval_sec`
 - Endpoints: `GET /metrics` (JSON), `GET /metrics/prometheus` (Prometheus text), `GET /metrics/export` (CSV download)
 
+### Key API endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /status` | Backend run-state + cached benchmark data per backend |
+| `GET /backends` | All registered backends (key, engine, tier, port, size) |
+| `GET /benchmarks` | Raw cached benchmark results for all backends |
+| `GET /sysinfo` | Hardware, CUDA, engine versions, install recommendations |
+| `GET /v1/models` | OpenAI-compatible model list (backend keys as model IDs) |
+| `POST /rescan` | Re-detect running servers + re-scan model dirs + refresh benchmarks |
+| `POST /retune/{key}` | Force TRT-LLM re-tune from scratch |
+
 ### Reference artifacts
 
 - **`router.py`** (root, 1141 lines) — original monolith kept for historical reference. **Not used by the running system.**
 - **`start_router.sh`** — original shell launcher. **Not used.**
+- **`router-start`** — shell wrapper that auto-selects `.venv/bin/python` → `python3` → `python`. Used as the ExecStart in both launchd (macOS) and systemd (Linux) service units.
