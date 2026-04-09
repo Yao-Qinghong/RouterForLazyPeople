@@ -23,7 +23,7 @@ from router.config import load_config, AppConfig
 from router.engines import available_engines, clear_engine_cache, ALL_ENGINES, is_engine_available
 from router.lifecycle import BackendManager
 from router.metrics import MetricsStore
-from router.proxy import handle_proxy, init_semaphore
+from router.proxy import handle_proxy, handle_anthropic_proxy, init_semaphore
 from router.registry import build_backend_registry
 
 logger = logging.getLogger("llm-router")
@@ -282,6 +282,34 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
         """
         return await handle_proxy(
             path=path,
+            request=request,
+            manager=request.app.state.manager,
+            metrics_store=request.app.state.metrics_store,
+            config=request.app.state.config,
+        )
+
+    @app.post("/anthropic/v1/messages", summary="Anthropic Messages API proxy (translates to local backend)")
+    @app.post("/v1/messages", summary="Anthropic Messages API proxy (alias)")
+    async def anthropic_proxy(request: Request):
+        """
+        Accepts Anthropic Messages API format and proxies to a local backend.
+
+        Drop-in replacement for https://api.anthropic.com — just change the
+        base URL in your Anthropic SDK config:
+
+            import anthropic
+            client = anthropic.Anthropic(
+                api_key="any-string",
+                base_url="http://localhost:9001/anthropic",
+            )
+
+        Backend selection (in priority order):
+          1. ?backend=key  query parameter
+          2. [route:key]   prefix in the first user message
+          3. Claude model name → tier mapping (haiku→fast, sonnet→mid, opus→deep)
+          4. Automatic classification (token count + keywords)
+        """
+        return await handle_anthropic_proxy(
             request=request,
             manager=request.app.state.manager,
             metrics_store=request.app.state.metrics_store,

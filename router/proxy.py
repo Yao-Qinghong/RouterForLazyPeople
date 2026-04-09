@@ -278,3 +278,174 @@ async def _proxy_stream(
             ))
 
     return StreamingResponse(stream_with_metrics(), media_type="text/event-stream")
+
+
+# ─────────────────────────────────────────────────────────────
+# Anthropic Messages API proxy
+# ─────────────────────────────────────────────────────────────
+
+async def handle_anthropic_proxy(
+    request: Request,
+    manager: "BackendManager",
+    metrics_store: MetricsStore,
+    config: "AppConfig",
+) -> StreamingResponse | JSONResponse:
+    """
+    Handle POST /anthropic/v1/messages and /v1/messages.
+
+    1. Parse Anthropic request body
+    2. Determine backend (query param → model name mapping → classifier)
+    3. Translate request to OpenAI format
+    4. Proxy to local backend
+    5. Translate response back to Anthropic format
+    """
+    from router.anthropic_compat import (
+        anthropic_to_openai, openai_to_anthropic,
+        stream_openai_to_anthropic, model_to_backend,
+    )
+
+    request_id = uuid.uuid4().hex[:8]
+    start_time = time.time()
+
+    # ── Parse body ────────────────────────────────────────────
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"type": "error", "error": {"type": "invalid_request_error",
+                     "message": "Invalid JSON body"}, "request_id": request_id},
+        )
+
+    original_model = payload.get("model", "claude-3-5-sonnet-20241022")
+    is_stream      = payload.get("stream", False)
+
+    # ── Determine backend ─────────────────────────────────────
+    backend_key = request.query_params.get("backend")
+    if not backend_key:
+        # Try model name → tier mapping first
+        backend_key = model_to_backend(original_model)
+        # Fall back to keyword classifier on the translated messages
+        if not backend_key or backend_key not in manager.backends:
+            oai_for_classify = anthropic_to_openai(payload)
+            from router.routing import classify
+            backend_key = classify(oai_for_classify, manager.backends, config)
+
+    if backend_key not in manager.backends:
+        return JSONResponse(
+            status_code=400,
+            content={"type": "error", "error": {
+                "type": "invalid_request_error",
+                "message": f"No backend available for model '{original_model}'. "
+                           f"Valid backends: {list(manager.backends.keys())}",
+            }},
+        )
+
+    # ── Backpressure ──────────────────────────────────────────
+    if _semaphore is None:
+        init_semaphore(config.proxy.max_concurrent_requests)
+
+    try:
+        await asyncio.wait_for(
+            _semaphore.acquire(),
+            timeout=config.proxy.queue_timeout_sec,
+        )
+    except asyncio.TimeoutError:
+        return JSONResponse(
+            status_code=529,   # Anthropic uses 529 for overload
+            content={"type": "error", "error": {
+                "type": "overloaded_error",
+                "message": "Router overloaded — too many concurrent requests",
+            }},
+        )
+
+    try:
+        # ── Start backend ─────────────────────────────────────
+        try:
+            await manager.ensure_running(backend_key)
+        except RuntimeError as e:
+            cfg = manager.backends[backend_key]
+            return JSONResponse(
+                status_code=503,
+                content={"type": "error", "error": {
+                    "type": "api_error",
+                    "message": str(e),
+                }, "log": cfg.get("log", "")},
+            )
+
+        manager.last_used[backend_key] = time.time()
+        cfg        = manager.backends[backend_key]
+        oai_payload = anthropic_to_openai(payload)
+        target_url  = f"http://localhost:{cfg['port']}/v1/chat/completions"
+
+        if is_stream:
+            converter = stream_openai_to_anthropic(original_model)
+
+            async def anthropic_stream() -> AsyncIterator[bytes]:
+                ttft_ms = None
+                try:
+                    async with httpx.AsyncClient(timeout=config.proxy.timeout_sec) as client:
+                        async with client.stream("POST", target_url, json=oai_payload) as resp:
+                            raw_stream = resp.aiter_bytes()
+                            async for chunk in converter(raw_stream):
+                                if ttft_ms is None and chunk:
+                                    ttft_ms = (time.time() - start_time) * 1000
+                                yield chunk
+                    total_ms = (time.time() - start_time) * 1000
+                    metrics_store.record(RequestRecord(
+                        request_id=request_id,
+                        timestamp_utc=datetime.now(timezone.utc).isoformat(),
+                        backend_key=backend_key, engine=cfg.get("engine", ""),
+                        model_path=cfg.get("model", cfg.get("model_dir", "")),
+                        endpoint="anthropic/messages",
+                        prompt_tokens=0, completion_tokens=0,
+                        ttft_ms=ttft_ms or total_ms, total_latency_ms=total_ms,
+                        tokens_per_sec=0.0, status_code=200, error=None,
+                    ))
+                    logger.info(f"[{backend_key}] anthropic stream done ({total_ms:.0f}ms)")
+                except Exception as e:
+                    logger.warning(f"[{backend_key}] anthropic stream error: {e}")
+
+            return StreamingResponse(
+                anthropic_stream(),
+                media_type="text/event-stream",
+                headers={"anthropic-version": "2023-06-01"},
+            )
+
+        else:
+            async with httpx.AsyncClient(timeout=config.proxy.timeout_sec) as client:
+                resp = await client.post(target_url, json=oai_payload)
+
+            total_ms = (time.time() - start_time) * 1000
+
+            try:
+                oai_body = resp.json()
+            except Exception:
+                oai_body = {}
+
+            anthropic_body = openai_to_anthropic(oai_body, original_model)
+            prompt_tokens  = anthropic_body["usage"]["input_tokens"]
+            comp_tokens    = anthropic_body["usage"]["output_tokens"]
+            tps = (comp_tokens / (total_ms / 1000)) if total_ms > 0 else 0.0
+
+            metrics_store.record(RequestRecord(
+                request_id=request_id,
+                timestamp_utc=datetime.now(timezone.utc).isoformat(),
+                backend_key=backend_key, engine=cfg.get("engine", ""),
+                model_path=cfg.get("model", cfg.get("model_dir", "")),
+                endpoint="anthropic/messages",
+                prompt_tokens=prompt_tokens, completion_tokens=comp_tokens,
+                ttft_ms=total_ms, total_latency_ms=total_ms,
+                tokens_per_sec=round(tps, 2),
+                status_code=resp.status_code, error=None,
+            ))
+
+            logger.info(f"[{backend_key}] anthropic /messages → {resp.status_code} ({total_ms:.0f}ms)")
+            return JSONResponse(
+                content=anthropic_body,
+                status_code=200,
+                headers={"anthropic-version": "2023-06-01"},
+            )
+
+    finally:
+        _semaphore.release()
