@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+
+# Router runtime data
+.llm-router/
+logs/
+*.log
+*.pid
+
+# Discovery / tuning cache (machine-specific)
+discovered.json
+tuning/
+metrics/
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
+*.swp

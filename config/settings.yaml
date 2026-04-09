@@ -1,0 +1,125 @@
+# ─────────────────────────────────────────────────────────────
+# LLM Router — settings.yaml
+#
+# Edit this file to tune the router for your system.
+# All ~ paths are expanded to your home directory automatically.
+# ─────────────────────────────────────────────────────────────
+
+router:
+  host: "0.0.0.0"
+  port: 9001
+  log_level: "INFO"          # DEBUG | INFO | WARNING | ERROR
+
+logging:
+  log_dir: "~/.llm-router/logs"
+  log_max_bytes: 10485760    # 10 MB per file before rotation
+  log_backup_count: 5        # number of rotated files to keep
+
+# Path to the llama-server binary built from llama.cpp
+llama_bin: "~/llama.cpp/build/bin/llama-server"
+
+# Where router data (tuning cache, overrides, metrics) lives
+data_dir: "~/.llm-router"
+
+# ── Model discovery ──────────────────────────────────────────
+# Directories scanned at startup (and on /rescan) for local models.
+# Add your own paths here. Missing directories are silently skipped.
+scan_dirs:
+  gguf:
+    - "~/.lmstudio/models"
+    - "~/models"
+    - "~/llm-models"
+    - "~/.cache/huggingface/hub"
+  hf:
+    - "~/models"
+    - "~/llm-models"
+    - "~/.cache/huggingface/hub"
+  trtllm:
+    - "~/trt-engines"
+    - "~/tensorrt-engines"
+    - "~/models/trt-llm"
+
+# ── Auto-discovery port range ────────────────────────────────
+# Discovered models are assigned ports from this range.
+# Manual backends (backends.yaml) use their own fixed ports.
+discovery:
+  port_start: 8100
+  port_end:   8299
+
+# ── Tier thresholds (model file size in GB) ──────────────────
+# fast  = small models, quick responses, simple questions
+# mid   = balanced quality and speed
+# deep  = large reasoning models for complex tasks
+tier_thresholds_gb:
+  fast: 15     # < 15 GB → fast
+  mid:  40     # 15–40 GB → mid
+               # ≥ 40 GB → deep (anything larger)
+
+# ── Default idle timeouts per tier (seconds) ─────────────────
+# After this much inactivity, the backend process is stopped
+# to free GPU memory. It restarts automatically on next request.
+idle_timeouts_sec:
+  fast: 300    # 5 minutes
+  mid:  180    # 3 minutes
+  deep: 600    # 10 minutes
+
+# ── Smart routing ─────────────────────────────────────────────
+# The router classifies each request and picks a backend.
+# You can always override with: [route:backend-key] at the start
+# of your message, or ?backend=key as a query parameter.
+routing:
+  # Requests longer than this (estimated tokens) → deep backend
+  token_threshold_deep: 4000
+  # Requests longer than this → mid backend
+  token_threshold_mid:  500
+
+  # Keywords that trigger the deep (reasoning) backend
+  deep_keywords:
+    - "reason"
+    - "think"
+    - "analyze"
+    - "analyse"
+    - "explain why"
+    - "step by step"
+    - "prove"
+    - "derive"
+    - "architecture"
+    - "design"
+    - "complex"
+    - "debug"
+    - "refactor"
+    - "optimize"
+    - "compare"
+    - "evaluate"
+    - "strategy"
+
+  # Keywords that trigger the mid (balanced) backend
+  mid_keywords:
+    - "write"
+    - "implement"
+    - "code"
+    - "function"
+    - "script"
+    - "fix"
+    - "review"
+    - "summarize"
+    - "summarise"
+    - "translate"
+    - "draft"
+    - "generate"
+
+# ── Proxy settings ────────────────────────────────────────────
+proxy:
+  # How long to wait for a backend response (seconds)
+  timeout_sec: 300
+  # Max simultaneous in-flight requests (backpressure)
+  max_concurrent_requests: 20
+  # How long a request can wait to acquire a slot before → 503
+  queue_timeout_sec: 30
+
+# ── Metrics / benchmarking ────────────────────────────────────
+metrics:
+  enabled: true
+  persist_dir: "~/.llm-router/metrics"
+  # Write buffered records to disk every N seconds
+  flush_interval_sec: 60

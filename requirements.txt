@@ -1,0 +1,11 @@
+# LLM Router — pinned dependencies
+# These versions are tested and stable. To upgrade, edit the version pins
+# and run: pip install -r requirements.txt
+#
+# NOTE: "pip install -r requirements.txt" installs exactly these versions.
+# It will NOT auto-upgrade. Run "python cli.py update" to apply new pins.
+
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+httpx==0.28.1
+pyyaml==6.0.2
