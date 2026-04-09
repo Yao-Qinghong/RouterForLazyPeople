@@ -4,6 +4,7 @@ import argparse
 import json
 import subprocess
 import sys
+import urllib.error
 
 import cli
 
@@ -50,6 +51,33 @@ class TestUpdateAndSysinfo:
         err = capsys.readouterr().err
         assert "requires Python 3.10+" in err
         assert "delete any old .venv" in err
+
+    def test_wait_router_ready_polls_health_endpoint(self, monkeypatch):
+        calls = []
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def fake_urlopen(url, **kwargs):
+            calls.append((url, kwargs))
+            if len(calls) == 1:
+                raise urllib.error.URLError("booting")
+            return FakeResponse()
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        monkeypatch.setattr(cli.time, "sleep", lambda _: None)
+
+        ready, error = cli._wait_router_ready(timeout_s=2)
+
+        assert ready is True
+        assert error is None
+        assert calls[0][0].endswith("/health")
 
     def test_update_restart_uses_clean_start_args(self, monkeypatch):
         calls = []

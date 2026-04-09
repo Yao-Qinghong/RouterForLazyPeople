@@ -82,6 +82,18 @@ def _router_url() -> str:
     return f"http://localhost:{_router_port()}"
 
 
+def _uvicorn_cmd() -> list[str]:
+    """Command that runs the FastAPI router. Used in foreground and daemon modes."""
+    return [
+        str(VENV_UVICORN),
+        "router.main:create_app",
+        "--factory",
+        "--host", "0.0.0.0",
+        "--port", str(_router_port()),
+        "--app-dir", str(PROJECT_DIR),
+    ]
+
+
 def _local_python() -> str:
     """Prefer the project venv when present; otherwise use the current interpreter."""
     return str(VENV_PYTHON if VENV_PYTHON.exists() else Path(sys.executable))
@@ -120,6 +132,23 @@ def _lan_ip() -> str:
         return ip
     except Exception:
         return "localhost"
+
+
+def _wait_router_ready(timeout_s: float = 20.0) -> tuple[bool, str | None]:
+    """Poll /health so user-facing commands do not report success before HTTP is ready."""
+    import urllib.request
+
+    deadline = time.monotonic() + timeout_s
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(f"{_router_url()}/health", timeout=1) as response:
+                if 200 <= getattr(response, "status", 200) < 500:
+                    return True, None
+        except Exception as e:
+            last_error = str(e)
+        time.sleep(0.5)
+    return False, last_error
 
 
 # ─────────────────────────────────────────────────────────────
@@ -324,6 +353,16 @@ def _read_pid() -> int | None:
     return None
 
 
+def _stop_saved_router_pid():
+    """Stop a router that was started by `./router-start start` and recorded in PID_FILE."""
+    pid = _read_pid()
+    if not pid:
+        return
+    subprocess.run(["kill", str(pid)], capture_output=True)
+    PID_FILE.unlink(missing_ok=True)
+    print(f"Stopped existing daemonized router (PID {pid})")
+
+
 # ─────────────────────────────────────────────────────────────
 # Commands
 # ─────────────────────────────────────────────────────────────
@@ -343,19 +382,18 @@ def cmd_start(args):
     log_handle = open(ROUTER_LOG, "a")
 
     proc = subprocess.Popen(
-        [
-            str(VENV_UVICORN),
-            "router.main:create_app",
-            "--factory",
-            "--host", "0.0.0.0",
-            "--port", str(port),
-            "--app-dir", str(PROJECT_DIR),
-        ],
+        _uvicorn_cmd(),
         stdout=log_handle,
         stderr=log_handle,
     )
 
     _save_pid(proc.pid)
+    ready, error = _wait_router_ready()
+    if not ready:
+        print(f"\nRouter process started with PID {proc.pid}, but HTTP is not ready: {error}")
+        print(f"Logs: {ROUTER_LOG}")
+        sys.exit(1)
+
     base    = _router_url()
     lan     = _lan_ip()
     same_pc = f"http://localhost:{port}/v1"
@@ -387,16 +425,15 @@ def cmd_start(args):
     print("  Stop : ./router-start stop")
 
 
+def cmd_serve(args):
+    """Run the router in the foreground. Intended for systemd/launchd service managers."""
+    ensure_venv()
+    os.execv(str(VENV_UVICORN), _uvicorn_cmd())
+
+
 def cmd_stop(args):
     port = _router_port()
-    pid = _read_pid()
-    if pid:
-        try:
-            subprocess.run(["kill", str(pid)], check=True)
-            print(f"Stopped router (PID {pid})")
-            PID_FILE.unlink(missing_ok=True)
-        except subprocess.CalledProcessError:
-            print(f"PID {pid} not found — trying port kill...")
+    _stop_saved_router_pid()
     _kill_port(port)
 
 
@@ -771,6 +808,26 @@ def _print_service_next_steps():
     print("    ./router-start bench    # run once to measure speed and improve routing")
 
 
+def _require_service_health(log_hint: str):
+    ready, error = _wait_router_ready()
+    if ready:
+        return
+    print("Service was registered, but router HTTP is not reachable yet.")
+    print(f"  Last health-check error: {error}")
+    print(f"  Logs: {log_hint}")
+    print("  Fix the logged error, then run: ./router-start service install")
+    sys.exit(1)
+
+
+def _require_launchd_running(log_hint: str):
+    result = subprocess.run(["launchctl", "list", _LAUNCHD_LABEL], capture_output=True)
+    if result.returncode == 0:
+        return
+    print("Service was registered, but launchd is not keeping it running.")
+    print(f"  Logs: {log_hint}")
+    sys.exit(1)
+
+
 # ── macOS — launchd ───────────────────────────────────────────
 
 _LAUNCHD_LABEL = "com.llm-router"
@@ -796,6 +853,7 @@ def _service_macos(action: str):
   <key>ProgramArguments</key>
   <array>
     <string>{_ROUTER_START}</string>
+    <string>serve</string>
   </array>
   <key>WorkingDirectory</key>  <string>{PROJECT_DIR}</string>
   <key>RunAtLoad</key>         <true/>
@@ -811,9 +869,13 @@ def _service_macos(action: str):
         # Unload first in case an old version is registered
         subprocess.run(["launchctl", "unload", str(_LAUNCHD_PLIST)],
                        capture_output=True)
+        _stop_saved_router_pid()
+        _kill_port(port)
         result = subprocess.run(["launchctl", "load", "-w", str(_LAUNCHD_PLIST)],
                                 capture_output=True, text=True)
         if result.returncode == 0:
+            _require_service_health(log_out)
+            _require_launchd_running(log_out)
             lan = _lan_ip()
             print(f"Service installed and started.")
             print(f"  Auto-starts at every login.")
@@ -872,7 +934,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory={PROJECT_DIR}
-ExecStart={_ROUTER_START}
+ExecStart={_ROUTER_START} serve
 Restart=on-failure
 RestartSec=5
 
@@ -883,13 +945,19 @@ WantedBy=default.target
         _SYSTEMD_FILE.write_text(unit)
 
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        subprocess.run(["systemctl", "--user", "stop", _SYSTEMD_UNIT], capture_output=True)
+        _stop_saved_router_pid()
+        _kill_port(port)
         subprocess.run(["systemctl", "--user", "enable", "--now", _SYSTEMD_UNIT], check=True)
+        log_hint = f"journalctl --user -u {_SYSTEMD_UNIT} -f"
+        _require_service_health(log_hint)
+        subprocess.run(["systemctl", "--user", "is-active", "--quiet", _SYSTEMD_UNIT], check=True)
         lan = _lan_ip()
         print(f"Service installed and started.")
         print(f"  Auto-starts at every login.")
         print(f"  On this machine  : http://localhost:{port}/v1")
         print(f"  From another PC  : http://{lan}:{port}/v1")
-        print(f"  Logs: journalctl --user -u {_SYSTEMD_UNIT} -f")
+        print(f"  Logs: {log_hint}")
         _warn_firewall(port, lan)
         _print_service_next_steps()
         print(f"  To remove: ./router-start service uninstall")
@@ -960,6 +1028,10 @@ def main():
     # logs
     p_logs = sub.add_parser("logs", help="Tail the router log")
     p_logs.set_defaults(func=cmd_logs)
+
+    # serve
+    p_serve = sub.add_parser("serve", help=argparse.SUPPRESS)
+    p_serve.set_defaults(func=cmd_serve)
 
     # bench
     p_bench2 = sub.add_parser("bench", help="Benchmark PP and TG speed for each backend")
