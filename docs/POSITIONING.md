@@ -8,6 +8,20 @@ RouterForLazyPeople is a **DGX Spark-first local LLM router**.
 
 It auto-discovers local models, starts one backend on demand, exposes OpenAI / Anthropic / Gemini-compatible endpoints, benchmarks real local speed, caches benchmark results for routing, and keeps beginner users away from bulk-start / OOM workflows.
 
+## Why This Exists
+
+This project started from a practical local-LLM problem: the maintainer wanted to play with many local models on limited hardware without manually starting, stopping, swapping, benchmarking, and remembering which app should point at which backend.
+
+The intended workflow is:
+
+- Keep a library of local models on disk
+- Connect chat / coding apps to one router URL
+- Let the router choose a reasonable model for the request
+- Start the selected backend only when needed
+- Stop idle backends so memory is available for the next model
+- Benchmark one model at a time and use those measurements for routing
+- Print useful status, logs, diagnostics, and next-step commands when something fails
+
 ## Current Status
 
 This repo is in active pre-release development.
