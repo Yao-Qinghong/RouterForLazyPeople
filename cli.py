@@ -676,6 +676,40 @@ def _benchmark_result_sort_key(result: dict) -> tuple:
     )
 
 
+def _best_benchmark_result(measured: list[dict]) -> dict | None:
+    """Return the fastest successful result from the already-sorted leaderboard list."""
+    return measured[0] if measured else None
+
+
+def _print_benchmark_usage_help(measured: list[dict]):
+    best = _best_benchmark_result(measured)
+    if not best:
+        return
+
+    best_key = best.get("backend_key", "")
+    mismatches = [
+        r for r in measured
+        if r.get("tier_assigned") and r.get("tier_measured") != r.get("tier_assigned")
+    ]
+
+    print()
+    print("Use this result")
+    print("  Auto-routing: cached TG speed ranks backends inside the same configured tier.")
+    print("  Direct use: put a backend key in your OpenAI-compatible app's model field.")
+    print(f"  Fastest measured key: {best_key}")
+    print("  One-message override:")
+    print(f"    [route:{best_key}] Say hello in one sentence. /no_think")
+    if mismatches:
+        print("  Tier mismatch to review:")
+        for result in mismatches[:3]:
+            print(
+                f"    {result.get('backend_key', 'unknown')}: "
+                f"configured={result.get('tier_assigned')}  "
+                f"measured={result.get('tier_measured')}"
+            )
+        print("    Auto-routing still uses the configured tier. Edit config/backends.yaml if you want to move it.")
+
+
 def _print_benchmark_leaderboard(results_by_key: dict):
     """Print cached active-benchmark results as a speed tier list."""
     results = sorted(results_by_key.values(), key=_benchmark_result_sort_key)
@@ -706,8 +740,12 @@ def _print_benchmark_leaderboard(results_by_key: dict):
             f"TTFT={_speed_label(result.get('ttft_ms'), 'ms')}  "
             f"think={result.get('thinking_mode', '—')}  "
             f"engine={result.get('engine', '—')}"
+            f"{'  configured=' + result['tier_assigned'] if result.get('tier_assigned') else ''}"
         )
         print(f"    {result.get('description', '')}")
+
+    _print_benchmark_usage_help(measured)
+
     if failures:
         print()
         print("FAILED / INCOMPLETE")

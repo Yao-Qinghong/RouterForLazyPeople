@@ -67,11 +67,14 @@ When the model list looks right, benchmark one model at a time:
 ```bash
 ./router-start status
 ./router-start bench --backend <backend-key> --start-stopped
+./router-start bench --results
 ```
 
 Use a backend key from `status`, for example `qwen3-5-35b-a3b-ud-q4-k-xl`.
 
 DGX Spark safety: `bench` no longer starts every discovered model automatically. It measures running models by default. `--start-stopped` allows starting the named model for the benchmark, and the CLI stops that model again afterward.
+
+Use `bench --results` to see the measured tier list. The router uses saved TG speed to rank backends inside the same configured tier. To use a measured backend directly, copy its backend key into your app's model field, or prefix one prompt with `[route:backend-key]`.
 
 ---
 
@@ -142,6 +145,7 @@ python cli.py stop               # stop the router
 python cli.py status             # show which backends are running
 python cli.py bench              # measure PP/TG speed for currently running backends
 python cli.py bench --backend KEY --start-stopped
+python cli.py bench --results    # show cached speed tier list and suggested model key
 python cli.py bench --thinking   # measure with /think prompt directive instead of default /no_think
 python cli.py benchmark          # show request metrics from real router traffic
 python cli.py benchmark --export report.csv

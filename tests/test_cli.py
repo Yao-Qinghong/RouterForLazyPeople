@@ -162,6 +162,7 @@ class TestUpdateAndSysinfo:
                 "validated": True,
                 "engine": "llama.cpp",
                 "thinking_mode": "no_think",
+                "tier_assigned": "deep",
                 "tier_measured": "fast",
                 "tg_tok_s": 61.0,
                 "pp_tok_s": 750.0,
@@ -176,6 +177,12 @@ class TestUpdateAndSysinfo:
         assert "DEEP" in out
         assert "quick" in out
         assert "TG=61 tok/s" in out
+        assert "Use this result" in out
+        assert "Fastest measured key: quick" in out
+        assert "[route:quick] Say hello" in out
+        assert "configured=deep" in out
+        assert "measured=fast" in out
+        assert "Auto-routing still uses the configured tier" in out
         assert out.index("quick") < out.index("slow")
 
     def test_backend_failure_help_prints_log_and_oom_hint(self, tmp_path, capsys):

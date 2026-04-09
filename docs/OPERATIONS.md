@@ -36,6 +36,8 @@ After backends appear in `./router-start status`, benchmark one model at a time:
 
 This starts the named backend, measures prompt-processing (PP) and token-generation (TG) speed, saves results under the configured data directory, asks the live router to rescan so speed-informed routing can use the new cache immediately, then stops the backend if bench started it.
 
+After one or more successful runs, use `./router-start bench --results` to see cached results, copy the fastest measured backend key into a client model field, or copy the printed `[route:key]` prompt override. Saved TG speed improves automatic selection among backends that are already assigned to the same configured tier; it does not automatically change a backend from `deep` to `fast`.
+
 DGX Spark safety: `python cli.py bench` measures currently running backends by default. It does not bulk-start discovered models. Use `--backend <key> --start-stopped` for one stopped model, or `--all --start-stopped` only when you have verified that every discovered backend can fit.
 
 ## Supported Platforms And Engines
@@ -86,6 +88,7 @@ DGX Spark safety: `python cli.py bench` measures currently running backends by d
 - `python cli.py sysinfo` works against the live router when available and falls back to local detection otherwise.
 - `python cli.py bench` is an active speed test for currently running managed backends. It sends fixed prompts, caches PP/TG speeds, and refreshes router routing data.
 - `python cli.py bench --backend <key> --start-stopped` intentionally starts one stopped backend for measurement and stops it afterward unless `--keep-running` is supplied.
+- `python cli.py bench --results` shows cached benchmark results, the best measured backend key, and a prompt-level route override example.
 - `python cli.py benchmark` is a passive metrics view. It reports request metrics from traffic the router has already served.
 - `GET /benchmarks` returns the cached active speed-test results.
 - `GET /metrics` provides aggregated request metrics.
