@@ -91,7 +91,28 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
         manual = sum(1 for v in backends.values() if not v.get("auto_discovered"))
         discovered = sum(1 for v in backends.values() if v.get("auto_discovered"))
 
+        # ── System info at startup ────────────────────────────
+        from router.sysinfo import detect_system
+        sys_info = detect_system(llama_bin=config.llama_bin)
+        app.state.sys_info = sys_info
+
+        gpu  = sys_info.get("gpu", {})
+        cuda = sys_info.get("cuda", {})
+        cpu  = sys_info.get("cpu", {})
+
         logger.info(f"LLM Router starting on :{config.router.port}")
+        logger.info(f"  OS:  {sys_info.get('platform', {}).get('os')} "
+                    f"{sys_info.get('platform', {}).get('arch')}")
+        logger.info(f"  CPU: {cpu.get('model') or cpu.get('arch', 'unknown')} "
+                    f"({cpu.get('cores')} cores)")
+        if gpu.get("available"):
+            for i, dev in enumerate(gpu.get("devices", [])):
+                logger.info(f"  GPU {i}: {dev['name']} "
+                            f"({dev['vram_total_gb']} GB VRAM, {dev['vram_free_gb']} GB free)")
+            logger.info(f"  CUDA: {cuda.get('version', 'unknown')} | "
+                        f"Driver: {gpu.get('driver_version', 'unknown')}")
+        else:
+            logger.info("  GPU: none detected (CPU-only mode)")
         logger.info(f"  Available engines: {engines}")
         logger.info(f"  Backends: {manual} manual + {discovered} auto-discovered = {len(backends)} total")
 
@@ -147,6 +168,27 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
     async def list_engines(request: Request):
         cfg = request.app.state.config
         return {e: is_engine_available(e, cfg) for e in ALL_ENGINES}
+
+    @app.get("/sysinfo", summary="Hardware, CUDA, engine versions, and install recommendations")
+    async def sysinfo(request: Request):
+        """
+        Returns detected system info:
+          - OS, CPU architecture, core count, RAM
+          - GPU names, VRAM (total + free), driver version
+          - CUDA version
+          - Installed engine versions (llama.cpp, vLLM, SGLang, TRT-LLM, HF)
+          - Recommended stable versions + install commands per engine
+          - Any processes already occupying LLM ports (conflicts)
+
+        Safe to call before or after backends are loaded.
+        Cached from startup; call /rescan to refresh.
+        """
+        # Return startup-cached value (fast) or re-detect if not cached
+        info = getattr(request.app.state, "sys_info", None)
+        if info is None:
+            from router.sysinfo import detect_system
+            info = detect_system(llama_bin=request.app.state.config.llama_bin)
+        return info
 
     @app.get("/metrics", summary="Per-backend performance summary")
     async def get_metrics(request: Request):

@@ -114,6 +114,21 @@ class BackendManager:
             logger.error(f"[{key}] Engine '{engine}' is not installed")
             return False
 
+        # Warn if the port is already in use by another process
+        try:
+            from router.sysinfo import detect_existing_llm_processes
+            conflicts = [p for p in detect_existing_llm_processes(ports=[cfg["port"]])
+                         if p["port"] == cfg["port"]]
+            if conflicts:
+                c = conflicts[0]
+                logger.warning(
+                    f"[{key}] Port {cfg['port']} already in use by PID {c['pid']} "
+                    f"({c['cmdline'][:60]}). "
+                    f"Stop that process first or change the port in backends.yaml."
+                )
+        except Exception:
+            pass
+
         try:
             cmd = self._build_cmd(key, trt_config)
         except ValueError as e:

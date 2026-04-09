@@ -19,6 +19,7 @@ import argparse
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -53,6 +54,18 @@ def _router_port() -> int:
 
 def _router_url() -> str:
     return f"http://localhost:{_router_port()}"
+
+
+def _lan_ip() -> str:
+    """Return the machine's LAN IP (no traffic sent — just resolves local interface)."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "localhost"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -233,13 +246,28 @@ def cmd_start(args):
     )
 
     _save_pid(proc.pid)
-    print(f"Started with PID {proc.pid}")
+    base = _router_url()
+    lan  = _lan_ip()
+    lan_base = f"http://{lan}:{port}/v1"
+    w = 60  # banner width
+
+    print(f"\nStarted with PID {proc.pid}\n")
+    print("┌─ Connect your LLM client to " + "─" * (w - 30) + "┐")
+    print(f"│  OpenAI base URL : {base}/v1" + " " * (w - 22 - len(f'{base}/v1')) + "│")
+    print(f"│  LAN / remote    : {lan_base}" + " " * (w - 22 - len(lan_base)) + "│")
+    print(f"│  API key         : any string (no auth required)" + " " * (w - 51) + "│")
+    print("└" + "─" * (w - 1) + "┘")
     print()
-    print(f"  Status:    curl {_router_url()}/status")
-    print(f"  Backends:  curl {_router_url()}/backends")
-    print(f"  Metrics:   curl {_router_url()}/metrics")
-    print(f"  Logs:      python cli.py logs")
-    print(f"  Stop:      python cli.py stop")
+    print("  Works with: Open WebUI · LM Studio API · Cursor · Continue · Jan")
+    print()
+    print("  Router endpoints:")
+    print(f"    Status   : {base}/status")
+    print(f"    Backends : {base}/backends")
+    print(f"    Metrics  : {base}/metrics")
+    print(f"    Sys info : {base}/sysinfo")
+    print()
+    print(f"  Logs : python cli.py logs")
+    print(f"  Stop : python cli.py stop")
 
 
 def cmd_stop(args):
@@ -347,6 +375,137 @@ def cmd_logs(args):
         pass
 
 
+def cmd_sysinfo(args):
+    """Show hardware info, engine versions, and install recommendations."""
+    # Try live router first; fall back to running detection directly
+    data = None
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"{_router_url()}/sysinfo", timeout=3) as r:
+            data = json.loads(r.read())
+    except Exception:
+        # Router not running — detect directly via venv Python
+        try:
+            result = subprocess.run(
+                [str(VENV_PYTHON), "-c",
+                 "import sys; sys.path.insert(0, '.'); "
+                 "from router.sysinfo import detect_system; "
+                 "import json; print(json.dumps(detect_system()))"],
+                capture_output=True, text=True, cwd=str(PROJECT_DIR),
+            )
+            if result.returncode == 0:
+                data = json.loads(result.stdout)
+        except Exception as e:
+            print(f"Could not detect system info: {e}")
+            sys.exit(1)
+
+    if not data:
+        print("No data available.")
+        sys.exit(1)
+
+    w = 60
+
+    # ── Platform ──────────────────────────────────────────────
+    plat = data.get("platform", {})
+    cpu  = data.get("cpu", {})
+    ram  = data.get("ram", {})
+    _section("System Info")
+    print(f"  OS      : {plat.get('os', '?')} {plat.get('arch', '')}  ({plat.get('os_version', '')})")
+    cpu_label = cpu.get('model') or cpu.get('arch', '?')
+    print(f"  CPU     : {cpu_label}  ({cpu.get('cores', '?')} cores)")
+    ram_gb = ram.get('total_gb')
+    print(f"  RAM     : {f'{ram_gb} GB' if ram_gb else 'unknown'}")
+    print(f"  Python  : {plat.get('python', '?')}")
+
+    # ── GPU ───────────────────────────────────────────────────
+    gpu  = data.get("gpu", {})
+    cuda = data.get("cuda", {})
+    _section("GPU")
+    if gpu.get("available"):
+        for i, dev in enumerate(gpu.get("devices", [])):
+            print(f"  GPU {i}   : {dev['name']}")
+            total = dev.get('vram_total_gb')
+            free  = dev.get('vram_free_gb')
+            if total is not None:
+                print(f"  VRAM    : {total} GB total  |  {free} GB free")
+        print(f"  Driver  : {gpu.get('driver_version', 'unknown')}")
+        print(f"  CUDA    : {cuda.get('version', 'unknown') if cuda.get('available') else 'not detected'}")
+    else:
+        print("  No NVIDIA GPU detected  (CPU-only mode)")
+
+    # ── Local LLMs ────────────────────────────────────────────
+    _section("Local LLMs (registered backends)")
+    backends_data = None
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"{_router_url()}/backends", timeout=3) as r:
+            backends_data = json.loads(r.read())
+    except Exception:
+        pass
+
+    if backends_data:
+        shown = 0
+        for key, info in backends_data.items():
+            size = f"{info['size_gb']:.1f} GB" if info.get("size_gb") else ""
+            tag  = "[auto]" if info.get("auto_discovered") else "[manual]"
+            desc = info.get("description", "")[:40]
+            print(f"  {key:<16} {size:<10} port {info['port']}  {tag}")
+            shown += 1
+            if not args.all and shown >= 5 and len(backends_data) > 5:
+                print(f"  ... {len(backends_data) - shown} more — run: python cli.py sysinfo --all")
+                break
+    else:
+        print("  (router not running — start with: python cli.py start)")
+
+    # ── Engine versions & recommendations ─────────────────────
+    _section("Engine Versions & Recommendations")
+    versions = data.get("engine_versions", {})
+    recs     = data.get("recommendations", {})
+
+    engines_display = [
+        ("llama.cpp",   "llama.cpp"),
+        ("vLLM",        "vllm"),
+        ("SGLang",      "sglang"),
+        ("TRT-LLM",     "trt-llm"),
+        ("HuggingFace", "huggingface"),
+    ]
+    for label, key in engines_display:
+        installed = versions.get(key)
+        rec       = recs.get(key, {})
+        rec_ver   = rec.get("recommended", "?")
+        compatible = rec.get("compatible", True)
+        reason     = rec.get("reason", "")
+        install    = rec.get("install_cmd", "")
+
+        if installed:
+            compat_str = "✓ compatible" if compatible else f"✗ {reason}"
+            print(f"  {label:<14} installed: {installed:<12} recommended: {rec_ver:<10} {compat_str}")
+        else:
+            compat_str = "✗ incompatible" if not compatible else ""
+            install_short = install.splitlines()[0][:50] if install else ""
+            print(f"  {label:<14} NOT installed        recommended: {rec_ver:<10} {compat_str}")
+            if install_short and compatible:
+                print(f"  {'':14}   install: {install_short}")
+
+    # ── Port conflicts ────────────────────────────────────────
+    _section("Port Conflicts")
+    conflicts = data.get("conflict_processes", [])
+    if conflicts:
+        for c in conflicts:
+            cmd_short = c.get("cmdline", "")[:55]
+            print(f"  Port {c['port']}  PID {c['pid']}  {cmd_short}")
+        print()
+        print("  Tip: stop conflicting processes before starting backends,")
+        print("       or change ports in config/backends.yaml")
+    else:
+        print("  No conflicts detected.")
+
+
+def _section(title: str):
+    print()
+    print(f"── {title} " + "─" * max(0, 50 - len(title)))
+
+
 # ─────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────
@@ -388,6 +547,11 @@ def main():
     # logs
     p_logs = sub.add_parser("logs", help="Tail the router log")
     p_logs.set_defaults(func=cmd_logs)
+
+    # sysinfo
+    p_sys = sub.add_parser("sysinfo", help="Show hardware, engine versions, and install recommendations")
+    p_sys.add_argument("--all", action="store_true", help="Show all discovered backends (not just first 5)")
+    p_sys.set_defaults(func=cmd_sysinfo)
 
     args = parser.parse_args()
     args.func(args)
