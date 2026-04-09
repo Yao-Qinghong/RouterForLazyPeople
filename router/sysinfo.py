@@ -189,6 +189,34 @@ def _detect_gpu() -> dict:
         return {"available": False, "driver_version": None, "devices": []}
 
 
+def query_free_vram():
+    """
+    Query current GPU VRAM: returns (free_gb, total_gb) summed across devices.
+    Returns None if no GPU or nvidia-smi unavailable. ~50ms per call.
+    """
+    if not shutil.which("nvidia-smi"):
+        return None
+    try:
+        out = _run([
+            "nvidia-smi",
+            "--query-gpu=memory.free,memory.total",
+            "--format=csv,noheader,nounits",
+        ])
+        if not out:
+            return None
+        free_total = 0.0
+        total_total = 0.0
+        for line in out.strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) < 2:
+                continue
+            free_total += int(parts[0]) / 1024
+            total_total += int(parts[1]) / 1024
+        return (round(free_total, 1), round(total_total, 1))
+    except Exception:
+        return None
+
+
 def _detect_cuda() -> dict:
     """Detect CUDA version from nvcc, nvidia-smi, or version files."""
     version = None

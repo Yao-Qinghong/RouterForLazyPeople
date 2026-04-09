@@ -7,9 +7,10 @@ applies user overrides, and saves the discovery cache.
 
 import json
 import logging
+from dataclasses import asdict
 from typing import TYPE_CHECKING
 
-from router.config import load_backends
+from router.config import load_backends, BackendConfig
 from router.discovery import (
     detect_running_servers,
     discover_gguf_models,
@@ -41,8 +42,13 @@ def save_discovery_cache(discovered: dict, config: "AppConfig"):
     cache_path = config.data_dir / "discovered.json"
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
+        # Convert BackendConfig dataclasses to dicts for JSON serialization
+        serializable = {
+            slug: asdict(cfg) if isinstance(cfg, BackendConfig) else cfg
+            for slug, cfg in discovered.items()
+        }
         with open(cache_path, "w") as f:
-            json.dump(discovered, f, indent=2)
+            json.dump(serializable, f, indent=2)
     except Exception as e:
         logger.warning(f"Could not save discovery cache: {e}")
 
@@ -101,7 +107,9 @@ def build_backend_registry(config: "AppConfig") -> dict:
         discovered_added.pop(slug, None)
     for slug, patches in user.get("overrides", {}).items():
         if slug in registry:
-            registry[slug].update(patches)
+            for attr, value in patches.items():
+                if hasattr(registry[slug], attr):
+                    setattr(registry[slug], attr, value)
 
     # ── Save discovery cache ──────────────────────────────────
     save_discovery_cache(discovered_added, config)

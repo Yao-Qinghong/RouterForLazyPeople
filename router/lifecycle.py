@@ -265,10 +265,49 @@ class BackendManager:
             f"Check {cfg['log']}"
         )
 
+    def _evict_for_vram(self, needed_gb: float, exclude_key: str = "") -> bool:
+        """
+        Evict idle backends until needed_gb of VRAM is free.
+        Evicts in last_used ascending order (oldest idle first).
+        Returns True if enough space is available, False if not.
+        Skips VRAM logic entirely when no GPU info is available.
+        """
+        from router.sysinfo import query_free_vram
+        vram = query_free_vram()
+        if vram is None:
+            return True  # no GPU info — skip VRAM logic
+
+        free_gb, _total_gb = vram
+        if free_gb >= needed_gb:
+            return True
+
+        # Collect running backends sorted by last_used (oldest first)
+        running = []
+        for k in self.backends:
+            if k == exclude_key or not self.is_running(k):
+                continue
+            running.append((self.last_used.get(k, 0), k))
+        running.sort()
+
+        for _, k in running:
+            if free_gb >= needed_gb:
+                return True
+            evict_gb = self.backends[k].get("vram_estimate_gb")
+            logger.info(f"[{k}] Evicting to free ~{evict_gb or '?'} GB VRAM")
+            self.stop(k)
+            vram = query_free_vram()
+            if vram is not None:
+                free_gb = vram[0]
+            elif evict_gb:
+                free_gb += evict_gb
+
+        return free_gb >= needed_gb
+
     async def ensure_running(self, key: str):
         """
         Ensure a backend is running. Start it if not.
         Uses a per-backend lock to prevent double-starts from concurrent requests.
+        Checks VRAM availability and evicts idle backends if needed.
         Raises RuntimeError if the backend cannot be started.
         """
         if self.is_running(key):
@@ -286,6 +325,18 @@ class BackendManager:
 
             cfg = self.backends[key]
             engine = cfg.get("engine", ENGINE_LLAMA)
+
+            # VRAM check — evict idle backends if needed to make room
+            vram_needed = cfg.get("vram_estimate_gb")
+            if vram_needed is not None:
+                if not self._evict_for_vram(vram_needed, exclude_key=key):
+                    from router.sysinfo import query_free_vram
+                    vram = query_free_vram()
+                    free = vram[0] if vram else 0
+                    raise RuntimeError(
+                        f"Not enough VRAM to start '{key}': need ~{vram_needed:.1f} GB, "
+                        f"only {free:.1f} GB available after evicting idle backends"
+                    )
 
             if engine == ENGINE_TRTLLM:
                 await self._start_trtllm_with_tuning(key)
@@ -371,6 +422,7 @@ class BackendManager:
         """
         Background task: stop backends that have been idle longer
         than their configured idle_timeout.
+        Also evicts the oldest backend under VRAM pressure (< 20% free).
         Runs every 30 seconds.
         """
         while True:
@@ -383,6 +435,28 @@ class BackendManager:
                 if idle_for > cfg["idle_timeout"]:
                     logger.info(f"[{key}] Idle for {idle_for:.0f}s — auto-stopping")
                     self.stop(key)
+
+            # VRAM pressure: if free < 20% of total, evict oldest backend
+            from router.sysinfo import query_free_vram
+            vram = query_free_vram()
+            if vram is not None:
+                free_gb, total_gb = vram
+                if total_gb > 0 and (free_gb / total_gb) < 0.20:
+                    oldest_key = None
+                    oldest_time = float('inf')
+                    for key in self.backends:
+                        if not self.is_running(key):
+                            continue
+                        lu = self.last_used.get(key, 0)
+                        if lu < oldest_time:
+                            oldest_time = lu
+                            oldest_key = key
+                    if oldest_key:
+                        logger.info(
+                            f"[{oldest_key}] VRAM pressure ({free_gb:.1f}/{total_gb:.1f} GB free) "
+                            f"— evicting oldest backend"
+                        )
+                        self.stop(oldest_key)
 
     def status(self) -> dict:
         """Return run-state for all registered backends."""

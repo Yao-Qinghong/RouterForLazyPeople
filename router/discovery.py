@@ -31,6 +31,7 @@ from router.engines import (
     ENGINE_OLLAMA, ENGINE_OPENAI,
     is_engine_available,
 )
+from router.config import BackendConfig, _infer_capabilities, _estimate_vram
 
 if TYPE_CHECKING:
     from router.config import AppConfig
@@ -259,22 +260,25 @@ def discover_gguf_models(config: "AppConfig", port_counter: list[int]) -> dict:
                 else:
                     tier_reason = f"{size_gb:.1f} GB"
 
-                discovered[slug] = {
-                    "engine":        ENGINE_LLAMA,
-                    "port":          port_counter[0],
-                    "model":         full_path,
-                    "log":           str(config.data_dir / "logs" / f"backend-{slug}.log"),
-                    "ctx_size":      _estimate_ctx(size_gb),
-                    "gpu_layers":    999,
-                    "flash_attn":    True,
-                    "reasoning":     _has_reasoning_kw(name),
-                    "idle_timeout":  _estimate_idle(tier, config),
-                    "startup_wait":  _estimate_startup(size_gb),
-                    "description":   f"{name} ({tier_reason})",
-                    "auto_discovered": True,
-                    "tier":          tier,
-                    "size_gb":       round(size_gb, 2),
-                }
+                backend = BackendConfig(
+                    engine=ENGINE_LLAMA,
+                    port=port_counter[0],
+                    model=full_path,
+                    log=str(config.data_dir / "logs" / f"backend-{slug}.log"),
+                    ctx_size=_estimate_ctx(size_gb),
+                    gpu_layers=999,
+                    flash_attn=True,
+                    reasoning=_has_reasoning_kw(name),
+                    idle_timeout=_estimate_idle(tier, config),
+                    startup_wait=_estimate_startup(size_gb),
+                    description=f"{name} ({tier_reason})",
+                    auto_discovered=True,
+                    tier=tier,
+                    size_gb=round(size_gb, 2),
+                    capabilities=_infer_capabilities(ENGINE_LLAMA, size_gb, name),
+                    vram_estimate_gb=_estimate_vram(ENGINE_LLAMA, size_gb),
+                )
+                discovered[slug] = backend
                 port_counter[0] += 1
 
     return discovered
@@ -344,23 +348,26 @@ def discover_hf_models(config: "AppConfig", port_counter: list[int]) -> dict:
             slug = _slug(f"hf-{dir_name}", path)
             tier = _classify_tier(size_gb, config, dir_name)
 
-            discovered[slug] = {
-                "engine":              preferred_engine,
-                "port":                port_counter[0],
-                "model":               path,
-                "log":                 str(config.data_dir / "logs" / f"backend-{slug}.log"),
-                "ctx_size":            min(_estimate_ctx(size_gb), hf_config.get("max_position_embeddings", 131072)),
-                "dtype":               "auto",
-                "gpu_memory_fraction": 0.90,
-                "trust_remote_code":   True,
-                "idle_timeout":        _estimate_idle(tier, config),
-                "startup_wait":        _estimate_startup(size_gb) + 30,
-                "description":         f"{dir_name} ({size_gb:.1f} GB, {arch}) [{preferred_engine}, auto]",
-                "auto_discovered":     True,
-                "tier":                tier,
-                "size_gb":             round(size_gb, 2),
-                "model_type":          model_type,
-            }
+            backend = BackendConfig(
+                engine=preferred_engine,
+                port=port_counter[0],
+                model=path,
+                log=str(config.data_dir / "logs" / f"backend-{slug}.log"),
+                ctx_size=min(_estimate_ctx(size_gb), hf_config.get("max_position_embeddings", 131072)),
+                dtype="auto",
+                gpu_memory_fraction=0.90,
+                trust_remote_code=True,
+                idle_timeout=_estimate_idle(tier, config),
+                startup_wait=_estimate_startup(size_gb) + 30,
+                description=f"{dir_name} ({size_gb:.1f} GB, {arch}) [{preferred_engine}, auto]",
+                auto_discovered=True,
+                tier=tier,
+                size_gb=round(size_gb, 2),
+                model_type=model_type,
+                capabilities=_infer_capabilities(preferred_engine, size_gb, dir_name),
+                vram_estimate_gb=_estimate_vram(preferred_engine, size_gb),
+            )
+            discovered[slug] = backend
             port_counter[0] += 1
 
     return discovered
@@ -396,17 +403,18 @@ def _probe_lmstudio(config: "AppConfig") -> dict:
         model_id = models[0]["id"] if models else "unknown"
         logger.info(f"Auto-detected: LM Studio on :1234  (model: {model_id})")
         return {
-            "lmstudio": {
-                "engine":         ENGINE_OPENAI,
-                "port":           1234,
-                "model":          model_id,
-                "tier":           "fast",
-                "idle_timeout":   86400,    # never auto-stop a server we don't own
-                "startup_wait":   5,
-                "auto_discovered": True,
-                "description":    f"LM Studio — {model_id}",
-                "log":            str(config.data_dir / "logs" / "backend-lmstudio.log"),
-            }
+            "lmstudio": BackendConfig(
+                engine=ENGINE_OPENAI,
+                port=1234,
+                model=model_id,
+                tier="fast",
+                idle_timeout=86400,    # never auto-stop a server we don't own
+                startup_wait=5,
+                auto_discovered=True,
+                description=f"LM Studio — {model_id}",
+                log=str(config.data_dir / "logs" / "backend-lmstudio.log"),
+                capabilities=_infer_capabilities(ENGINE_OPENAI, None, model_id),
+            ),
         }
     except Exception:
         return {}
@@ -428,17 +436,18 @@ def _probe_ollama_models(config: "AppConfig") -> dict:
             name = m["name"]
             slug = "ollama-" + re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
             tier = _tier_from_model_name(name)
-            result[slug] = {
-                "engine":         ENGINE_OLLAMA,
-                "port":           11434,
-                "model":          name,
-                "tier":           tier,
-                "idle_timeout":   86400,
-                "startup_wait":   30,
-                "auto_discovered": True,
-                "description":    f"Ollama — {name}",
-                "log":            str(config.data_dir / "logs" / f"backend-{slug}.log"),
-            }
+            result[slug] = BackendConfig(
+                engine=ENGINE_OLLAMA,
+                port=11434,
+                model=name,
+                tier=tier,
+                idle_timeout=86400,
+                startup_wait=30,
+                auto_discovered=True,
+                description=f"Ollama — {name}",
+                log=str(config.data_dir / "logs" / f"backend-{slug}.log"),
+                capabilities=_infer_capabilities(ENGINE_OLLAMA, None, name),
+            )
         return result
     except Exception:
         return {}
@@ -471,17 +480,18 @@ def _probe_openai_servers(config: "AppConfig") -> dict:
             label = _guess_engine_label(port)
             logger.info(f"Auto-detected: {label} on :{port}  (model: {model_id})")
             return {
-                slug: {
-                    "engine":         ENGINE_OPENAI,
-                    "port":           port,
-                    "model":          model_id,
-                    "tier":           _tier_from_model_name(model_id),
-                    "idle_timeout":   86400,
-                    "startup_wait":   5,
-                    "auto_discovered": True,
-                    "description":    f"{label} :{port} — {model_id}",
-                    "log":            str(config.data_dir / "logs" / f"backend-{slug}.log"),
-                }
+                slug: BackendConfig(
+                    engine=ENGINE_OPENAI,
+                    port=port,
+                    model=model_id,
+                    tier=_tier_from_model_name(model_id),
+                    idle_timeout=86400,
+                    startup_wait=5,
+                    auto_discovered=True,
+                    description=f"{label} :{port} — {model_id}",
+                    log=str(config.data_dir / "logs" / f"backend-{slug}.log"),
+                    capabilities=_infer_capabilities(ENGINE_OPENAI, None, model_id),
+                ),
             }
         except Exception:
             return {}
@@ -578,17 +588,17 @@ def discover_trtllm_engines(config: "AppConfig", port_counter: list[int]) -> dic
                     tokenizer_dir = candidate
                     break
 
-            discovered[slug] = {
-                "engine":        ENGINE_TRTLLM,
-                "port":          port_counter[0],
-                "model_dir":     entry.path,
-                "tokenizer":     tokenizer_dir,
-                "log":           str(config.data_dir / "logs" / f"backend-{slug}.log"),
-                "idle_timeout":  600,
-                "startup_wait":  120,
-                "description":   description,
-                "auto_discovered": True,
-                "trt_config": {
+            discovered[slug] = BackendConfig(
+                engine=ENGINE_TRTLLM,
+                port=port_counter[0],
+                model_dir=entry.path,
+                tokenizer=tokenizer_dir,
+                log=str(config.data_dir / "logs" / f"backend-{slug}.log"),
+                idle_timeout=600,
+                startup_wait=120,
+                description=description,
+                auto_discovered=True,
+                trt_config={
                     "max_batch_size": 1,
                     "max_input_len":  32768,
                     "max_output_len": 4096,
@@ -598,7 +608,8 @@ def discover_trtllm_engines(config: "AppConfig", port_counter: list[int]) -> dic
                     "max_beam_width": 1,
                     "gpu_memory_fraction": 0.90,
                 },
-            }
+                capabilities=_infer_capabilities(ENGINE_TRTLLM, None, description),
+            )
             port_counter[0] += 1
 
     return discovered
