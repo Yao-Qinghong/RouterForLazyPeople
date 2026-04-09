@@ -10,8 +10,9 @@ Usage in proxy.py:
     store.record(rec)
 
 Endpoints:
-    GET /metrics       → store.summary()
-    GET /metrics/export → store.export_csv(path)
+    GET /metrics            → store.summary()
+    GET /metrics/export     → store.export_csv(path)
+    GET /metrics/prometheus → store.prometheus()
 """
 
 import asyncio
@@ -73,6 +74,10 @@ class MetricsStore:
         self._pending: list[RequestRecord] = []   # buffer waiting to be flushed
         self._lock = asyncio.Lock()
         self._enabled = config.metrics.enabled
+        # Global counters for Prometheus (never reset)
+        self._total_requests = 0
+        self._total_errors = 0
+        self._total_tokens = 0
 
     def record(self, rec: RequestRecord):
         """Add a record to the ring buffer and the flush-pending list."""
@@ -80,6 +85,10 @@ class MetricsStore:
             return
         self._ring.append(rec)
         self._pending.append(rec)
+        self._total_requests += 1
+        if rec.error or rec.status_code >= 400:
+            self._total_errors += 1
+        self._total_tokens += rec.prompt_tokens + rec.completion_tokens
 
     async def flush(self):
         """Write pending records to today's JSONL file."""
@@ -147,6 +156,59 @@ class MetricsStore:
             }
 
         return result
+
+    def prometheus(self) -> str:
+        """
+        Return metrics in Prometheus text exposition format.
+        Scrapeable by Prometheus, VictoriaMetrics, Grafana Agent, etc.
+        """
+        lines = []
+        lines.append("# HELP llm_router_requests_total Total number of inference requests")
+        lines.append("# TYPE llm_router_requests_total counter")
+        lines.append(f"llm_router_requests_total {self._total_requests}")
+
+        lines.append("# HELP llm_router_errors_total Total number of failed requests")
+        lines.append("# TYPE llm_router_errors_total counter")
+        lines.append(f"llm_router_errors_total {self._total_errors}")
+
+        lines.append("# HELP llm_router_tokens_total Total tokens processed (prompt + completion)")
+        lines.append("# TYPE llm_router_tokens_total counter")
+        lines.append(f"llm_router_tokens_total {self._total_tokens}")
+
+        # Per-backend gauges from ring buffer
+        summary = self.summary()
+        for backend, stats in summary.items():
+            labels = f'backend="{backend}"'
+
+            lines.append(f"# HELP llm_router_backend_requests Backend request count (ring buffer)")
+            lines.append(f"# TYPE llm_router_backend_requests gauge")
+            lines.append(f'llm_router_backend_requests{{{labels}}} {stats["request_count"]}')
+
+            lines.append(f"# HELP llm_router_backend_errors Backend error count (ring buffer)")
+            lines.append(f"# TYPE llm_router_backend_errors gauge")
+            lines.append(f'llm_router_backend_errors{{{labels}}} {stats["error_count"]}')
+
+            if stats["avg_ttft_ms"] is not None:
+                lines.append(f"# HELP llm_router_ttft_avg_ms Average time to first token (ms)")
+                lines.append(f"# TYPE llm_router_ttft_avg_ms gauge")
+                lines.append(f'llm_router_ttft_avg_ms{{{labels}}} {stats["avg_ttft_ms"]}')
+
+            if stats["p95_ttft_ms"] is not None:
+                lines.append(f"# HELP llm_router_ttft_p95_ms P95 time to first token (ms)")
+                lines.append(f"# TYPE llm_router_ttft_p95_ms gauge")
+                lines.append(f'llm_router_ttft_p95_ms{{{labels}}} {stats["p95_ttft_ms"]}')
+
+            if stats["avg_total_latency_ms"] is not None:
+                lines.append(f"# HELP llm_router_latency_avg_ms Average total latency (ms)")
+                lines.append(f"# TYPE llm_router_latency_avg_ms gauge")
+                lines.append(f'llm_router_latency_avg_ms{{{labels}}} {stats["avg_total_latency_ms"]}')
+
+            if stats["avg_tokens_per_sec"] is not None:
+                lines.append(f"# HELP llm_router_tokens_per_sec Average tokens per second")
+                lines.append(f"# TYPE llm_router_tokens_per_sec gauge")
+                lines.append(f'llm_router_tokens_per_sec{{{labels}}} {stats["avg_tokens_per_sec"]}')
+
+        return "\n".join(lines) + "\n"
 
     def export_csv(self, output_path: Path):
         """Write all history (JSONL files) to a single CSV file."""

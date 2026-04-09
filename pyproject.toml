@@ -1,0 +1,9 @@
+[project]
+name = "llm-router"
+version = "3.0.0"
+description = "Local LLM routing proxy — lazy, efficient, beginner-friendly"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

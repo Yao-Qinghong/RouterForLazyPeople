@@ -9,6 +9,7 @@ Or via cli.py:
 """
 
 import asyncio
+import json
 import logging
 import logging.handlers
 import tempfile
@@ -16,14 +17,14 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
 from router.config import load_config, AppConfig
 from router.engines import available_engines, clear_engine_cache, ALL_ENGINES, is_engine_available
 from router.lifecycle import BackendManager
 from router.metrics import MetricsStore
-from router.proxy import handle_proxy, handle_anthropic_proxy, init_semaphore
+from router.proxy import handle_proxy, handle_anthropic_proxy, handle_gemini_proxy, init_semaphore
 from router.registry import build_backend_registry
 
 logger = logging.getLogger("llm-router")
@@ -33,11 +34,38 @@ logger = logging.getLogger("llm-router")
 # Logging setup
 # ─────────────────────────────────────────────────────────────
 
+class JSONFormatter(logging.Formatter):
+    """Structured JSON log formatter for log aggregators (ELK, Loki, Datadog)."""
+    def format(self, record: logging.LogRecord) -> str:
+        entry = {
+            "timestamp": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        if record.exc_info and record.exc_info[0]:
+            entry["exception"] = self.formatException(record.exc_info)
+        return json.dumps(entry)
+
+
 def setup_logging(config: AppConfig):
-    """Configure rotating file + console logging."""
+    """Configure rotating file + console logging. Optionally use JSON format."""
     log_dir = config.logging.log_dir
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "router.log"
+
+    if config.logging.json_format:
+        formatter = JSONFormatter()
+        console_formatter = JSONFormatter()
+    else:
+        formatter = logging.Formatter(
+            "%(asctime)s %(levelname)-8s %(name)s  %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        )
+        console_formatter = logging.Formatter(
+            "%(asctime)s %(levelname)s %(message)s",
+            datefmt="%H:%M:%S",
+        )
 
     file_handler = logging.handlers.RotatingFileHandler(
         log_file,
@@ -45,21 +73,31 @@ def setup_logging(config: AppConfig):
         backupCount=config.logging.log_backup_count,
         encoding="utf-8",
     )
-    file_handler.setFormatter(logging.Formatter(
-        "%(asctime)s %(levelname)-8s %(name)s  %(message)s",
-        datefmt="%Y-%m-%dT%H:%M:%S",
-    ))
+    file_handler.setFormatter(formatter)
 
     console_handler = logging.StreamHandler()
-    console_handler.setFormatter(logging.Formatter(
-        "%(asctime)s %(levelname)s %(message)s",
-        datefmt="%H:%M:%S",
-    ))
+    console_handler.setFormatter(console_formatter)
 
     root = logging.getLogger()
     root.setLevel(getattr(logging, config.router.log_level, logging.INFO))
     root.addHandler(file_handler)
     root.addHandler(console_handler)
+
+    # Setup audit logger (separate file)
+    if config.audit.enabled:
+        audit_dir = config.audit.log_dir
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        audit_handler = logging.handlers.RotatingFileHandler(
+            audit_dir / "audit.jsonl",
+            maxBytes=config.logging.log_max_bytes,
+            backupCount=config.logging.log_backup_count,
+            encoding="utf-8",
+        )
+        audit_handler.setFormatter(logging.Formatter("%(message)s"))
+        audit_logger = logging.getLogger("llm-router.audit")
+        audit_logger.addHandler(audit_handler)
+        audit_logger.setLevel(logging.INFO)
+        audit_logger.propagate = False
 
 
 # ─────────────────────────────────────────────────────────────
@@ -115,6 +153,10 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
             logger.info("  GPU: none detected (CPU-only mode)")
         logger.info(f"  Available engines: {engines}")
         logger.info(f"  Backends: {manual} manual + {discovered} auto-discovered = {len(backends)} total")
+        if config.model_aliases:
+            logger.info(f"  Model aliases: {config.model_aliases}")
+        if config.auth.enabled:
+            logger.info(f"  Auth: enabled ({len(config.auth.api_keys)} keys)")
 
         # Store shared objects on app.state for route handlers
         app.state.manager = manager
@@ -124,6 +166,10 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
         # Background tasks
         watchdog_task = asyncio.create_task(manager.idle_watchdog())
         flush_task = asyncio.create_task(metrics_store.flush_loop())
+
+        # Preload backends if configured
+        if config.preload:
+            asyncio.create_task(manager.preload(config.preload))
 
         yield
 
@@ -136,14 +182,39 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
 
     app = FastAPI(
         title="LLM Router",
-        description="Local LLM routing proxy — lazy, efficient, beginner-friendly",
-        version="2.0.0",
+        description="Local LLM routing proxy — lazy, efficient, beginner-friendly. "
+                    "Supports OpenAI, Anthropic, and Gemini API formats.",
+        version="3.0.0",
         lifespan=lifespan,
     )
 
     # ─────────────────────────────────────────────────────────
-    # Routes
+    # Middleware
     # ─────────────────────────────────────────────────────────
+
+    # CORS
+    if config.cors.enabled:
+        from fastapi.middleware.cors import CORSMiddleware
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=config.cors.allow_origins,
+            allow_credentials=config.cors.allow_credentials,
+            allow_methods=config.cors.allow_methods,
+            allow_headers=config.cors.allow_headers,
+        )
+
+    # Authentication
+    if config.auth.enabled:
+        from router.auth import AuthMiddleware
+        app.add_middleware(AuthMiddleware, auth_config=config.auth)
+
+    # ─────────────────────────────────────────────────────────
+    # Routes — Status & Discovery
+    # ─────────────────────────────────────────────────────────
+
+    @app.get("/health", summary="Health check")
+    async def health():
+        return {"status": "ok"}
 
     @app.get("/status", summary="Backend run-state")
     async def status(request: Request):
@@ -179,6 +250,7 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
         """
         import time as _time
         backends = request.app.state.manager.backends
+        aliases = request.app.state.config.model_aliases
         models = []
         for key, cfg in backends.items():
             models.append({
@@ -193,6 +265,20 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
                 "context_window": cfg.get("ctx_size"),
                 "auto_discovered": cfg.get("auto_discovered", False),
             })
+        # Also list model aliases as models
+        for alias, backend_key in aliases.items():
+            if backend_key in backends:
+                cfg = backends[backend_key]
+                models.append({
+                    "id":       alias,
+                    "object":   "model",
+                    "created":  int(_time.time()),
+                    "owned_by": "local",
+                    "description": f"Alias for {backend_key}",
+                    "engine":   cfg.get("engine", "llama.cpp"),
+                    "tier":     cfg.get("tier"),
+                    "alias_for": backend_key,
+                })
         return {"object": "list", "data": models}
 
     @app.get("/v1/models/{model_id}", summary="Get a single model by backend key")
@@ -200,16 +286,19 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
         """OpenAI-compatible GET /v1/models/{id}."""
         import time as _time
         backends = request.app.state.manager.backends
-        if model_id not in backends:
+        aliases = request.app.state.config.model_aliases
+        # Resolve alias
+        resolved = aliases.get(model_id, model_id)
+        if resolved not in backends:
             raise HTTPException(404, f"Model '{model_id}' not found. "
                                      f"Available: {list(backends.keys())}")
-        cfg = backends[model_id]
+        cfg = backends[resolved]
         return {
             "id":       model_id,
             "object":   "model",
             "created":  int(_time.time()),
             "owned_by": "local",
-            "description": cfg.get("description", model_id),
+            "description": cfg.get("description", resolved),
             "engine":   cfg.get("engine", "llama.cpp"),
             "tier":     cfg.get("tier"),
             "context_window": cfg.get("ctx_size"),
@@ -227,19 +316,22 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
           - OS, CPU architecture, core count, RAM
           - GPU names, VRAM (total + free), driver version
           - CUDA version
-          - Installed engine versions (llama.cpp, vLLM, SGLang, TRT-LLM, HF)
+          - Installed engine versions (llama.cpp, vLLM, SGLang, TRT-LLM, HF, Ollama)
           - Recommended stable versions + install commands per engine
           - Any processes already occupying LLM ports (conflicts)
 
         Safe to call before or after backends are loaded.
         Cached from startup; call /rescan to refresh.
         """
-        # Return startup-cached value (fast) or re-detect if not cached
         info = getattr(request.app.state, "sys_info", None)
         if info is None:
             from router.sysinfo import detect_system
             info = detect_system(llama_bin=request.app.state.config.llama_bin)
         return info
+
+    # ─────────────────────────────────────────────────────────
+    # Routes — Metrics
+    # ─────────────────────────────────────────────────────────
 
     @app.get("/metrics", summary="Per-backend performance summary")
     async def get_metrics(request: Request):
@@ -260,6 +352,16 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
             filename="llm-router-metrics.csv",
             media_type="text/csv",
         )
+
+    @app.get("/metrics/prometheus", summary="Prometheus-compatible metrics")
+    async def prometheus_metrics(request: Request):
+        """Prometheus text exposition format, scrapeable by Prometheus/Grafana."""
+        text = request.app.state.metrics_store.prometheus()
+        return PlainTextResponse(content=text, media_type="text/plain; version=0.0.4")
+
+    # ─────────────────────────────────────────────────────────
+    # Routes — Control
+    # ─────────────────────────────────────────────────────────
 
     @app.post("/rescan", summary="Re-discover models and reload config")
     async def rescan(request: Request):
@@ -283,6 +385,23 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
             "backends":  list(new_backends.keys()),
         }
 
+    @app.post("/reload-config", summary="Reload settings.yaml without restart")
+    async def reload_config(request: Request):
+        """Hot-reload settings.yaml. Does NOT restart running backends."""
+        try:
+            new_config = load_config()
+            # Update mutable config references
+            app_config = request.app.state.config
+            app_config.routing = new_config.routing
+            app_config.proxy = new_config.proxy
+            app_config.model_aliases = new_config.model_aliases
+            app_config.idle_timeouts = new_config.idle_timeouts
+            app_config.tier_thresholds = new_config.tier_thresholds
+            logger.info("Config hot-reloaded from settings.yaml")
+            return {"status": "reloaded", "model_aliases": new_config.model_aliases}
+        except Exception as e:
+            raise HTTPException(500, f"Config reload failed: {e}")
+
     @app.post("/start/{key}", summary="Start a backend")
     async def start_backend(key: str, request: Request):
         manager = request.app.state.manager
@@ -303,6 +422,19 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
         manager.stop(key)
         return {"status": "stopped", "backend": key}
 
+    @app.post("/restart/{key}", summary="Restart a backend")
+    async def restart_backend(key: str, request: Request):
+        """Stop and restart a backend gracefully."""
+        manager = request.app.state.manager
+        if key not in manager.backends:
+            raise HTTPException(404, f"Unknown backend '{key}'")
+        try:
+            await manager.restart(key)
+        except RuntimeError as e:
+            raise HTTPException(503, str(e))
+        cfg = manager.backends[key]
+        return {"status": "restarted", "backend": key, "port": cfg["port"]}
+
     @app.post("/retune/{key}", summary="Force re-tune a TRT-LLM backend")
     async def retune(key: str, request: Request):
         from router.engines import ENGINE_TRTLLM
@@ -321,15 +453,53 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
             raise HTTPException(503, str(e))
         return {"status": "retuned", "active_config": manager.active_configs.get(key)}
 
+    # ─────────────────────────────────────────────────────────
+    # Routes — Inference Proxies
+    # ─────────────────────────────────────────────────────────
+
+    @app.post("/v1/chat/completions", summary="OpenAI-compatible chat completions")
+    async def chat_completions(request: Request):
+        """Explicit chat completions route (also matched by /v1/{path})."""
+        return await handle_proxy(
+            path="chat/completions",
+            request=request,
+            manager=request.app.state.manager,
+            metrics_store=request.app.state.metrics_store,
+            config=request.app.state.config,
+        )
+
+    @app.post("/v1/completions", summary="OpenAI-compatible legacy completions")
+    async def completions(request: Request):
+        """Legacy completions endpoint — proxies to backend's /v1/completions."""
+        return await handle_proxy(
+            path="completions",
+            request=request,
+            manager=request.app.state.manager,
+            metrics_store=request.app.state.metrics_store,
+            config=request.app.state.config,
+        )
+
+    @app.post("/v1/embeddings", summary="OpenAI-compatible embeddings")
+    async def embeddings(request: Request):
+        """Embeddings endpoint — proxies to backend's /v1/embeddings."""
+        return await handle_proxy(
+            path="embeddings",
+            request=request,
+            manager=request.app.state.manager,
+            metrics_store=request.app.state.metrics_store,
+            config=request.app.state.config,
+        )
+
     @app.post("/v1/{path:path}", summary="OpenAI-compatible inference proxy")
     async def proxy(path: str, request: Request):
         """
-        Main inference endpoint. Accepts OpenAI-compatible payloads.
+        Catch-all inference endpoint. Accepts OpenAI-compatible payloads.
 
         Backend selection (in priority order):
           1. ?backend=key  query parameter
-          2. [route:key]   prefix in the first user message
-          3. Automatic classification (token count + keywords)
+          2. Model alias → backend mapping
+          3. [route:key]   prefix in the first user message
+          4. Automatic classification (token count + keywords)
         """
         return await handle_proxy(
             path=path,
@@ -339,11 +509,12 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
             config=request.app.state.config,
         )
 
-    @app.post("/anthropic/v1/messages", summary="Anthropic Messages API proxy (translates to local backend)")
+    @app.post("/anthropic/v1/messages", summary="Anthropic Messages API proxy")
     @app.post("/v1/messages", summary="Anthropic Messages API proxy (alias)")
     async def anthropic_proxy(request: Request):
         """
         Accepts Anthropic Messages API format and proxies to a local backend.
+        Supports tool use / function calling.
 
         Drop-in replacement for https://api.anthropic.com — just change the
         base URL in your Anthropic SDK config:
@@ -356,7 +527,7 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
 
         Backend selection (in priority order):
           1. ?backend=key  query parameter
-          2. [route:key]   prefix in the first user message
+          2. Model alias → backend mapping
           3. Claude model name → tier mapping (haiku→fast, sonnet→mid, opus→deep)
           4. Automatic classification (token count + keywords)
         """
@@ -366,6 +537,86 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
             metrics_store=request.app.state.metrics_store,
             config=request.app.state.config,
         )
+
+    @app.post("/gemini/v1beta/models/{model}:generateContent",
+              summary="Gemini generateContent proxy")
+    async def gemini_generate(model: str, request: Request):
+        """Google Gemini API compatibility — non-streaming."""
+        return await handle_gemini_proxy(
+            model=model, is_stream=False,
+            request=request,
+            manager=request.app.state.manager,
+            metrics_store=request.app.state.metrics_store,
+            config=request.app.state.config,
+        )
+
+    @app.post("/gemini/v1beta/models/{model}:streamGenerateContent",
+              summary="Gemini streamGenerateContent proxy")
+    async def gemini_stream(model: str, request: Request):
+        """Google Gemini API compatibility — streaming."""
+        return await handle_gemini_proxy(
+            model=model, is_stream=True,
+            request=request,
+            manager=request.app.state.manager,
+            metrics_store=request.app.state.metrics_store,
+            config=request.app.state.config,
+        )
+
+    # ─────────────────────────────────────────────────────────
+    # WebSocket streaming
+    # ─────────────────────────────────────────────────────────
+
+    @app.websocket("/v1/chat/completions/ws")
+    async def websocket_chat(ws: WebSocket):
+        """
+        WebSocket endpoint for streaming chat completions.
+        Send a JSON payload, receive streamed chunks as JSON messages.
+        """
+        await ws.accept()
+        try:
+            while True:
+                data = await ws.receive_json()
+                data["stream"] = True
+
+                manager = ws.app.state.manager
+                config = ws.app.state.config
+                from router.routing import classify as ws_classify
+
+                backend_key = data.pop("backend", None) or ws_classify(data, manager.backends, config)
+                if backend_key not in manager.backends:
+                    await ws.send_json({"error": f"Unknown backend '{backend_key}'"})
+                    continue
+
+                try:
+                    await manager.ensure_running(backend_key)
+                except RuntimeError as e:
+                    await ws.send_json({"error": str(e)})
+                    continue
+
+                cfg = manager.backends[backend_key]
+                manager.last_used[backend_key] = __import__("time").time()
+                target_url = f"http://localhost:{cfg['port']}/v1/chat/completions"
+
+                try:
+                    async with httpx.AsyncClient(timeout=config.proxy.timeout_sec) as client:
+                        async with client.stream("POST", target_url, json=data) as resp:
+                            async for chunk in resp.aiter_bytes():
+                                for line in chunk.decode("utf-8", errors="replace").splitlines():
+                                    line = line.strip()
+                                    if line.startswith("data:"):
+                                        data_str = line[5:].strip()
+                                        if data_str == "[DONE]":
+                                            await ws.send_json({"done": True})
+                                        else:
+                                            try:
+                                                await ws.send_json(json.loads(data_str))
+                                            except Exception:
+                                                pass
+                except Exception as e:
+                    await ws.send_json({"error": str(e)})
+
+        except WebSocketDisconnect:
+            pass
 
     # ── Global error handler — always return JSON ─────────────
     @app.exception_handler(Exception)

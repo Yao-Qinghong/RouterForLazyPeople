@@ -1,0 +1,31 @@
+version: "3.8"
+
+services:
+  router:
+    build: .
+    ports:
+      - "9001:9001"
+    volumes:
+      # Mount config for easy editing
+      - ./config:/app/config
+      # Persist logs and metrics
+      - ~/.llm-router:/root/.llm-router
+      # Mount model directories (add your own)
+      - ~/models:/root/models:ro
+      - ~/.cache/huggingface:/root/.cache/huggingface:ro
+    environment:
+      - LLM_ROUTER_CONFIG=/app/config/settings.yaml
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    # Uncomment for GPU access (NVIDIA Container Toolkit required)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]

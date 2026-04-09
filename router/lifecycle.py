@@ -1,8 +1,8 @@
 """
 router/lifecycle.py — Backend lifecycle manager
 
-Handles starting, stopping, health-checking, and idle-eviction
-of backend inference server processes.
+Handles starting, stopping, health-checking, idle-eviction,
+restarting, and preloading of backend inference server processes.
 """
 
 import asyncio
@@ -14,10 +14,10 @@ from typing import TYPE_CHECKING
 import httpx
 
 from router.engines import (
-    ENGINE_LLAMA, ENGINE_TRTLLM,
+    ENGINE_LLAMA, ENGINE_TRTLLM, ENGINE_OLLAMA,
     is_engine_available, health_url,
     build_llama_cmd, build_vllm_cmd, build_sglang_cmd,
-    build_hf_cmd, build_trtllm_cmd,
+    build_hf_cmd, build_trtllm_cmd, build_ollama_cmd,
 )
 from router.trt_tuner import TRTLLMTuner
 
@@ -33,6 +33,7 @@ class BackendManager:
 
     Backends are started lazily (on first request) and stopped
     automatically after idle_timeout seconds of inactivity.
+    Supports preloading specific backends on startup.
     """
 
     def __init__(self, backends: dict, config: "AppConfig"):
@@ -102,6 +103,8 @@ class BackendManager:
             return build_trtllm_cmd(cfg, trt_config or {})
         elif engine == "huggingface":
             return build_hf_cmd(cfg)
+        elif engine == ENGINE_OLLAMA:
+            return build_ollama_cmd(cfg)
         else:
             raise ValueError(f"Unknown engine '{engine}' for backend '{key}'")
 
@@ -109,6 +112,10 @@ class BackendManager:
         """Spawn the backend subprocess and wait for it to become healthy."""
         cfg = self.backends[key]
         engine = cfg.get("engine", ENGINE_LLAMA)
+
+        # Ollama backends connect to an existing Ollama server
+        if engine == ENGINE_OLLAMA:
+            return await self._start_ollama_backend(key)
 
         if not is_engine_available(engine, self.config):
             logger.error(f"[{key}] Engine '{engine}' is not installed")
@@ -155,6 +162,45 @@ class BackendManager:
 
         logger.info(f"[{key}] Ready on port {cfg['port']} (PID {proc.pid})")
         return True
+
+    async def _start_ollama_backend(self, key: str) -> bool:
+        """
+        Start an Ollama-managed backend. Ollama runs its own server;
+        we just need to ensure the model is loaded.
+        """
+        cfg = self.backends[key]
+        model = cfg.get("model", "")
+        port = cfg.get("port", 11434)
+        logger.info(f"[{key}] Loading Ollama model '{model}' on port {port}...")
+
+        # Check if Ollama is running
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(f"http://localhost:{port}/api/tags", timeout=5)
+                if r.status_code != 200:
+                    logger.error(f"[{key}] Ollama server not running on port {port}")
+                    return False
+        except Exception:
+            logger.error(f"[{key}] Cannot reach Ollama on port {port}")
+            return False
+
+        # Pull/load the model via Ollama API
+        try:
+            async with httpx.AsyncClient(timeout=300) as client:
+                r = await client.post(
+                    f"http://localhost:{port}/api/generate",
+                    json={"model": model, "prompt": "", "keep_alive": f"{cfg.get('idle_timeout', 300)}s"},
+                )
+                if r.status_code == 200:
+                    self.last_used[key] = time.time()
+                    # Store a sentinel so is_running() returns True
+                    self.processes[key] = _OllamaSentinel(port)
+                    logger.info(f"[{key}] Ollama model '{model}' loaded")
+                    return True
+        except Exception as e:
+            logger.error(f"[{key}] Failed to load Ollama model: {e}")
+
+        return False
 
     async def _start_trtllm_with_tuning(self, key: str):
         """Start a TRT-LLM backend, auto-tuning memory config if needed."""
@@ -225,7 +271,10 @@ class BackendManager:
     def stop(self, key: str):
         """Gracefully stop a backend (SIGTERM → SIGKILL after 10s)."""
         proc = self.processes.get(key)
-        if proc and proc.poll() is None:
+        if proc and isinstance(proc, _OllamaSentinel):
+            # Ollama backends: unload via API
+            self._unload_ollama(key)
+        elif proc and proc.poll() is None:
             logger.info(f"[{key}] Stopping (PID {proc.pid})")
             proc.terminate()
             try:
@@ -242,9 +291,49 @@ class BackendManager:
                 pass
             self.log_handles.pop(key, None)
 
+    def _unload_ollama(self, key: str):
+        """Tell Ollama to unload a model to free memory."""
+        cfg = self.backends.get(key, {})
+        model = cfg.get("model", "")
+        port = cfg.get("port", 11434)
+        try:
+            import httpx as _httpx
+            _httpx.post(
+                f"http://localhost:{port}/api/generate",
+                json={"model": model, "keep_alive": 0},
+                timeout=10,
+            )
+            logger.info(f"[{key}] Ollama model '{model}' unloaded")
+        except Exception:
+            pass
+
     def stop_all(self):
         for key in list(self.processes.keys()):
             self.stop(key)
+
+    async def restart(self, key: str):
+        """Stop and restart a backend."""
+        self.stop(key)
+        await asyncio.sleep(1)
+        await self.ensure_running(key)
+
+    async def preload(self, keys: list[str]):
+        """Start backends in parallel at startup (non-blocking)."""
+        tasks = []
+        for key in keys:
+            if key in self.backends:
+                logger.info(f"[{key}] Preloading...")
+                tasks.append(self._preload_one(key))
+            else:
+                logger.warning(f"[{key}] Cannot preload — not in registry")
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _preload_one(self, key: str):
+        try:
+            await self.ensure_running(key)
+        except Exception as e:
+            logger.error(f"[{key}] Preload failed: {e}")
 
     async def idle_watchdog(self):
         """
@@ -278,7 +367,8 @@ class BackendManager:
                 "idle_timeout":    cfg["idle_timeout"],
                 "description":     cfg.get("description", key),
                 "auto_discovered": cfg.get("auto_discovered", False),
-                "pid":             self.processes[key].pid if running else None,
+                "tier":            cfg.get("tier"),
+                "pid":             self.processes[key].pid if running and not isinstance(self.processes.get(key), _OllamaSentinel) else None,
                 "log":             cfg.get("log", ""),
             }
             if key in self.active_configs:
@@ -288,3 +378,28 @@ class BackendManager:
                 entry["tuning_saved"] = True
             out[key] = entry
         return out
+
+
+class _OllamaSentinel:
+    """Sentinel object for Ollama backends — not a real subprocess."""
+    def __init__(self, port: int):
+        self.port = port
+        self.pid = None
+
+    def poll(self):
+        """Check if Ollama is still serving. Returns None if running."""
+        try:
+            import httpx as _httpx
+            r = _httpx.get(f"http://localhost:{self.port}/api/tags", timeout=2)
+            return None if r.status_code == 200 else 1
+        except Exception:
+            return 1
+
+    def kill(self):
+        pass
+
+    def terminate(self):
+        pass
+
+    def wait(self, timeout=None):
+        pass

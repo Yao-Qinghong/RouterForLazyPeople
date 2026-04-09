@@ -14,6 +14,7 @@ logging:
   log_dir: "~/.llm-router/logs"
   log_max_bytes: 10485760    # 10 MB per file before rotation
   log_backup_count: 5        # number of rotated files to keep
+  json_format: false         # true → structured JSON logs (for ELK/Loki/Datadog)
 
 # Path to the llama-server binary built from llama.cpp
 llama_bin: "~/llama.cpp/build/bin/llama-server"
@@ -116,6 +117,12 @@ proxy:
   max_concurrent_requests: 20
   # How long a request can wait to acquire a slot before → 503
   queue_timeout_sec: 30
+  # Retry on transient errors (0 = no retry)
+  retry_attempts: 2
+  # Base backoff between retries (multiplied by attempt number)
+  retry_backoff_sec: 1.0
+  # HTTP status codes that trigger a retry
+  retry_on_status: [502, 503, 504]
 
 # ── Metrics / benchmarking ────────────────────────────────────
 metrics:
@@ -123,3 +130,69 @@ metrics:
   persist_dir: "~/.llm-router/metrics"
   # Write buffered records to disk every N seconds
   flush_interval_sec: 60
+
+# ── Model aliases ─────────────────────────────────────────────
+# Map arbitrary model names to backend keys. Useful when clients
+# request "gpt-4" or "gemini-pro" and you want to route them locally.
+# Example:
+#   model_aliases:
+#     gpt-4: deep
+#     gpt-4o: mid
+#     gpt-3.5-turbo: fast
+#     gemini-pro: mid
+model_aliases: {}
+
+# ── Preload backends ──────────────────────────────────────────
+# List of backend keys to start on router boot (skips lazy-loading).
+# Useful for backends that have long cold-start times.
+# Example:
+#   preload:
+#     - fast
+#     - mid
+preload: []
+
+# ── Authentication ────────────────────────────────────────────
+# Optional API key validation. Disabled by default.
+# When enabled, all inference and admin endpoints require a valid key.
+# Status, model list, and health endpoints are always public.
+auth:
+  enabled: false
+  # api_keys:
+  #   - key: "sk-my-secret-key"
+  #     name: "dev-machine"
+  #     scope: "all"          # "all" | "inference" | "admin"
+  #   - key: "sk-readonly"
+  #     name: "monitoring"
+  #     scope: "inference"
+
+# ── CORS ──────────────────────────────────────────────────────
+# Cross-Origin Resource Sharing for browser-based clients.
+# Enabled by default with permissive settings.
+cors:
+  enabled: true
+  allow_origins: ["*"]
+  allow_methods: ["*"]
+  allow_headers: ["*"]
+  allow_credentials: false
+
+# ── Audit logging ─────────────────────────────────────────────
+# Optional request/response audit trail. Disabled by default.
+# Useful for debugging routing decisions and tracking usage.
+audit:
+  enabled: false
+  log_dir: "~/.llm-router/audit"
+  log_request_body: false    # log full request body (privacy risk!)
+  log_response_body: false   # log full response body (privacy risk!)
+  redact_content: true       # strip message content, keep metadata only
+
+# ── Rate limiting ─────────────────────────────────────────────
+# Per-API-key rate limiting. Requires auth to be enabled.
+# Disabled by default.
+rate_limit:
+  enabled: false
+  default_rpm: 60           # requests per minute per key
+  default_tpm: 100000       # tokens per minute per key
+  # Per-key overrides (0 = unlimited):
+  # per_key_overrides:
+  #   sk-admin: { rpm: 0, tpm: 0 }
+  #   sk-user: { rpm: 30, tpm: 50000 }

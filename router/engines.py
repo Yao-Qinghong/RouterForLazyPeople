@@ -1,7 +1,7 @@
 """
 router/engines.py — Engine availability detection and command builders
 
-Supports: llama.cpp, vLLM, SGLang, TensorRT-LLM, HuggingFace TGI
+Supports: llama.cpp, vLLM, SGLang, TensorRT-LLM, HuggingFace TGI, Ollama
 """
 
 import os
@@ -18,8 +18,9 @@ ENGINE_TRTLLM = "trt-llm"
 ENGINE_VLLM   = "vllm"
 ENGINE_SGLANG = "sglang"
 ENGINE_HF     = "huggingface"
+ENGINE_OLLAMA = "ollama"
 
-ALL_ENGINES = [ENGINE_LLAMA, ENGINE_TRTLLM, ENGINE_VLLM, ENGINE_SGLANG, ENGINE_HF]
+ALL_ENGINES = [ENGINE_LLAMA, ENGINE_TRTLLM, ENGINE_VLLM, ENGINE_SGLANG, ENGINE_HF, ENGINE_OLLAMA]
 
 # ─────────────────────────────────────────────────────────────
 # Availability detection
@@ -49,11 +50,22 @@ def is_engine_available(engine: str, config: "AppConfig") -> bool:
         ENGINE_SGLANG: lambda: shutil.which("sglang") is not None or _can_import("sglang"),
         ENGINE_TRTLLM: lambda: _can_import("tensorrt_llm"),
         ENGINE_HF:     lambda: _can_import("transformers"),
+        ENGINE_OLLAMA: lambda: shutil.which("ollama") is not None or _is_ollama_running(),
     }
 
     result = checks.get(engine, lambda: False)()
     _engine_available_cache[engine] = result
     return result
+
+
+def _is_ollama_running() -> bool:
+    """Check if Ollama server is already running on its default port."""
+    try:
+        import httpx
+        resp = httpx.get("http://localhost:11434/api/tags", timeout=2)
+        return resp.status_code == 200
+    except Exception:
+        return False
 
 
 def available_engines(config: "AppConfig") -> list[str]:
@@ -107,7 +119,7 @@ def build_vllm_cmd(cfg: dict, config: "AppConfig" = None) -> list[str]:
         cmd.append("--enforce-eager")
     if cfg.get("trust_remote_code"):
         cmd.append("--trust-remote-code")
-    if cfg.get("enable_prefix_caching"):
+    if cfg.get("enable_prefix_caching", True):
         cmd.append("--enable-prefix-caching")
     for arg in cfg.get("extra_args", []):
         cmd.append(arg)
@@ -132,6 +144,8 @@ def build_sglang_cmd(cfg: dict, config: "AppConfig" = None) -> list[str]:
         cmd += ["--quantization", cfg["quantization"]]
     if cfg.get("trust_remote_code"):
         cmd.append("--trust-remote-code")
+    if cfg.get("enable_prefix_caching", True):
+        cmd.append("--enable-prefix-caching")
     if cfg.get("chunked_prefill"):
         cmd += ["--chunked-prefill-size", str(cfg.get("chunked_prefill_size", 8192))]
     for arg in cfg.get("extra_args", []):
@@ -190,8 +204,26 @@ def build_hf_cmd(cfg: dict, config: "AppConfig" = None) -> list[str]:
     ]
 
 
+def build_ollama_cmd(cfg: dict, config: "AppConfig" = None) -> list[str]:
+    """
+    Build command to start Ollama serving a specific model.
+    Ollama manages its own model lifecycle, so we use 'ollama serve'
+    and pull the model if needed.
+    """
+    # Ollama is typically already running as a service.
+    # We use 'ollama run' in the background which pulls + loads the model.
+    model = cfg.get("model", "")
+    return [
+        "ollama", "run", model,
+        "--keepalive", str(cfg.get("idle_timeout", 300)),
+    ]
+
+
 def health_url(cfg: dict) -> str:
     """Return the health-check URL for a backend config."""
+    engine = cfg.get("engine", ENGINE_LLAMA)
+    if engine == ENGINE_OLLAMA:
+        return f"http://localhost:{cfg['port']}/api/tags"
     return f"http://localhost:{cfg['port']}/health"
 
 
@@ -203,5 +235,6 @@ def get_cmd_builder(engine: str):
         ENGINE_SGLANG: build_sglang_cmd,
         ENGINE_TRTLLM: None,  # handled specially — needs trt_config
         ENGINE_HF:     build_hf_cmd,
+        ENGINE_OLLAMA: build_ollama_cmd,
     }
     return builders.get(engine)

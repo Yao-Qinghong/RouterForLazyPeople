@@ -1,17 +1,23 @@
 """
-router/routing.py — Request classifier
+router/routing.py — Request classifier with load balancing
 
 Determines which backend to route a request to based on:
   1. Explicit [route:key] prefix in the first user message
   2. Token count estimate
   3. Keyword scan (keywords configured in settings.yaml)
   4. Default: "fast"
+
+Supports multiple backends per tier with round-robin load balancing.
 """
 
+import itertools
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from router.config import AppConfig
+
+# Round-robin state per tier
+_tier_cycles: dict[str, tuple[set[str], itertools.cycle]] = {}
 
 
 def _extract_content(payload: dict) -> str:
@@ -32,6 +38,39 @@ def _extract_content(payload: dict) -> str:
 def _token_estimate(content: str) -> int:
     """Fast word-count token estimate. No tokenizer needed."""
     return len(content.split())
+
+
+def _backends_for_tier(backends: dict, tier: str) -> list[str]:
+    """Return all backend keys that belong to a tier."""
+    return [k for k, v in backends.items() if v.get("tier") == tier]
+
+
+def _pick(backends: dict, preferred: str) -> str:
+    """
+    Return a backend from the preferred tier using round-robin
+    if multiple backends exist. Falls back to any available backend.
+    """
+    tier_backends = _backends_for_tier(backends, preferred)
+
+    if not tier_backends:
+        # Exact key match (e.g., "fast" is a backend key, not a tier)
+        if preferred in backends:
+            return preferred
+        # Graceful fallback: use any available backend
+        if backends:
+            return next(iter(backends))
+        return preferred  # caller will get a 400 — no backends registered
+
+    if len(tier_backends) == 1:
+        return tier_backends[0]
+
+    # Round-robin across backends in this tier
+    current = _tier_cycles.get(preferred)
+    if current is None or current[0] != set(tier_backends):
+        cycle = itertools.cycle(tier_backends)
+        _tier_cycles[preferred] = (set(tier_backends), cycle)
+
+    return next(_tier_cycles[preferred][1])
 
 
 def classify(payload: dict, backends: dict, config: "AppConfig") -> str:
@@ -70,16 +109,3 @@ def classify(payload: dict, backends: dict, config: "AppConfig") -> str:
 
     # 5. Default: fast
     return _pick(backends, "fast")
-
-
-def _pick(backends: dict, preferred: str) -> str:
-    """
-    Return preferred tier if it exists in backends,
-    otherwise fall back to the first available backend.
-    """
-    if preferred in backends:
-        return preferred
-    # Graceful fallback: use any available backend
-    if backends:
-        return next(iter(backends))
-    return preferred  # caller will get a 400 — no backends registered

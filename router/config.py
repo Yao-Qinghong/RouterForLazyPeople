@@ -38,6 +38,7 @@ class LoggingSettings:
     log_dir: Path = Path("~/.llm-router/logs")
     log_max_bytes: int = 10_485_760   # 10 MB
     log_backup_count: int = 5
+    json_format: bool = False         # structured JSON logging
 
 
 @dataclass
@@ -79,6 +80,9 @@ class ProxyConfig:
     timeout_sec: int = 300
     max_concurrent_requests: int = 20
     queue_timeout_sec: int = 30
+    retry_attempts: int = 2           # retries on transient errors (0 = no retry)
+    retry_backoff_sec: float = 1.0    # base backoff between retries
+    retry_on_status: list[int] = field(default_factory=lambda: [502, 503, 504])
 
 
 @dataclass
@@ -86,6 +90,40 @@ class MetricsConfig:
     enabled: bool = True
     persist_dir: Path = Path("~/.llm-router/metrics")
     flush_interval_sec: int = 60
+
+
+@dataclass
+class AuthConfig:
+    enabled: bool = False
+    api_keys: list[dict] = field(default_factory=list)
+    # Each key: {"key": "sk-...", "name": "dev", "scope": "all"}
+
+
+@dataclass
+class CORSConfig:
+    enabled: bool = True
+    allow_origins: list[str] = field(default_factory=lambda: ["*"])
+    allow_methods: list[str] = field(default_factory=lambda: ["*"])
+    allow_headers: list[str] = field(default_factory=lambda: ["*"])
+    allow_credentials: bool = False
+
+
+@dataclass
+class AuditConfig:
+    enabled: bool = False
+    log_dir: Path = Path("~/.llm-router/audit")
+    log_request_body: bool = False    # log full request body (privacy risk)
+    log_response_body: bool = False   # log full response body (privacy risk)
+    redact_content: bool = True       # strip message content, keep metadata
+
+
+@dataclass
+class RateLimitConfig:
+    enabled: bool = False
+    default_rpm: int = 60             # requests per minute per key
+    default_tpm: int = 100_000        # tokens per minute per key
+    per_key_overrides: dict = field(default_factory=dict)
+    # e.g. {"sk-admin": {"rpm": 0, "tpm": 0}}  (0 = unlimited)
 
 
 @dataclass
@@ -99,9 +137,15 @@ class AppConfig:
     routing: RoutingConfig
     proxy: ProxyConfig
     metrics: MetricsConfig
+    auth: AuthConfig
+    cors: CORSConfig
+    audit: AuditConfig
+    rate_limit: RateLimitConfig
     llama_bin: Path
     data_dir: Path
     backends_file: Path
+    model_aliases: dict[str, str] = field(default_factory=dict)
+    preload: list[str] = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -175,6 +219,7 @@ def load_config(
         log_dir=_expand(lg.get("log_dir", "~/.llm-router/logs")),
         log_max_bytes=int(lg.get("log_max_bytes", 10_485_760)),
         log_backup_count=int(lg.get("log_backup_count", 5)),
+        json_format=bool(lg.get("json_format", False)),
     )
 
     # ── Paths ─────────────────────────────────────────────────
@@ -226,6 +271,9 @@ def load_config(
         timeout_sec=int(px.get("timeout_sec", 300)),
         max_concurrent_requests=int(px.get("max_concurrent_requests", 20)),
         queue_timeout_sec=int(px.get("queue_timeout_sec", 30)),
+        retry_attempts=int(px.get("retry_attempts", 2)),
+        retry_backoff_sec=float(px.get("retry_backoff_sec", 1.0)),
+        retry_on_status=[int(s) for s in px.get("retry_on_status", [502, 503, 504])],
     )
 
     # ── Metrics ───────────────────────────────────────────────
@@ -235,6 +283,48 @@ def load_config(
         persist_dir=_expand(mx.get("persist_dir", "~/.llm-router/metrics")),
         flush_interval_sec=int(mx.get("flush_interval_sec", 60)),
     )
+
+    # ── Auth ──────────────────────────────────────────────────
+    au = raw.get("auth", {})
+    auth = AuthConfig(
+        enabled=bool(au.get("enabled", False)),
+        api_keys=au.get("api_keys", []),
+    )
+
+    # ── CORS ──────────────────────────────────────────────────
+    co = raw.get("cors", {})
+    cors = CORSConfig(
+        enabled=bool(co.get("enabled", True)),
+        allow_origins=co.get("allow_origins", ["*"]),
+        allow_methods=co.get("allow_methods", ["*"]),
+        allow_headers=co.get("allow_headers", ["*"]),
+        allow_credentials=bool(co.get("allow_credentials", False)),
+    )
+
+    # ── Audit logging ─────────────────────────────────────────
+    ad = raw.get("audit", {})
+    audit = AuditConfig(
+        enabled=bool(ad.get("enabled", False)),
+        log_dir=_expand(ad.get("log_dir", "~/.llm-router/audit")),
+        log_request_body=bool(ad.get("log_request_body", False)),
+        log_response_body=bool(ad.get("log_response_body", False)),
+        redact_content=bool(ad.get("redact_content", True)),
+    )
+
+    # ── Rate limiting ─────────────────────────────────────────
+    rl = raw.get("rate_limit", {})
+    rate_limit = RateLimitConfig(
+        enabled=bool(rl.get("enabled", False)),
+        default_rpm=int(rl.get("default_rpm", 60)),
+        default_tpm=int(rl.get("default_tpm", 100_000)),
+        per_key_overrides=rl.get("per_key_overrides", {}),
+    )
+
+    # ── Model aliases ─────────────────────────────────────────
+    model_aliases = raw.get("model_aliases", {})
+
+    # ── Preload ───────────────────────────────────────────────
+    preload = raw.get("preload", [])
 
     bf = _find_backends_file(sf, backends_path)
 
@@ -248,9 +338,15 @@ def load_config(
         routing=routing,
         proxy=proxy,
         metrics=metrics,
+        auth=auth,
+        cors=cors,
+        audit=audit,
+        rate_limit=rate_limit,
         llama_bin=llama_bin,
         data_dir=data_dir,
         backends_file=bf,
+        model_aliases=model_aliases,
+        preload=preload,
     )
 
 
@@ -271,7 +367,6 @@ def load_backends(config: AppConfig) -> dict:
         )
 
     result = {}
-    home = os.path.expanduser("~")
 
     for slug, cfg in entries.items():
         if not isinstance(cfg, dict):
@@ -301,7 +396,6 @@ def load_backends(config: AppConfig) -> dict:
 
         # Build a log path if not provided
         if "log" not in cfg:
-            engine = cfg.get("engine", "llama.cpp").replace(".", "-")
             cfg["log"] = str(config.data_dir / "logs" / f"backend-{slug}.log")
 
         result[slug] = cfg
