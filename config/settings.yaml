@@ -47,6 +47,17 @@ discovery:
   port_start: 8100
   port_end:   8299
 
+  # Ports to probe for already-running inference servers at startup.
+  # Any OpenAI-compatible server found here is registered automatically.
+  # Covers: llama.cpp (8080), vLLM / SGLang (8000, 8001), TRT-LLM (8002),
+  #         SGLang alt (30000). Add your own ports here as needed.
+  probe_ports:
+    - 8080    # llama.cpp default
+    - 8000    # vLLM / SGLang default
+    - 8001    # vLLM / SGLang alternative
+    - 8002    # TRT-LLM / generic
+    - 30000   # SGLang alternative
+
 # ── Tier thresholds (model file size in GB) ──────────────────
 # fast  = small models, quick responses, simple questions
 # mid   = balanced quality and speed

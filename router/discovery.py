@@ -14,6 +14,7 @@ Also probes for already-running inference servers:
 All scan paths and thresholds come from AppConfig — nothing is hardcoded here.
 """
 
+import concurrent.futures
 import glob
 import hashlib
 import json
@@ -296,15 +297,20 @@ def discover_hf_models(config: "AppConfig", port_counter: list[int]) -> dict:
 
 def detect_running_servers(config: "AppConfig") -> dict:
     """
-    Probe common ports for already-running LLM inference servers.
+    Probe for already-running LLM inference servers and register them.
 
-    Detects: LM Studio (port 1234), Ollama (port 11434).
+    Checks (in parallel):
+      - LM Studio on port 1234
+      - Ollama on port 11434
+      - llama.cpp / vLLM / SGLang / TRT-LLM on ports in discovery.probe_ports
+
     Returns a backend dict ready to merge into the registry.
     No subprocess is spawned — these servers are already running.
     """
     backends = {}
     backends.update(_probe_lmstudio(config))
     backends.update(_probe_ollama_models(config))
+    backends.update(_probe_openai_servers(config))
     return backends
 
 
@@ -365,6 +371,70 @@ def _probe_ollama_models(config: "AppConfig") -> dict:
         return result
     except Exception:
         return {}
+
+
+def _probe_openai_servers(config: "AppConfig") -> dict:
+    """
+    Probe discovery.probe_ports for running llama.cpp / vLLM / SGLang / TRT-LLM servers.
+
+    All probes run in parallel with a 1-second timeout each so startup is not slowed down.
+    Any port that responds to GET /v1/models is registered as an openai-passthrough backend.
+    Ports already claimed by LM Studio (1234) or Ollama (11434) are skipped.
+    """
+    # Ports already handled by dedicated probes or reserved
+    skip_ports: set[int] = {1234, 11434}
+    ports = [p for p in config.discovery.probe_ports if p not in skip_ports]
+    if not ports:
+        return {}
+
+    def _probe_one(port: int) -> dict:
+        try:
+            import httpx
+            r = httpx.get(f"http://localhost:{port}/v1/models", timeout=1.0)
+            if r.status_code != 200:
+                return {}
+            data = r.json().get("data", [])
+            model_id = data[0]["id"] if data else "unknown"
+            slug = f"local-{port}"
+            # Try to guess engine from /health response headers or body
+            label = _guess_engine_label(port)
+            logger.info(f"Auto-detected: {label} on :{port}  (model: {model_id})")
+            return {
+                slug: {
+                    "engine":         ENGINE_OPENAI,
+                    "port":           port,
+                    "model":          model_id,
+                    "tier":           _tier_from_model_name(model_id),
+                    "idle_timeout":   86400,
+                    "startup_wait":   5,
+                    "auto_discovered": True,
+                    "description":    f"{label} :{port} — {model_id}",
+                    "log":            str(config.data_dir / "logs" / f"backend-{slug}.log"),
+                }
+            }
+        except Exception:
+            return {}
+
+    result = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(ports)) as pool:
+        for backend in pool.map(_probe_one, ports):
+            result.update(backend)
+    return result
+
+
+def _guess_engine_label(port: int) -> str:
+    """
+    Best-effort label for what engine is likely running on a given port.
+    Based on common defaults only — not guaranteed to be correct.
+    """
+    labels = {
+        8080: "llama.cpp",
+        8000: "vLLM/SGLang",
+        8001: "vLLM/SGLang",
+        8002: "TRT-LLM",
+        30000: "SGLang",
+    }
+    return labels.get(port, f"LLM server")
 
 
 def _tier_from_model_name(name: str) -> str:

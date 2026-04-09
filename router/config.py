@@ -52,6 +52,7 @@ class ScanDirs:
 class DiscoverySettings:
     port_start: int = 8100
     port_end: int = 8299
+    probe_ports: list[int] = field(default_factory=lambda: [8080, 8000, 8001, 8002, 30000])
 
 
 @dataclass
@@ -240,6 +241,7 @@ def load_config(
     discovery = DiscoverySettings(
         port_start=int(disc.get("port_start", 8100)),
         port_end=int(disc.get("port_end", 8299)),
+        probe_ports=[int(p) for p in disc.get("probe_ports", [8080, 8000, 8001, 8002, 30000])],
     )
 
     # ── Tier thresholds ───────────────────────────────────────
