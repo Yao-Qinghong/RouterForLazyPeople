@@ -362,7 +362,7 @@ def load_backends(config: AppConfig) -> dict:
     with open(config.backends_file) as f:
         raw = yaml.safe_load(f) or {}
 
-    entries = raw.get("backends", {})
+    entries = raw.get("backends") or {}
     if not isinstance(entries, dict):
         raise ConfigError(
             f"backends.yaml must have a top-level 'backends:' mapping, got {type(entries)}"

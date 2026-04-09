@@ -5,62 +5,73 @@
 # slug used for routing (e.g. [route:fast] or ?backend=fast).
 #
 # Required fields for every backend:
-#   engine  — llama.cpp | vllm | sglang | trt-llm | huggingface
+#   engine  — llama.cpp | vllm | sglang | trt-llm | huggingface | ollama
 #   port    — local port this backend listens on
-#   model   — path to the model file/directory (for llama.cpp/HF)
-#             OR a HuggingFace model ID (for vllm/sglang)
+#   model   — path to the model file/directory (llama.cpp/HF)
+#             OR a HuggingFace model ID (vllm/sglang)
 #
 # All ~ paths are expanded to your home directory automatically.
+#
+# Tip: if you have models in standard locations (~/.lmstudio/models,
+#      ~/models, ~/.cache/huggingface/hub), the router will discover
+#      them automatically at startup — no manual config needed.
+#      Run `python cli.py status` to see what was found.
 # ─────────────────────────────────────────────────────────────
 
 backends:
 
-  # ── Fast tier: small model, instant responses ──────────────
-  fast:
-    engine: llama.cpp
-    port: 8080
-    model: "~/.lmstudio/models/unsloth/Qwen3.5-35B-A3B-GGUF/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf"
-    ctx_size: 131072
-    gpu_layers: 999
-    flash_attn: true
-    reasoning: false
-    idle_timeout: 300      # stop after 5 min idle
-    startup_wait: 30       # seconds to wait for health check
-    description: "Qwen3.5-35B-A3B Q4_K_XL — fast, no reasoning"
+  # ── EXAMPLES — uncomment and edit paths to match your models ─
 
-  # ── Mid tier: balanced quality and speed ──────────────────
-  mid:
-    engine: llama.cpp
-    port: 8082
-    model: "~/.lmstudio/models/lmstudio-community/Qwen3.5-27B-GGUF/Qwen3.5-27B-Q8_0.gguf"
-    ctx_size: 131072
-    gpu_layers: 999
-    flash_attn: true
-    reasoning: false
-    idle_timeout: 180      # stop after 3 min idle
-    startup_wait: 40
-    description: "Qwen3.5-27B Q8_0 — balanced quality"
+  # ── Fast tier: small model, quick responses ──────────────────
+  # fast:
+  #   engine: llama.cpp
+  #   port: 8080
+  #   model: "~/models/Qwen2.5-7B-Instruct-Q4_K_M.gguf"
+  #   ctx_size: 32768
+  #   gpu_layers: 999         # 999 = offload all layers to GPU
+  #   flash_attn: true
+  #   idle_timeout: 300       # stop after 5 min idle
+  #   startup_wait: 30        # seconds to wait for health check
+  #   tier: fast
+  #   description: "Qwen2.5-7B Q4_K_M — fast tier"
 
-  # ── Deep tier: large reasoning model ──────────────────────
-  deep:
-    engine: llama.cpp
-    port: 8081
-    model: "~/.lmstudio/models/unsloth/Qwen3.5-122B-A10B-GGUF/Qwen3.5-122B-A10B-UD-Q4_K_XL-00001-of-00003.gguf"
-    ctx_size: 131072
-    gpu_layers: 999
-    flash_attn: true
-    reasoning: true
-    reasoning_budget: 2048
-    idle_timeout: 600      # stop after 10 min idle
-    startup_wait: 90       # large model needs more time
-    description: "Qwen3.5-122B-A10B Q4_K_XL — deep reasoning"
+  # ── Mid tier: balanced quality and speed ─────────────────────
+  # mid:
+  #   engine: llama.cpp
+  #   port: 8082
+  #   model: "~/models/Qwen2.5-32B-Instruct-Q4_K_M.gguf"
+  #   ctx_size: 32768
+  #   gpu_layers: 999
+  #   flash_attn: true
+  #   idle_timeout: 180       # stop after 3 min idle
+  #   startup_wait: 60
+  #   tier: mid
+  #   description: "Qwen2.5-32B Q4_K_M — mid tier"
 
+  # ── Deep tier: large reasoning model ─────────────────────────
+  # deep:
+  #   engine: llama.cpp
+  #   port: 8081
+  #   model: "~/models/Qwen2.5-72B-Instruct-Q4_K_M.gguf"
+  #   ctx_size: 32768
+  #   gpu_layers: 999
+  #   flash_attn: true
+  #   idle_timeout: 600       # stop after 10 min idle
+  #   startup_wait: 90        # large model needs more time
+  #   tier: deep
+  #   description: "Qwen2.5-72B Q4_K_M — deep tier"
 
-  # ────────────────────────────────────────────────────────────
-  # EXAMPLES — uncomment and edit to add more backends
-  # ────────────────────────────────────────────────────────────
+  # ── Ollama example (Ollama must already be running) ──────────
+  # ollama-llama3:
+  #   engine: ollama
+  #   port: 11434
+  #   model: "llama3.2:latest"
+  #   idle_timeout: 300
+  #   startup_wait: 30
+  #   tier: fast
+  #   description: "Llama 3.2 via Ollama"
 
-  # ── vLLM example (needs: pip install vllm) ────────────────
+  # ── vLLM example (needs: pip install vllm) ───────────────────
   # qwen-vllm:
   #   engine: vllm
   #   port: 8091
@@ -71,9 +82,10 @@ backends:
   #   gpu_memory_fraction: 0.90
   #   idle_timeout: 600
   #   startup_wait: 120
+  #   tier: deep
   #   description: "Qwen2.5-72B AWQ via vLLM"
 
-  # ── SGLang example (needs: pip install sglang) ───────────
+  # ── SGLang example (needs: pip install sglang) ───────────────
   # llama-sglang:
   #   engine: sglang
   #   port: 8092
@@ -82,9 +94,10 @@ backends:
   #   gpu_memory_fraction: 0.88
   #   idle_timeout: 600
   #   startup_wait: 120
+  #   tier: deep
   #   description: "Llama-3.1-70B via SGLang"
 
-  # ── HuggingFace TGI example ──────────────────────────────
+  # ── HuggingFace TGI example ──────────────────────────────────
   # mistral-hf:
   #   engine: huggingface
   #   port: 8093
@@ -92,9 +105,10 @@ backends:
   #   ctx_size: 32768
   #   idle_timeout: 300
   #   startup_wait: 60
+  #   tier: fast
   #   description: "Mistral-7B via HF TGI"
 
-  # ── TensorRT-LLM example (auto-tuned memory config) ──────
+  # ── TensorRT-LLM example (auto-tuned memory config) ──────────
   # qwen-trt:
   #   engine: trt-llm
   #   port: 8094
@@ -102,6 +116,7 @@ backends:
   #   tokenizer: "~/trt-engines/qwen2-7b/tokenizer"
   #   idle_timeout: 600
   #   startup_wait: 120
+  #   tier: mid
   #   description: "Qwen2-7B via TensorRT-LLM (auto-tuned)"
   #   trt_config:
   #     max_batch_size: 1
