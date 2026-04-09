@@ -10,6 +10,7 @@ Search order for settings.yaml:
   3. ./config/settings.yaml  (project-local, next to cli.py)
   4. ~/.llm-router/settings.yaml  (user override)
 """
+from __future__ import annotations
 
 import os
 import yaml
@@ -125,6 +126,88 @@ class RateLimitConfig:
     default_tpm: int = 100_000        # tokens per minute per key
     per_key_overrides: dict = field(default_factory=dict)
     # e.g. {"sk-admin": {"rpm": 0, "tpm": 0}}  (0 = unlimited)
+
+
+@dataclass
+class BackendCapabilities:
+    supports_tools: bool = False
+    supports_json_schema: bool = False
+    max_context: int = 32768
+    code_quality: str = "good"        # "weak" | "good" | "strong"
+
+
+@dataclass
+class BackendConfig:
+    engine: str = "llama.cpp"
+    port: int = 8080
+    model: str = ""
+    model_dir: str = ""
+    log: str = ""
+    tier: str = ""
+    size_gb: float | None = None
+    vram_estimate_gb: float | None = None
+    ctx_size: int = 32768
+    gpu_layers: int = 999
+    flash_attn: bool = True
+    reasoning: bool = False
+    reasoning_budget: int | None = None
+    idle_timeout: int = 300
+    startup_wait: int = 30
+    auto_discovered: bool = False
+    description: str = ""
+    dtype: str = "auto"
+    gpu_memory_fraction: float = 0.90
+    trust_remote_code: bool = False
+    tensor_parallel_size: int = 1
+    quantization: str | None = None
+    enforce_eager: bool = False
+    enable_prefix_caching: bool = True
+    tokenizer: str = ""
+    wrapper_script: str = ""
+    model_type: str = ""
+    trt_config: dict = field(default_factory=dict)
+    extra_args: list = field(default_factory=list)
+    capabilities: BackendCapabilities = field(default_factory=BackendCapabilities)
+
+    def __getitem__(self, key: str):
+        try:
+            return getattr(self, key)
+        except AttributeError:
+            raise KeyError(key)
+
+    def get(self, key: str, default=None):
+        return getattr(self, key, default)
+
+
+def _infer_capabilities(engine: str, size_gb: float | None, name: str = "") -> BackendCapabilities:
+    """Infer backend capabilities from engine type and model size/name."""
+    size = size_gb or 0.0
+    name_lower = name.lower()
+    if size >= 25 or any(kw in name_lower for kw in ("70b", "72b", "65b", "32b", "34b")):
+        return BackendCapabilities(
+            supports_tools=True, supports_json_schema=True,
+            max_context=65536, code_quality="strong",
+        )
+    elif size >= 8 or any(kw in name_lower for kw in ("14b", "13b", "27b")):
+        return BackendCapabilities(
+            supports_tools=True, supports_json_schema=True,
+            max_context=32768, code_quality="good",
+        )
+    return BackendCapabilities(
+        supports_tools=False, supports_json_schema=False,
+        max_context=32768, code_quality="weak",
+    )
+
+
+def _estimate_vram(engine: str, size_gb: float | None) -> float | None:
+    """Estimate VRAM needed. GGUF × 1.15 for KV cache; HF/vLLM × 1.3."""
+    if size_gb is None:
+        return None
+    if engine == "llama.cpp":
+        return round(size_gb * 1.15, 2)
+    elif engine in ("vllm", "sglang", "huggingface", "trt-llm"):
+        return round(size_gb * 1.3, 2)
+    return None
 
 
 @dataclass
@@ -354,12 +437,12 @@ def load_config(
     )
 
 
-def load_backends(config: AppConfig) -> dict:
+def load_backends(config: AppConfig) -> dict[str, BackendConfig]:
     """
-    Parse backends.yaml into a dict of backend configs.
+    Parse backends.yaml into a dict of typed backend configs.
     Each entry is validated for required fields.
     Model/model_dir paths are ~ -expanded.
-    Returns dict[slug → backend_cfg_dict].
+    Returns dict[slug → BackendConfig].
     """
     with open(config.backends_file) as f:
         raw = yaml.safe_load(f) or {}
@@ -370,7 +453,8 @@ def load_backends(config: AppConfig) -> dict:
             f"backends.yaml must have a top-level 'backends:' mapping, got {type(entries)}"
         )
 
-    result = {}
+    result: dict[str, BackendConfig] = {}
+    known_fields = {f.name for f in BackendConfig.__dataclass_fields__.values()}
 
     for slug, cfg in entries.items():
         if not isinstance(cfg, dict):
@@ -402,6 +486,11 @@ def load_backends(config: AppConfig) -> dict:
         if "log" not in cfg:
             cfg["log"] = str(config.data_dir / "logs" / f"backend-{slug}.log")
 
-        result[slug] = cfg
+        # Construct typed BackendConfig, dropping unknown YAML keys
+        filtered = {k: v for k, v in cfg.items() if k in known_fields and k != "capabilities"}
+        backend = BackendConfig(**filtered)
+        backend.capabilities = _infer_capabilities(backend.engine, backend.size_gb, backend.description)
+        backend.vram_estimate_gb = _estimate_vram(backend.engine, backend.size_gb)
+        result[slug] = backend
 
     return result

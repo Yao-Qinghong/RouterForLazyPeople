@@ -3,23 +3,24 @@ router/routing.py — Request classifier with best-engine selection
 
 Determines which backend to route a request to based on:
   1. Explicit [route:key] prefix in the first user message
-  2. Tool use / function calling → deep (agentic tasks need capable models)
-  3. Token count estimate
-  4. Keyword scan (keywords configured in settings.yaml)
+  2. Structural signals (tools, response_format, system prompt, message count)
+  3. Token count thresholds
+  4. Keywords (soft tiebreaker — can push fast→mid, never force deep alone)
   5. Default: "fast"
 
 When multiple backends share a tier, picks the BEST one rather than
 round-robining randomly:
   - Benchmark TG speed (from ./router-start bench) takes priority
   - Falls back to engine capability ranking when no benchmarks exist
+  - Capability-aware filtering prefers backends matching request needs
   - Round-robins only among backends with identical measured speed
-    (e.g. two vLLM instances of the same model for load balancing)
 
 Engine capability ranking (higher = preferred when speed unknown):
   trt-llm > vllm > sglang > llama.cpp > huggingface > openai > ollama
 """
 
 import itertools
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -79,6 +80,58 @@ def _token_estimate(content: str) -> int:
     return len(content.split())
 
 
+@dataclass
+class RequestSignals:
+    """Structural signals extracted from a request payload."""
+    has_tools: bool = False
+    needs_json_schema: bool = False
+    system_token_count: int = 0
+    total_messages: int = 0
+    token_count: int = 0
+    keyword_tier: str = ""  # "mid" or "deep" from keyword scan, or ""
+
+
+def _extract_signals(payload: dict, config: "AppConfig") -> RequestSignals:
+    """Extract all classification signals from a request payload."""
+    content = _extract_content(payload)
+    messages = payload.get("messages", [])
+
+    # System prompt tokens
+    system_tokens = 0
+    for m in messages:
+        if m.get("role") == "system":
+            c = m.get("content", "")
+            if isinstance(c, str):
+                system_tokens += _token_estimate(c)
+
+    # response_format
+    rf = payload.get("response_format") or {}
+    needs_schema = rf.get("type") in ("json_schema", "json_object")
+
+    # Keyword scan (soft signal)
+    kw_tier = ""
+    if any(kw in content for kw in config.routing.deep_keywords):
+        kw_tier = "deep"
+    elif any(kw in content for kw in config.routing.mid_keywords):
+        kw_tier = "mid"
+
+    return RequestSignals(
+        has_tools=bool(payload.get("tools") or payload.get("functions")),
+        needs_json_schema=needs_schema,
+        system_token_count=system_tokens,
+        total_messages=len(messages),
+        token_count=_token_estimate(content),
+        keyword_tier=kw_tier,
+    )
+
+
+_TIER_ORDER = {"fast": 0, "mid": 1, "deep": 2}
+
+
+def _max_tier(a: str, b: str) -> str:
+    return a if _TIER_ORDER.get(a, 0) >= _TIER_ORDER.get(b, 0) else b
+
+
 def _backends_for_tier(backends: dict, tier: str) -> list[str]:
     """Return all backend keys that belong to a tier."""
     return [k for k, v in backends.items() if v.get("tier") == tier]
@@ -106,14 +159,15 @@ def _engine_score(key: str, backends: dict) -> tuple[float, int]:
     return (0.0, priority)
 
 
-def _pick(backends: dict, preferred: str) -> str:
+def _pick(backends: dict, preferred: str, signals: RequestSignals = None) -> str:
     """
     Return the best backend for the preferred tier.
 
     Selection order:
-      1. Highest measured TG tok/s from benchmarks
-      2. Engine capability ranking (trt-llm > vllm > sglang > llama.cpp …)
-      3. Round-robin among backends with identical score (load balancing)
+      1. Filter by capability match (tools, JSON schema) if signals provided
+      2. Highest measured TG tok/s from benchmarks
+      3. Engine capability ranking (trt-llm > vllm > sglang > llama.cpp …)
+      4. Round-robin among backends with identical score (load balancing)
 
     Falls back gracefully if the preferred tier has no backends.
     """
@@ -127,6 +181,19 @@ def _pick(backends: dict, preferred: str) -> str:
         if backends:
             return next(iter(backends))
         return preferred  # caller returns 400
+
+    # Capability-aware filtering: prefer backends matching request needs
+    if signals and len(tier_backends) > 1:
+        if signals.has_tools:
+            capable = [k for k in tier_backends
+                       if getattr(backends[k].get("capabilities"), "supports_tools", False)]
+            if capable:
+                tier_backends = capable
+        elif signals.needs_json_schema:
+            capable = [k for k in tier_backends
+                       if getattr(backends[k].get("capabilities"), "supports_json_schema", False)]
+            if capable:
+                tier_backends = capable
 
     if len(tier_backends) == 1:
         return tier_backends[0]
@@ -159,14 +226,12 @@ def classify(payload: dict, backends: dict, config: "AppConfig") -> str:
     Classify a request payload and return the backend key to use.
 
     Priority order:
-      1. [route:key] explicit prefix in message
-      2. Tool use / function calling → deep  (agentic tasks need capable models)
-      3. Long prompt → deep
-      4. Deep keywords → deep
-      5. Code keywords / medium prompt → mid
-      6. Default → fast
+      1. [route:key] explicit prefix (highest priority)
+      2. Structural signals (tools, response_format, system prompt, message count)
+      3. Token count thresholds
+      4. Keywords (soft tiebreaker — can push fast→mid, never force deep alone)
+      5. Default → fast
     """
-    content = _extract_content(payload)
     messages = payload.get("messages", [])
 
     # 1. Explicit routing prefix: [route:backend-key] in any message
@@ -177,27 +242,29 @@ def classify(payload: dict, backends: dict, config: "AppConfig") -> str:
             if key in backends:
                 return key
 
-    # 2. Tool use / function calling → deep
-    #    Small models produce unreliable JSON for tool calls and often
-    #    fail multi-step agentic tasks entirely.
-    if payload.get("tools") or payload.get("functions"):
-        return _pick(backends, "deep")
+    signals = _extract_signals(payload, config)
+    tier = "fast"
 
-    token_count = _token_estimate(content)
+    # 2. Structural signals → determine minimum tier
+    if signals.has_tools:
+        tier = "deep"
+    elif signals.needs_json_schema:
+        tier = _max_tier(tier, "mid")
+    elif signals.token_count > config.routing.token_threshold_deep:
+        tier = "deep"
+    elif signals.system_token_count > 2000:
+        tier = _max_tier(tier, "mid")
+    elif signals.total_messages > 10:
+        tier = _max_tier(tier, "mid")
+    elif signals.token_count > config.routing.token_threshold_mid:
+        tier = _max_tier(tier, "mid")
 
-    # 3. Long prompt → deep
-    if token_count > config.routing.token_threshold_deep:
-        return _pick(backends, "deep")
+    # 3. Keywords as soft signal: can push fast→mid, NOT force deep alone
+    if tier == "fast" and signals.keyword_tier in ("mid", "deep"):
+        tier = "mid"
+    elif tier == "mid" and signals.keyword_tier == "deep":
+        # Keyword can confirm mid→deep only combined with structural signal
+        if signals.token_count > config.routing.token_threshold_mid:
+            tier = "deep"
 
-    # 4. Deep keywords → deep
-    if any(kw in content for kw in config.routing.deep_keywords):
-        return _pick(backends, "deep")
-
-    # 5. Mid keywords → mid
-    if token_count > config.routing.token_threshold_mid:
-        return _pick(backends, "mid")
-    if any(kw in content for kw in config.routing.mid_keywords):
-        return _pick(backends, "mid")
-
-    # 6. Default: fast
-    return _pick(backends, "fast")
+    return _pick(backends, tier, signals)

@@ -2,6 +2,7 @@
 
 import pytest
 from unittest.mock import MagicMock
+from router.config import BackendConfig
 from router.routing import (
     classify,
     set_benchmark_results,
@@ -25,9 +26,9 @@ def _make_config(**overrides):
 
 
 BACKENDS_BASIC = {
-    "fast": {"tier": "fast", "port": 8080},
-    "mid": {"tier": "mid", "port": 8081},
-    "deep": {"tier": "deep", "port": 8082},
+    "fast": BackendConfig(tier="fast", port=8080),
+    "mid": BackendConfig(tier="mid", port=8081),
+    "deep": BackendConfig(tier="deep", port=8082),
 }
 
 
@@ -84,10 +85,11 @@ class TestClassify:
         # Falls through to default classification
         assert result in BACKENDS_BASIC
 
-    def test_deep_keyword(self):
+    def test_deep_keyword_is_soft_signal(self):
+        """Deep keywords push fast→mid, but do NOT force deep alone."""
         payload = {"messages": [{"content": "Please analyze this code"}]}
         result = classify(payload, BACKENDS_BASIC, _make_config())
-        assert result == "deep"
+        assert result == "mid"
 
     def test_mid_keyword(self):
         payload = {"messages": [{"content": "write a function"}]}
@@ -112,7 +114,7 @@ class TestClassify:
         assert result == "mid"
 
     def test_fallback_when_tier_missing(self):
-        backends = {"only-backend": {"tier": "fast", "port": 8080}}
+        backends = {"only-backend": BackendConfig(tier="fast", port=8080)}
         payload = {"messages": [{"content": "analyze this deeply"}]}
         result = classify(payload, backends, _make_config())
         # Should fall back to the only available backend
@@ -129,7 +131,7 @@ class TestPick:
         assert _pick(BACKENDS_BASIC, "fast") == "fast"
 
     def test_fallback_to_first(self):
-        backends = {"only": {"tier": "mid", "port": 8080}}
+        backends = {"only": BackendConfig(tier="mid", port=8080)}
         result = _pick(backends, "fast")
         assert result == "only"
 
@@ -139,9 +141,9 @@ class TestPick:
 
     def test_round_robin_multiple(self):
         backends = {
-            "fast-1": {"tier": "fast", "port": 8080},
-            "fast-2": {"tier": "fast", "port": 8081},
-            "deep": {"tier": "deep", "port": 8082},
+            "fast-1": BackendConfig(tier="fast", port=8080),
+            "fast-2": BackendConfig(tier="fast", port=8081),
+            "deep": BackendConfig(tier="deep", port=8082),
         }
         results = [_pick(backends, "fast") for _ in range(4)]
         assert "fast-1" in results
@@ -149,8 +151,8 @@ class TestPick:
 
     def test_prefers_faster_measured_backend(self):
         backends = {
-            "fast-slow": {"tier": "fast", "port": 8080},
-            "fast-quick": {"tier": "fast", "port": 8081},
+            "fast-slow": BackendConfig(tier="fast", port=8080),
+            "fast-quick": BackendConfig(tier="fast", port=8081),
         }
         set_benchmark_results({
             "fast-slow": {"tg_tok_s": 12.0},
@@ -173,9 +175,124 @@ class TestBackendsForTier:
 
     def test_multiple_same_tier(self):
         backends = {
-            "fast-a": {"tier": "fast"},
-            "fast-b": {"tier": "fast"},
-            "mid": {"tier": "mid"},
+            "fast-a": BackendConfig(tier="fast"),
+            "fast-b": BackendConfig(tier="fast"),
+            "mid": BackendConfig(tier="mid"),
         }
         result = _backends_for_tier(backends, "fast")
         assert set(result) == {"fast-a", "fast-b"}
+
+
+# ── Structural signal classification ─────────────────────────
+
+class TestStructuralSignals:
+    def test_tools_routes_to_deep(self):
+        payload = {"messages": [{"content": "hi"}], "tools": [{"type": "function"}]}
+        result = classify(payload, BACKENDS_BASIC, _make_config())
+        assert result == "deep"
+
+    def test_response_format_json_schema_routes_mid(self):
+        payload = {
+            "messages": [{"content": "list items"}],
+            "response_format": {"type": "json_schema"},
+        }
+        result = classify(payload, BACKENDS_BASIC, _make_config())
+        assert result == "mid"
+
+    def test_response_format_json_object_routes_mid(self):
+        payload = {
+            "messages": [{"content": "list items"}],
+            "response_format": {"type": "json_object"},
+        }
+        result = classify(payload, BACKENDS_BASIC, _make_config())
+        assert result == "mid"
+
+    def test_long_system_prompt_routes_mid(self):
+        system = " ".join(["instruction"] * 2500)
+        payload = {"messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": "do the task"},
+        ]}
+        result = classify(payload, BACKENDS_BASIC, _make_config())
+        assert result == "mid"
+
+    def test_many_messages_routes_mid(self):
+        msgs = [{"role": "user", "content": "hi"}] * 12
+        payload = {"messages": msgs}
+        result = classify(payload, BACKENDS_BASIC, _make_config())
+        assert result == "mid"
+
+    def test_keyword_alone_does_not_force_deep(self):
+        payload = {"messages": [{"content": "analyze this"}]}
+        result = classify(payload, BACKENDS_BASIC, _make_config())
+        assert result == "mid"  # keyword pushes fast→mid, not deep
+
+    def test_keyword_mid_from_fast(self):
+        payload = {"messages": [{"content": "write a poem"}]}
+        result = classify(payload, BACKENDS_BASIC, _make_config())
+        assert result == "mid"
+
+    def test_explicit_route_overrides_everything(self):
+        payload = {"messages": [{"content": "[route:fast] analyze deeply"}]}
+        result = classify(payload, BACKENDS_BASIC, _make_config())
+        assert result == "fast"
+
+    def test_no_signals_defaults_fast(self):
+        payload = {"messages": [{"content": "hello"}]}
+        result = classify(payload, BACKENDS_BASIC, _make_config())
+        assert result == "fast"
+
+
+# ── Capability-aware _pick ───────────────────────────────────
+
+class TestCapabilityAwarePick:
+    def setup_method(self):
+        set_benchmark_results({})
+
+    def test_tools_prefers_capable_backend(self):
+        from router.config import BackendCapabilities
+        from router.routing import RequestSignals
+        backends = {
+            "d1": BackendConfig(tier="deep", port=8080,
+                                capabilities=BackendCapabilities(supports_tools=False)),
+            "d2": BackendConfig(tier="deep", port=8081,
+                                capabilities=BackendCapabilities(supports_tools=True)),
+        }
+        signals = RequestSignals(has_tools=True)
+        assert _pick(backends, "deep", signals) == "d2"
+
+    def test_json_schema_prefers_capable_backend(self):
+        from router.config import BackendCapabilities
+        from router.routing import RequestSignals
+        backends = {
+            "m1": BackendConfig(tier="mid", port=8080,
+                                capabilities=BackendCapabilities(supports_json_schema=False)),
+            "m2": BackendConfig(tier="mid", port=8081,
+                                capabilities=BackendCapabilities(supports_json_schema=True)),
+        }
+        signals = RequestSignals(needs_json_schema=True)
+        assert _pick(backends, "mid", signals) == "m2"
+
+    def test_no_capable_backends_falls_back_to_all(self):
+        from router.config import BackendCapabilities
+        from router.routing import RequestSignals
+        backends = {
+            "d1": BackendConfig(tier="deep", port=8080,
+                                capabilities=BackendCapabilities(supports_tools=False)),
+            "d2": BackendConfig(tier="deep", port=8081,
+                                capabilities=BackendCapabilities(supports_tools=False)),
+        }
+        signals = RequestSignals(has_tools=True)
+        result = _pick(backends, "deep", signals)
+        assert result in ("d1", "d2")
+
+    def test_plain_dict_backends_still_work(self):
+        """Backward compat: backends without capabilities field."""
+        backends = {
+            "a": {"tier": "deep", "port": 8080},
+            "b": {"tier": "deep", "port": 8081},
+        }
+        from router.routing import RequestSignals
+        signals = RequestSignals(has_tools=True)
+        result = _pick(backends, "deep", signals)
+        assert result in ("a", "b")
