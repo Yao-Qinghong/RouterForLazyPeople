@@ -158,8 +158,10 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
         logger.info(f"  Backends: {manual} manual + {discovered} auto-discovered = {len(backends)} total")
         if not backends:
             logger.warning(
-                "No backends registered. Edit config/backends.yaml to add your models, "
-                "or place GGUF files in ~/models (they will be auto-discovered)."
+                "No backends found. Quick options:\n"
+                "  • Start LM Studio or Ollama — the router will detect them automatically\n"
+                "  • Place GGUF files in ~/models and restart\n"
+                "  • Edit config/backends.yaml to add backends manually"
             )
         if config.model_aliases:
             logger.info(f"  Model aliases: {config.model_aliases}")

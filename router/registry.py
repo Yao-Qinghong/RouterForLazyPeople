@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from router.config import load_backends
 from router.discovery import (
+    detect_running_servers,
     discover_gguf_models,
     discover_hf_models,
     discover_trtllm_engines,
@@ -61,7 +62,13 @@ def build_backend_registry(config: "AppConfig") -> dict:
     registry = load_backends(config)
     manual_count = len(registry)
 
-    # ── Auto-discovery ────────────────────────────────────────
+    # ── Detect already-running servers (LM Studio, Ollama, …) ─
+    running = detect_running_servers(config)
+    for slug, cfg in running.items():
+        if slug not in registry:
+            registry[slug] = cfg
+
+    # ── Auto-discovery (GGUF / HF / TRT-LLM on disk) ─────────
     port_counter = [config.discovery.port_start]
 
     gguf = discover_gguf_models(config, port_counter)

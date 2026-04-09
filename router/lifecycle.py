@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 from router.engines import (
-    ENGINE_LLAMA, ENGINE_TRTLLM, ENGINE_OLLAMA,
+    ENGINE_LLAMA, ENGINE_TRTLLM, ENGINE_OLLAMA, ENGINE_OPENAI,
     is_engine_available, health_url,
     build_llama_cmd, build_vllm_cmd, build_sglang_cmd,
     build_hf_cmd, build_trtllm_cmd, build_ollama_cmd,
@@ -95,6 +95,9 @@ class BackendManager:
         cfg = self.backends[key]
         engine = cfg.get("engine", ENGINE_LLAMA)
 
+        if engine == ENGINE_OPENAI:
+            raise ValueError(f"Engine 'openai' uses an external server — no command to build")
+
         if engine == ENGINE_LLAMA:
             return build_llama_cmd(cfg, self.config)
         elif engine == "vllm":
@@ -114,6 +117,10 @@ class BackendManager:
         """Spawn the backend subprocess and wait for it to become healthy."""
         cfg = self.backends[key]
         engine = cfg.get("engine", ENGINE_LLAMA)
+
+        # External OpenAI-compatible servers are already running — just verify
+        if engine == ENGINE_OPENAI:
+            return await self._start_external_backend(key)
 
         # Ollama backends connect to an existing Ollama server
         if engine == ENGINE_OLLAMA:
@@ -164,6 +171,26 @@ class BackendManager:
 
         logger.info(f"[{key}] Ready on port {cfg['port']} (PID {proc.pid})")
         return True
+
+    async def _start_external_backend(self, key: str) -> bool:
+        """
+        Verify that an external OpenAI-compatible server (e.g. LM Studio)
+        is reachable. No subprocess is started — the server is already running.
+        """
+        cfg = self.backends[key]
+        port = cfg.get("port", 1234)
+        url = f"http://localhost:{port}/v1/models"
+        try:
+            async with httpx.AsyncClient() as client:
+                r = await client.get(url, timeout=5)
+                if r.status_code == 200:
+                    self.processes[key] = _ExternalSentinel(port)
+                    self.last_used[key] = time.time()
+                    logger.info(f"[{key}] Connected to external server on port {port}")
+                    return True
+        except Exception as e:
+            logger.error(f"[{key}] Cannot reach external server on port {port}: {e}")
+        return False
 
     async def _start_ollama_backend(self, key: str) -> bool:
         """
@@ -273,7 +300,10 @@ class BackendManager:
     def stop(self, key: str):
         """Gracefully stop a backend (SIGTERM → SIGKILL after 10s)."""
         proc = self.processes.get(key)
-        if proc and isinstance(proc, _OllamaSentinel):
+        if proc and isinstance(proc, _ExternalSentinel):
+            # External servers are not ours to stop — just disconnect
+            pass
+        elif proc and isinstance(proc, _OllamaSentinel):
             # Ollama backends: unload via API
             self._unload_ollama(key)
         elif proc and proc.poll() is None:
@@ -370,7 +400,7 @@ class BackendManager:
                 "description":     cfg.get("description", key),
                 "auto_discovered": cfg.get("auto_discovered", False),
                 "tier":            cfg.get("tier"),
-                "pid":             self.processes[key].pid if running and not isinstance(self.processes.get(key), _OllamaSentinel) else None,
+                "pid":             self.processes[key].pid if running and not isinstance(self.processes.get(key), (_OllamaSentinel, _ExternalSentinel)) else None,
                 "log":             cfg.get("log", ""),
             }
             if key in self.active_configs:
@@ -380,6 +410,29 @@ class BackendManager:
                 entry["tuning_saved"] = True
             out[key] = entry
         return out
+
+
+class _ExternalSentinel:
+    """
+    Sentinel for external OpenAI-compatible servers (LM Studio, etc.).
+    We do not own this process — poll() checks if it's still reachable.
+    """
+    def __init__(self, port: int):
+        self.port = port
+        self.pid = None
+
+    def poll(self):
+        """Return None if reachable (alive), 1 if not."""
+        try:
+            import httpx as _httpx
+            r = _httpx.get(f"http://localhost:{self.port}/v1/models", timeout=2)
+            return None if r.status_code == 200 else 1
+        except Exception:
+            return 1
+
+    def kill(self): pass
+    def terminate(self): pass
+    def wait(self, timeout=None): pass
 
 
 class _OllamaSentinel:

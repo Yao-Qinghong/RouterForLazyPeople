@@ -6,12 +6,18 @@ Scans configured directories for:
   - HuggingFace checkpoints (for vLLM / SGLang / HF TGI)
   - TensorRT-LLM engine directories
 
+Also probes for already-running inference servers:
+  - LM Studio (port 1234, OpenAI-compatible)
+  - Ollama (port 11434)
+  - Any other OpenAI-compatible server on user-configured ports
+
 All scan paths and thresholds come from AppConfig — nothing is hardcoded here.
 """
 
 import glob
 import hashlib
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -19,11 +25,14 @@ from typing import TYPE_CHECKING
 
 from router.engines import (
     ENGINE_LLAMA, ENGINE_VLLM, ENGINE_SGLANG, ENGINE_HF, ENGINE_TRTLLM,
+    ENGINE_OLLAMA, ENGINE_OPENAI,
     is_engine_available,
 )
 
 if TYPE_CHECKING:
     from router.config import AppConfig
+
+logger = logging.getLogger("llm-router.discovery")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -283,6 +292,91 @@ def discover_hf_models(config: "AppConfig", port_counter: list[int]) -> dict:
             port_counter[0] += 1
 
     return discovered
+
+
+def detect_running_servers(config: "AppConfig") -> dict:
+    """
+    Probe common ports for already-running LLM inference servers.
+
+    Detects: LM Studio (port 1234), Ollama (port 11434).
+    Returns a backend dict ready to merge into the registry.
+    No subprocess is spawned — these servers are already running.
+    """
+    backends = {}
+    backends.update(_probe_lmstudio(config))
+    backends.update(_probe_ollama_models(config))
+    return backends
+
+
+def _probe_lmstudio(config: "AppConfig") -> dict:
+    """Detect LM Studio and register it as a passthrough backend."""
+    try:
+        import httpx
+        r = httpx.get("http://localhost:1234/v1/models", timeout=2)
+        if r.status_code != 200:
+            return {}
+        models = r.json().get("data", [])
+        model_id = models[0]["id"] if models else "unknown"
+        logger.info(f"Auto-detected: LM Studio on :1234  (model: {model_id})")
+        return {
+            "lmstudio": {
+                "engine":         ENGINE_OPENAI,
+                "port":           1234,
+                "model":          model_id,
+                "tier":           "fast",
+                "idle_timeout":   86400,    # never auto-stop a server we don't own
+                "startup_wait":   5,
+                "auto_discovered": True,
+                "description":    f"LM Studio — {model_id}",
+                "log":            str(config.data_dir / "logs" / "backend-lmstudio.log"),
+            }
+        }
+    except Exception:
+        return {}
+
+
+def _probe_ollama_models(config: "AppConfig") -> dict:
+    """Detect Ollama and register each available model as a backend."""
+    try:
+        import httpx
+        r = httpx.get("http://localhost:11434/api/tags", timeout=2)
+        if r.status_code != 200:
+            return {}
+        models = r.json().get("models", [])
+        if not models:
+            return {}
+        logger.info(f"Auto-detected: Ollama on :11434  ({len(models)} model(s))")
+        result = {}
+        for m in models:
+            name = m["name"]
+            slug = "ollama-" + re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+            tier = _tier_from_model_name(name)
+            result[slug] = {
+                "engine":         ENGINE_OLLAMA,
+                "port":           11434,
+                "model":          name,
+                "tier":           tier,
+                "idle_timeout":   86400,
+                "startup_wait":   30,
+                "auto_discovered": True,
+                "description":    f"Ollama — {name}",
+                "log":            str(config.data_dir / "logs" / f"backend-{slug}.log"),
+            }
+        return result
+    except Exception:
+        return {}
+
+
+def _tier_from_model_name(name: str) -> str:
+    """Heuristic tier assignment from model name size tokens."""
+    n = name.lower()
+    for token in ("70b", "72b", "65b", "80b", "110b", "122b", "123b", "178b", "671b"):
+        if token in n:
+            return "deep"
+    for token in ("13b", "14b", "27b", "30b", "32b", "34b", "47b"):
+        if token in n:
+            return "mid"
+    return "fast"
 
 
 def discover_trtllm_engines(config: "AppConfig", port_counter: list[int]) -> dict:

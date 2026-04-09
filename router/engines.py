@@ -1,7 +1,8 @@
 """
 router/engines.py — Engine availability detection and command builders
 
-Supports: llama.cpp, vLLM, SGLang, TensorRT-LLM, HuggingFace TGI, Ollama
+Supports: llama.cpp, vLLM, SGLang, TensorRT-LLM, HuggingFace TGI, Ollama,
+          and any already-running OpenAI-compatible server (LM Studio, etc.)
 """
 
 import os
@@ -19,8 +20,9 @@ ENGINE_VLLM   = "vllm"
 ENGINE_SGLANG = "sglang"
 ENGINE_HF     = "huggingface"
 ENGINE_OLLAMA = "ollama"
+ENGINE_OPENAI = "openai"   # passthrough to any running OpenAI-compatible server
 
-ALL_ENGINES = [ENGINE_LLAMA, ENGINE_TRTLLM, ENGINE_VLLM, ENGINE_SGLANG, ENGINE_HF, ENGINE_OLLAMA]
+ALL_ENGINES = [ENGINE_LLAMA, ENGINE_TRTLLM, ENGINE_VLLM, ENGINE_SGLANG, ENGINE_HF, ENGINE_OLLAMA, ENGINE_OPENAI]
 
 # ─────────────────────────────────────────────────────────────
 # Availability detection
@@ -51,6 +53,7 @@ def is_engine_available(engine: str, config: "AppConfig") -> bool:
         ENGINE_TRTLLM: lambda: _can_import("tensorrt_llm"),
         ENGINE_HF:     lambda: _can_import("transformers"),
         ENGINE_OLLAMA: lambda: shutil.which("ollama") is not None or _is_ollama_running(),
+        ENGINE_OPENAI: lambda: True,   # no local binary required; server already running
     }
 
     result = checks.get(engine, lambda: False)()
@@ -224,6 +227,8 @@ def health_url(cfg: dict) -> str:
     engine = cfg.get("engine", ENGINE_LLAMA)
     if engine == ENGINE_OLLAMA:
         return f"http://localhost:{cfg['port']}/api/tags"
+    if engine == ENGINE_OPENAI:
+        return f"http://localhost:{cfg['port']}/v1/models"
     return f"http://localhost:{cfg['port']}/health"
 
 
