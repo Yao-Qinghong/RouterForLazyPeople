@@ -178,6 +178,29 @@ class TestUpdateAndSysinfo:
         assert "TG=61 tok/s" in out
         assert out.index("quick") < out.index("slow")
 
+    def test_backend_failure_help_prints_log_and_oom_hint(self, tmp_path, capsys):
+        log_path = tmp_path / "backend.log"
+        log_path.write_text("INFO loading\nCUDA out of memory while allocating KV cache\n")
+
+        cli._print_backend_failure_help("deep", "Backend 'deep' failed to start", str(log_path))
+
+        out = capsys.readouterr().out
+        assert "diagnosis:" in out
+        assert "GPU memory/OOM" in out
+        assert str(log_path) in out
+        assert "tail -n 120" in out
+
+    def test_backend_failure_help_classifies_vllm_unsupported_model(self, capsys):
+        cli._print_backend_failure_help(
+            "hf-test",
+            "ValueError: model architecture is not supported by vLLM",
+            None,
+        )
+
+        out = capsys.readouterr().out
+        assert "compatibility failure" in out
+        assert "vLLM version" in out
+
     def test_bench_thinking_mode_defaults_to_no_think(self):
         assert cli._bench_thinking_mode(argparse.Namespace()) == "no_think"
         assert cli._bench_thinking_mode(argparse.Namespace(thinking=True)) == "think"

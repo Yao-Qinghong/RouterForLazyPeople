@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -776,6 +777,60 @@ def _router_exception_text(exc: Exception) -> str:
     return str(exc)
 
 
+def _extract_log_path(text: str) -> str | None:
+    match = re.search(r"(?:log:\s*|Check\s+)(\S+\.log)", text)
+    return match.group(1) if match else None
+
+
+def _read_tail(path: str, max_lines: int = 80) -> str:
+    try:
+        lines = Path(path).read_text(errors="replace").splitlines()
+    except Exception:
+        return ""
+    return "\n".join(lines[-max_lines:])
+
+
+def _diagnose_backend_failure(text: str) -> list[str]:
+    """Classify common backend startup failures from the router error plus backend log tail."""
+    lower = text.lower()
+    hints = []
+    if re.search(r"out of memory|cuda.*oom|oom|cumemalloc|memory allocation", lower):
+        hints.append("Likely GPU memory/OOM. Do not bulk-retry; stop backends, check nvidia-smi, and power-restart the Spark if GPU memory is wedged.")
+    if "address already in use" in lower or "port is already in use" in lower or "errno 98" in lower:
+        hints.append("Port conflict. Stop the process using this backend port or change the port in config/backends.yaml.")
+    if "no module named" in lower or "modulenotfounderror" in lower:
+        hints.append("Missing Python dependency for this engine. Run ./router-start sysinfo and install the engine shown as missing.")
+    if "trust_remote_code" in lower or "trust-remote-code" in lower:
+        hints.append("Model requires remote custom code. Add trust_remote_code: true to that backend, then rescan.")
+    if "unsupported" in lower or "not supported" in lower or "unrecognized configuration" in lower:
+        hints.append("Engine/model compatibility failure. Try a llama.cpp GGUF backend first, or install a vLLM version that supports this model/quantization.")
+    if "no such file" in lower or "does not exist" in lower or "not found" in lower:
+        hints.append("Path/config problem. Confirm the model path exists or remove stale scan_dirs entries.")
+    if "failed to start" in lower and not hints:
+        hints.append("Backend did not become healthy. Inspect the backend log shown below for the exact engine error.")
+    return hints[:4]
+
+
+def _print_backend_failure_help(key: str, error_text: str, log_path: str | None = None):
+    log_path = log_path or _extract_log_path(error_text)
+    log_tail = _read_tail(log_path) if log_path else ""
+    hints = _diagnose_backend_failure(error_text + "\n" + log_tail)
+
+    if hints:
+        print("      diagnosis:")
+        for hint in hints:
+            print(f"        - {hint}")
+    if log_path:
+        print(f"      log: {log_path}")
+        print(f"      inspect: tail -n 120 {log_path}")
+    if log_tail and not hints:
+        last_lines = [line for line in log_tail.splitlines() if line.strip()][-8:]
+        if last_lines:
+            print("      backend log tail:")
+            for line in last_lines:
+                print(f"        {_shorten(line, 120)}")
+
+
 def cmd_bench(args):
     """
     Run PP and TG speed benchmarks against registered backends.
@@ -798,6 +853,9 @@ def cmd_bench(args):
         with urllib.request.urlopen(f"{_router_url()}/backends", timeout=5) as r:
             backends = json.loads(r.read())
         status = _fetch_router_status()
+        for key, info in status.items():
+            if key in backends and info.get("log"):
+                backends[key]["log"] = info["log"]
     except Exception as e:
         print(f"Router not reachable: {e}")
         print("Start it first with: ./router-start")
@@ -917,6 +975,7 @@ def cmd_bench(args):
             except Exception as e:
                 error_text = _router_exception_text(e)
                 print(f"failed: {error_text}")
+                _print_backend_failure_help(key, error_text, cfg.get("log"))
                 results.append({"backend_key": key, "thinking_mode": thinking_mode, "error": error_text})
             finally:
                 if started_by_bench and attempted_start and not getattr(args, "keep_running", False):
