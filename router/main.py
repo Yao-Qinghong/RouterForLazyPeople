@@ -164,6 +164,57 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
             for k, v in backends.items()
         }
 
+    @app.get("/v1/models", summary="List backends as OpenAI-compatible model objects")
+    async def list_models_openai(request: Request):
+        """
+        OpenAI-compatible GET /v1/models endpoint.
+
+        Required by OpenClaw, LM Studio, Open WebUI, and most OpenAI-compatible
+        clients so they can discover what 'models' are available.
+
+        Each backend is listed as a model whose id is the backend key
+        (e.g. 'fast', 'mid', 'deep'). Point your client at:
+            baseUrl: http://localhost:9001/v1
+        and select a model by its backend key.
+        """
+        import time as _time
+        backends = request.app.state.manager.backends
+        models = []
+        for key, cfg in backends.items():
+            models.append({
+                "id":       key,
+                "object":   "model",
+                "created":  int(_time.time()),
+                "owned_by": "local",
+                "description": cfg.get("description", key),
+                "engine":   cfg.get("engine", "llama.cpp"),
+                "tier":     cfg.get("tier"),
+                "size_gb":  cfg.get("size_gb"),
+                "context_window": cfg.get("ctx_size"),
+                "auto_discovered": cfg.get("auto_discovered", False),
+            })
+        return {"object": "list", "data": models}
+
+    @app.get("/v1/models/{model_id}", summary="Get a single model by backend key")
+    async def get_model_openai(model_id: str, request: Request):
+        """OpenAI-compatible GET /v1/models/{id}."""
+        import time as _time
+        backends = request.app.state.manager.backends
+        if model_id not in backends:
+            raise HTTPException(404, f"Model '{model_id}' not found. "
+                                     f"Available: {list(backends.keys())}")
+        cfg = backends[model_id]
+        return {
+            "id":       model_id,
+            "object":   "model",
+            "created":  int(_time.time()),
+            "owned_by": "local",
+            "description": cfg.get("description", model_id),
+            "engine":   cfg.get("engine", "llama.cpp"),
+            "tier":     cfg.get("tier"),
+            "context_window": cfg.get("ctx_size"),
+        }
+
     @app.get("/engines", summary="Installed engine availability")
     async def list_engines(request: Request):
         cfg = request.app.state.config

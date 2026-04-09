@@ -258,7 +258,7 @@ def cmd_start(args):
     print(f"│  API key         : any string (no auth required)" + " " * (w - 51) + "│")
     print("└" + "─" * (w - 1) + "┘")
     print()
-    print("  Works with: Open WebUI · LM Studio API · Cursor · Continue · Jan · Anything OpenAI-compatible")
+    print("  Works with: Open WebUI · OpenClaw · LM Studio API · Cursor · Continue · Jan · Anything OpenAI-compatible")
     print()
     print("  Anthropic SDK (Claude Code, @anthropic-ai/sdk):")
     print(f"    base_url  : {base}/anthropic")
@@ -266,6 +266,7 @@ def cmd_start(args):
     print()
     print("  Router endpoints:")
     print(f"    Status   : {base}/status")
+    print(f"    Models   : {base}/v1/models   (OpenAI model list)")
     print(f"    Backends : {base}/backends")
     print(f"    Metrics  : {base}/metrics")
     print(f"    Sys info : {base}/sysinfo")
@@ -490,6 +491,21 @@ def cmd_sysinfo(args):
             print(f"  {label:<14} NOT installed        recommended: {rec_ver:<10} {compat_str}")
             if install_short and compatible:
                 print(f"  {'':14}   install: {install_short}")
+
+    # ── Client connection snippets ────────────────────────────
+    base = _router_url()
+    _section("Quick Connect")
+    print(f"  OpenAI SDK / Open WebUI / Jan:")
+    print(f"    base_url = {base}/v1")
+    print(f"    api_key  = anything")
+    print()
+    print(f"  OpenClaw (openclaw.json):")
+    print(f'    "baseUrl": "{base}/v1",')
+    print(f'    "api": "openai-completions"')
+    print()
+    print(f"  Anthropic SDK / Claude Code:")
+    print(f"    base_url = {base}/anthropic")
+    print(f"    api_key  = anything")
 
     # ── Port conflicts ────────────────────────────────────────
     _section("Port Conflicts")
