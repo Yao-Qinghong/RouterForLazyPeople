@@ -4,7 +4,10 @@ import pytest
 import tempfile
 from pathlib import Path
 
-from router.config import load_config, AppConfig, ConfigError
+from router.config import (
+    load_config, load_backends, AppConfig, BackendConfig,
+    BackendCapabilities, ConfigError, _infer_capabilities,
+)
 
 
 class TestLoadConfig:
@@ -105,5 +108,112 @@ proxy:
                 assert config.proxy.retry_attempts == 5
                 assert config.proxy.retry_backoff_sec == 2.0
                 assert config.proxy.retry_on_status == [500, 502, 503]
+            finally:
+                backends_path.unlink(missing_ok=True)
+
+
+class TestBackendCapabilities:
+    def test_explicit_capabilities_override_inferred(self):
+        """YAML capabilities block should override heuristic inference."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as sf:
+            sf.write("router:\n  port: 9001\n")
+            sf.flush()
+            backends_path = Path(sf.name).parent / "backends.yaml"
+            # Small model would normally infer supports_tools=False
+            backends_path.write_text("""
+backends:
+  my-model:
+    engine: llama.cpp
+    port: 8080
+    model: /tmp/small-3b.gguf
+    size_gb: 2.0
+    capabilities:
+      supports_tools: true
+      supports_json_schema: true
+      code_quality: strong
+""")
+            try:
+                config = load_config(Path(sf.name), backends_path)
+                result = load_backends(config)
+                backend = result["my-model"]
+                assert isinstance(backend, BackendConfig)
+                assert backend.capabilities.supports_tools is True
+                assert backend.capabilities.supports_json_schema is True
+                assert backend.capabilities.code_quality == "strong"
+            finally:
+                backends_path.unlink(missing_ok=True)
+
+    def test_partial_capabilities_merges_with_inferred(self):
+        """Partial YAML capabilities should merge with inferred defaults."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as sf:
+            sf.write("router:\n  port: 9001\n")
+            sf.flush()
+            backends_path = Path(sf.name).parent / "backends.yaml"
+            backends_path.write_text("""
+backends:
+  my-model:
+    engine: llama.cpp
+    port: 8080
+    model: /tmp/small-3b.gguf
+    size_gb: 2.0
+    capabilities:
+      supports_tools: true
+""")
+            try:
+                config = load_config(Path(sf.name), backends_path)
+                result = load_backends(config)
+                backend = result["my-model"]
+                # supports_tools overridden to True
+                assert backend.capabilities.supports_tools is True
+                # Other fields come from inference (small model = weak defaults)
+                assert backend.capabilities.code_quality == "weak"
+            finally:
+                backends_path.unlink(missing_ok=True)
+
+    def test_no_capabilities_block_uses_inference(self):
+        """Without capabilities in YAML, heuristics are used."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as sf:
+            sf.write("router:\n  port: 9001\n")
+            sf.flush()
+            backends_path = Path(sf.name).parent / "backends.yaml"
+            backends_path.write_text("""
+backends:
+  big-model:
+    engine: llama.cpp
+    port: 8080
+    model: /tmp/big-70b.gguf
+    size_gb: 40.0
+    description: "big-70b model"
+""")
+            try:
+                config = load_config(Path(sf.name), backends_path)
+                result = load_backends(config)
+                backend = result["big-model"]
+                # 40 GB + "70b" in description → strong capabilities inferred
+                assert backend.capabilities.supports_tools is True
+                assert backend.capabilities.code_quality == "strong"
+            finally:
+                backends_path.unlink(missing_ok=True)
+
+    def test_vram_estimate_populated_from_size(self):
+        """vram_estimate_gb should be calculated from size_gb."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as sf:
+            sf.write("router:\n  port: 9001\n")
+            sf.flush()
+            backends_path = Path(sf.name).parent / "backends.yaml"
+            backends_path.write_text("""
+backends:
+  model-a:
+    engine: llama.cpp
+    port: 8080
+    model: /tmp/model.gguf
+    size_gb: 10.0
+""")
+            try:
+                config = load_config(Path(sf.name), backends_path)
+                result = load_backends(config)
+                backend = result["model-a"]
+                # llama.cpp: 10.0 * 1.15 = 11.5
+                assert backend.vram_estimate_gb == 11.5
             finally:
                 backends_path.unlink(missing_ok=True)

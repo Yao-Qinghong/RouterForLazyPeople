@@ -489,7 +489,20 @@ def load_backends(config: AppConfig) -> dict[str, BackendConfig]:
         # Construct typed BackendConfig, dropping unknown YAML keys
         filtered = {k: v for k, v in cfg.items() if k in known_fields and k != "capabilities"}
         backend = BackendConfig(**filtered)
-        backend.capabilities = _infer_capabilities(backend.engine, backend.size_gb, backend.description)
+
+        # Capabilities: use explicit YAML overrides if present, else infer
+        caps_raw = cfg.get("capabilities")
+        if isinstance(caps_raw, dict):
+            inferred = _infer_capabilities(backend.engine, backend.size_gb, backend.description)
+            known_cap_fields = {f.name for f in BackendCapabilities.__dataclass_fields__.values()}
+            cap_values = {k: v for k, v in caps_raw.items() if k in known_cap_fields}
+            # Merge: explicit YAML values override inferred defaults
+            from dataclasses import asdict
+            merged = {**asdict(inferred), **cap_values}
+            backend.capabilities = BackendCapabilities(**merged)
+        else:
+            backend.capabilities = _infer_capabilities(backend.engine, backend.size_gb, backend.description)
+
         backend.vram_estimate_gb = _estimate_vram(backend.engine, backend.size_gb)
         result[slug] = backend
 
