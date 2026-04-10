@@ -17,6 +17,7 @@ Forwards inference requests to the appropriate backend with:
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -39,6 +40,18 @@ audit_logger = logging.getLogger("llm-router.audit")
 # Module-level semaphore — initialized by init_semaphore() at app startup
 _semaphore: asyncio.Semaphore | None = None
 
+_MODEL_MATCH_ENGINE_PRIORITY = {
+    # Prefer already-running passthrough servers for exact model IDs so clients
+    # can select a real model name without knowing an internal backend key.
+    "openai": 0,
+    "trt-llm": 1,
+    "vllm": 2,
+    "sglang": 3,
+    "llama.cpp": 4,
+    "huggingface": 5,
+    "ollama": 6,
+}
+
 
 def init_semaphore(max_concurrent: int):
     """Call once at startup to set up the backpressure semaphore."""
@@ -46,19 +59,87 @@ def init_semaphore(max_concurrent: int):
     _semaphore = asyncio.Semaphore(max_concurrent)
 
 
-def _resolve_model_alias(payload: dict, config: "AppConfig") -> str | None:
-    """If the request's model field matches a configured alias, return the backend key."""
-    model = payload.get("model", "")
+def _is_path_like_model_name(model: str) -> bool:
+    if not model:
+        return False
+
+    expanded = os.path.expanduser(model)
+    return (
+        expanded.startswith("/")
+        or model.startswith(("~/", "./", "../"))
+        or expanded.endswith((".gguf", ".bin", ".pt", ".pth", ".safetensors", ".engine"))
+        or os.path.exists(expanded)
+    )
+
+
+def _backend_model_name(cfg: dict) -> str | None:
+    """Return a client-facing model id when the backend has one."""
+    model = cfg.get("model", "")
+    if not model or _is_path_like_model_name(model):
+        return None
+    return model
+
+
+def _preferred_model_backend(
+    candidates: list[str],
+    backends: dict,
+    manager: "BackendManager" | None = None,
+) -> str:
+    def _score(key: str) -> tuple[int, int, str]:
+        running = 0 if manager and manager.is_running(key) else 1
+        engine = backends[key].get("engine", "")
+        engine_rank = _MODEL_MATCH_ENGINE_PRIORITY.get(engine, 99)
+        return (running, engine_rank, key)
+
+    return min(candidates, key=_score)
+
+
+def build_model_aliases(
+    backends: dict,
+    configured_aliases: dict[str, str] | None = None,
+    manager: "BackendManager" | None = None,
+) -> dict[str, str]:
+    """
+    Build a model-name → backend-key map.
+
+    Explicit config aliases win. Auto aliases are generated from backend model
+    ids when they are safe to expose to clients.
+    """
+    auto_aliases: dict[str, list[str]] = {}
+    for key, cfg in backends.items():
+        model = _backend_model_name(cfg)
+        if model and model not in backends:
+            auto_aliases.setdefault(model, []).append(key)
+
+    resolved = {
+        model: _preferred_model_backend(candidates, backends, manager)
+        for model, candidates in auto_aliases.items()
+    }
+    for alias, target in (configured_aliases or {}).items():
+        if target in backends:
+            resolved[alias] = target
+    return resolved
+
+
+def resolve_requested_model(
+    model: str,
+    backends: dict,
+    configured_aliases: dict[str, str] | None = None,
+    manager: "BackendManager" | None = None,
+) -> str | None:
+    """
+    Resolve a client-supplied model string to a backend key.
+
+    Order:
+      1. Exact backend key
+      2. Explicit config alias
+      3. Exact backend model id (auto alias)
+    """
     if not model:
         return None
-    return config.model_aliases.get(model)
-
-
-def _model_name_as_backend(payload: dict, backends: dict) -> str | None:
-    """If the model field exactly matches a backend key, use it directly.
-    Lets clients pick backends by name (e.g. model='fast', model='deep')."""
-    model = payload.get("model", "")
-    return model if model in backends else None
+    if model in backends:
+        return model
+    return build_model_aliases(backends, configured_aliases, manager).get(model)
 
 
 def _audit_request(request_id: str, backend_key: str, endpoint: str,
@@ -138,8 +219,12 @@ async def handle_proxy(
     # Priority: ?backend= param → model alias → model name IS a backend key → content classifier
     backend_key = (
         request.query_params.get("backend")
-        or _resolve_model_alias(payload, config)
-        or _model_name_as_backend(payload, manager.backends)
+        or resolve_requested_model(
+            payload.get("model", ""),
+            manager.backends,
+            config.model_aliases,
+            manager,
+        )
         or classify(payload, manager.backends, config)
     )
 
@@ -471,8 +556,12 @@ async def handle_anthropic_proxy(
     # ── Determine backend ─────────────────────────────────────
     backend_key = request.query_params.get("backend")
     if not backend_key:
-        # Try model alias first
-        backend_key = config.model_aliases.get(original_model)
+        backend_key = resolve_requested_model(
+            original_model,
+            manager.backends,
+            config.model_aliases,
+            manager,
+        )
     if not backend_key:
         # Try model name → tier mapping
         backend_key = model_to_backend(original_model)
@@ -692,7 +781,7 @@ async def handle_gemini_proxy(
     # Determine backend
     backend_key = (
         request.query_params.get("backend")
-        or config.model_aliases.get(model)
+        or resolve_requested_model(model, manager.backends, config.model_aliases, manager)
         or gemini_model_to_backend(model)
     )
     if not backend_key or backend_key not in manager.backends:

@@ -27,7 +27,14 @@ from router.config import load_config, AppConfig
 from router.engines import available_engines, clear_engine_cache, ALL_ENGINES, is_engine_available
 from router.lifecycle import BackendManager
 from router.metrics import MetricsStore
-from router.proxy import handle_proxy, handle_anthropic_proxy, handle_gemini_proxy, init_semaphore
+from router.proxy import (
+    build_model_aliases,
+    handle_proxy,
+    handle_anthropic_proxy,
+    handle_gemini_proxy,
+    init_semaphore,
+    resolve_requested_model,
+)
 from router.registry import build_backend_registry
 
 logger = logging.getLogger("llm-router")
@@ -375,8 +382,13 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
         """
         import time as _time
         backends = request.app.state.manager.backends
-        aliases = request.app.state.config.model_aliases
+        aliases = build_model_aliases(
+            backends,
+            request.app.state.config.model_aliases,
+            request.app.state.manager,
+        )
         models = []
+        seen_ids: set[str] = set()
         for key, cfg in backends.items():
             models.append({
                 "id":       key,
@@ -390,9 +402,10 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
                 "context_window": cfg.get("ctx_size"),
                 "auto_discovered": cfg.get("auto_discovered", False),
             })
+            seen_ids.add(key)
         # Also list model aliases as models
         for alias, backend_key in aliases.items():
-            if backend_key in backends:
+            if backend_key in backends and alias not in seen_ids:
                 cfg = backends[backend_key]
                 models.append({
                     "id":       alias,
@@ -404,16 +417,20 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
                     "tier":     cfg.get("tier"),
                     "alias_for": backend_key,
                 })
+                seen_ids.add(alias)
         return {"object": "list", "data": models}
 
-    @app.get("/v1/models/{model_id}", summary="Get a single model by backend key")
+    @app.get("/v1/models/{model_id:path}", summary="Get a single model by backend key")
     async def get_model_openai(model_id: str, request: Request):
         """OpenAI-compatible GET /v1/models/{id}."""
         import time as _time
         backends = request.app.state.manager.backends
-        aliases = request.app.state.config.model_aliases
-        # Resolve alias
-        resolved = aliases.get(model_id, model_id)
+        resolved = resolve_requested_model(
+            model_id,
+            backends,
+            request.app.state.config.model_aliases,
+            request.app.state.manager,
+        ) or model_id
         if resolved not in backends:
             raise HTTPException(404, f"Model '{model_id}' not found. "
                                      f"Available: {list(backends.keys())}")

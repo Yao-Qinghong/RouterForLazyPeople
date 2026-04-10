@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 import router.main as main_module
+import router.proxy as proxy_module
 import router.sysinfo as sysinfo_module
 
 
@@ -86,6 +87,108 @@ def _make_app(tmp_path: Path, monkeypatch, *, auth_enabled: bool = False,
 
 
 class TestApiRoutes:
+    def test_openai_models_lists_auto_model_id_alias(self, monkeypatch, tmp_path):
+        model_id = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
+        registry = {
+            "local-8000": {
+                "engine": "openai",
+                "port": 8000,
+                "model": model_id,
+                "idle_timeout": 86400,
+                "startup_wait": 5,
+                "description": "External Nemotron",
+                "tier": "fast",
+                "log": str(tmp_path / "local-8000.log"),
+            },
+            "hf-nvidia": {
+                "engine": "vllm",
+                "port": 8111,
+                "model": model_id,
+                "idle_timeout": 600,
+                "startup_wait": 120,
+                "description": "Managed duplicate",
+                "tier": "fast",
+                "log": str(tmp_path / "hf-nvidia.log"),
+            },
+        }
+        _, app = _make_app(tmp_path, monkeypatch, registry=registry)
+
+        with TestClient(app) as client:
+            response = client.get("/v1/models")
+
+            assert response.status_code == 200
+            ids = {item["id"]: item for item in response.json()["data"]}
+            assert ids[model_id]["alias_for"] == "local-8000"
+
+            single = client.get(f"/v1/models/{model_id}")
+            assert single.status_code == 200
+            assert single.json()["id"] == model_id
+
+    def test_chat_completions_resolves_exact_model_id_without_manual_backend(self, monkeypatch, tmp_path):
+        model_id = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
+        registry = {
+            "local-8000": {
+                "engine": "openai",
+                "port": 8000,
+                "model": model_id,
+                "idle_timeout": 86400,
+                "startup_wait": 5,
+                "description": "External Nemotron",
+                "tier": "fast",
+                "log": str(tmp_path / "local-8000.log"),
+            },
+            "hf-nvidia": {
+                "engine": "vllm",
+                "port": 8111,
+                "model": model_id,
+                "idle_timeout": 600,
+                "startup_wait": 120,
+                "description": "Managed duplicate",
+                "tier": "fast",
+                "log": str(tmp_path / "hf-nvidia.log"),
+            },
+        }
+        _, app = _make_app(tmp_path, monkeypatch, registry=registry)
+        observed = {"ensure": None, "url": None}
+
+        async def fake_ensure_running(key: str):
+            observed["ensure"] = key
+
+        class FakeResponse:
+            status_code = 200
+            text = '{"id":"ok"}'
+
+            def json(self):
+                return {"id": "ok", "choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+
+        class FakeAsyncClient:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def post(self, url, json):
+                observed["url"] = url
+                return FakeResponse()
+
+        monkeypatch.setattr(proxy_module.httpx, "AsyncClient", FakeAsyncClient)
+
+        with TestClient(app) as client:
+            client.app.state.manager.ensure_running = fake_ensure_running
+
+            response = client.post(
+                "/v1/chat/completions",
+                json={"model": model_id, "messages": [{"role": "user", "content": "hello"}]},
+            )
+
+            assert response.status_code == 200
+            assert observed["ensure"] == "local-8000"
+            assert observed["url"] == "http://localhost:8000/v1/chat/completions"
+
     def test_reload_config_uses_original_settings_file(self, monkeypatch, tmp_path):
         settings_path, app = _make_app(tmp_path, monkeypatch)
 

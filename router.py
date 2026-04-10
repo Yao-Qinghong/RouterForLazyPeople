@@ -20,6 +20,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -111,7 +112,7 @@ def build_vllm_cmd(cfg: dict) -> list[str]:
     """
     model = cfg.get("model") or cfg.get("model_dir", "")
     cmd = [
-        "python3", "-m", "vllm.entrypoints.openai.api_server",
+        sys.executable or "python3", "-m", "vllm.entrypoints.openai.api_server",
         "--model",                model,
         "--host",                 "0.0.0.0",
         "--port",                 str(cfg["port"]),
@@ -143,7 +144,7 @@ def build_sglang_cmd(cfg: dict) -> list[str]:
     """
     model = cfg.get("model") or cfg.get("model_dir", "")
     cmd = [
-        "python3", "-m", "sglang.launch_server",
+        sys.executable or "python3", "-m", "sglang.launch_server",
         "--model-path",           model,
         "--host",                 "0.0.0.0",
         "--port",                 str(cfg["port"]),
@@ -167,10 +168,10 @@ def build_sglang_cmd(cfg: dict) -> list[str]:
 
 
 def build_trtllm_cmd(cfg: dict, trt_config: dict) -> list[str]:
+    model_dir = cfg.get("model_dir") or cfg.get("model", "")
     cmd = [
-        "python3", "-m", "tensorrt_llm.commands.serve",
-        "--model_dir",          cfg["model_dir"],
-        "--tokenizer_dir",      cfg.get("tokenizer", ""),
+        sys.executable or "python3", "-m", "tensorrt_llm.commands.serve",
+        "--model_dir",          model_dir,
         "--host",               "0.0.0.0",
         "--port",               str(cfg["port"]),
         "--max_batch_size",     str(trt_config.get("max_batch_size", 1)),
@@ -179,12 +180,16 @@ def build_trtllm_cmd(cfg: dict, trt_config: dict) -> list[str]:
         "--max_beam_width",     str(trt_config.get("max_beam_width", 1)),
         "--kv_cache_dtype",     trt_config.get("kv_cache_dtype", "int8"),
     ]
+    if cfg.get("tokenizer"):
+        cmd += ["--tokenizer_dir", cfg["tokenizer"]]
     if trt_config.get("chunked_context"):
         cmd.append("--chunked_context")
     if trt_config.get("enable_mtp"):
         cmd.append("--enable_mtp")
     if trt_config.get("gpu_memory_fraction"):
         cmd += ["--gpu_memory_fraction", str(trt_config["gpu_memory_fraction"])]
+    if cfg.get("trust_remote_code"):
+        cmd.append("--trust_remote_code")
     return cmd
 
 
@@ -366,6 +371,28 @@ def _read_hf_config(path: str) -> dict:
         return {}
 
 
+def _hf_prefers_trtllm(model_name: str, hf_config: dict) -> bool:
+    haystacks = [
+        model_name,
+        hf_config.get("model_type", ""),
+        " ".join(hf_config.get("architectures") or []),
+        json.dumps(hf_config, sort_keys=True),
+    ]
+    return any("nvfp4" in str(value).lower() for value in haystacks)
+
+
+def _preferred_hf_engine(model_name: str, hf_config: dict) -> str | None:
+    if _hf_prefers_trtllm(model_name, hf_config) and is_engine_available(ENGINE_TRTLLM):
+        return ENGINE_TRTLLM
+    if is_engine_available(ENGINE_VLLM):
+        return ENGINE_VLLM
+    if is_engine_available(ENGINE_SGLANG):
+        return ENGINE_SGLANG
+    if is_engine_available(ENGINE_HF):
+        return ENGINE_HF
+    return None
+
+
 def discover_gguf_models(port_counter: list[int]) -> dict:
     discovered = {}
     seen_paths = set()
@@ -435,14 +462,7 @@ def discover_hf_models(port_counter: list[int]) -> dict:
     discovered = {}
     seen_paths = set()
 
-    # Determine preferred engine for HF models
-    if is_engine_available(ENGINE_VLLM):
-        preferred_engine = ENGINE_VLLM
-    elif is_engine_available(ENGINE_SGLANG):
-        preferred_engine = ENGINE_SGLANG
-    elif is_engine_available(ENGINE_HF):
-        preferred_engine = ENGINE_HF
-    else:
+    if not any(is_engine_available(engine) for engine in (ENGINE_TRTLLM, ENGINE_VLLM, ENGINE_SGLANG, ENGINE_HF)):
         return {}  # No engine available for HF models
 
     for scan_dir in HF_SCAN_DIRS:
@@ -495,11 +515,24 @@ def discover_hf_models(port_counter: list[int]) -> dict:
 
             slug = _slug(f"hf-{dir_name}", path)
             tier = _classify_tier(size_gb)
+            preferred_engine = _preferred_hf_engine(dir_name, hf_config)
+            if preferred_engine is None:
+                continue
+
+            model_value = path
+            model_dir = ""
+            tokenizer = ""
+            if preferred_engine == ENGINE_TRTLLM:
+                model_value = dir_name
+                model_dir = path
+                tokenizer = path
 
             discovered[slug] = {
                 "engine":         preferred_engine,
                 "port":           port_counter[0],
-                "model":          path,
+                "model":          model_value,
+                "model_dir":      model_dir,
+                "tokenizer":      tokenizer,
                 "log":            f"{HOME}/{preferred_engine}-{slug}.log",
                 "ctx_size":       min(_estimate_ctx(size_gb), hf_config.get("max_position_embeddings", 131072)),
                 "dtype":          "auto",

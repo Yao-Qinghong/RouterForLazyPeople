@@ -8,6 +8,7 @@ Supports: llama.cpp, vLLM, SGLang, TensorRT-LLM, HuggingFace TGI, Ollama,
 import os
 import shutil
 import subprocess
+import sys
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -81,6 +82,14 @@ def clear_engine_cache():
     _engine_available_cache.clear()
 
 
+def _python_bin() -> str:
+    """
+    Use the same interpreter that launched the router so managed Python
+    backends inherit the project venv instead of falling back to /usr/bin/python3.
+    """
+    return sys.executable or "python3"
+
+
 # ─────────────────────────────────────────────────────────────
 # Command builders
 # ─────────────────────────────────────────────────────────────
@@ -104,7 +113,7 @@ def build_llama_cmd(cfg: dict, config: "AppConfig") -> list[str]:
 def build_vllm_cmd(cfg: dict, config: "AppConfig" = None) -> list[str]:
     model = cfg.get("model") or cfg.get("model_dir", "")
     cmd = [
-        "python3", "-m", "vllm.entrypoints.openai.api_server",
+        _python_bin(), "-m", "vllm.entrypoints.openai.api_server",
         "--model",                  model,
         "--host",                   "0.0.0.0",
         "--port",                   str(cfg["port"]),
@@ -132,7 +141,7 @@ def build_vllm_cmd(cfg: dict, config: "AppConfig" = None) -> list[str]:
 def build_sglang_cmd(cfg: dict, config: "AppConfig" = None) -> list[str]:
     model = cfg.get("model") or cfg.get("model_dir", "")
     cmd = [
-        "python3", "-m", "sglang.launch_server",
+        _python_bin(), "-m", "sglang.launch_server",
         "--model-path",          model,
         "--host",                "0.0.0.0",
         "--port",                str(cfg["port"]),
@@ -157,10 +166,10 @@ def build_sglang_cmd(cfg: dict, config: "AppConfig" = None) -> list[str]:
 
 
 def build_trtllm_cmd(cfg: dict, trt_config: dict, config: "AppConfig" = None) -> list[str]:
+    model_dir = cfg.get("model_dir") or cfg.get("model", "")
     cmd = [
-        "python3", "-m", "tensorrt_llm.commands.serve",
-        "--model_dir",      cfg["model_dir"],
-        "--tokenizer_dir",  cfg.get("tokenizer", ""),
+        _python_bin(), "-m", "tensorrt_llm.commands.serve",
+        "--model_dir",      model_dir,
         "--host",           "0.0.0.0",
         "--port",           str(cfg["port"]),
         "--max_batch_size", str(trt_config.get("max_batch_size", 1)),
@@ -169,12 +178,16 @@ def build_trtllm_cmd(cfg: dict, trt_config: dict, config: "AppConfig" = None) ->
         "--max_beam_width", str(trt_config.get("max_beam_width", 1)),
         "--kv_cache_dtype", trt_config.get("kv_cache_dtype", "int8"),
     ]
+    if cfg.get("tokenizer"):
+        cmd += ["--tokenizer_dir", cfg["tokenizer"]]
     if trt_config.get("chunked_context"):
         cmd.append("--chunked_context")
     if trt_config.get("enable_mtp"):
         cmd.append("--enable_mtp")
     if trt_config.get("gpu_memory_fraction"):
         cmd += ["--gpu_memory_fraction", str(trt_config["gpu_memory_fraction"])]
+    if cfg.get("trust_remote_code"):
+        cmd.append("--trust_remote_code")
     return cmd
 
 
@@ -200,7 +213,7 @@ def build_hf_cmd(cfg: dict, config: "AppConfig" = None) -> list[str]:
     home = os.path.expanduser("~")
     wrapper = cfg.get("wrapper_script", f"{home}/llm-router/hf_serve.py")
     return [
-        "python3", wrapper,
+        _python_bin(), wrapper,
         "--model", model,
         "--host",  "0.0.0.0",
         "--port",  str(cfg["port"]),

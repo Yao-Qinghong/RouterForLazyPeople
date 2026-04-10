@@ -208,6 +208,35 @@ def _read_hf_config(path: str) -> dict:
         return {}
 
 
+def _hf_prefers_trtllm(model_name: str, hf_config: dict) -> bool:
+    """
+    Prefer TRT-LLM for NVFP4 checkpoints when the runtime is available.
+
+    These models are NVIDIA-specialized and are a better fit for the TRT-LLM
+    serve path than the generic HF/vLLM fallback.
+    """
+    haystacks = [
+        model_name,
+        hf_config.get("model_type", ""),
+        " ".join(hf_config.get("architectures") or []),
+        json.dumps(hf_config, sort_keys=True),
+    ]
+    return any("nvfp4" in str(value).lower() for value in haystacks)
+
+
+def _preferred_hf_engine(model_name: str, hf_config: dict, config: "AppConfig") -> str | None:
+    """Pick the best serving engine for a single HF checkpoint."""
+    if _hf_prefers_trtllm(model_name, hf_config) and is_engine_available(ENGINE_TRTLLM, config):
+        return ENGINE_TRTLLM
+    if is_engine_available(ENGINE_VLLM, config):
+        return ENGINE_VLLM
+    if is_engine_available(ENGINE_SGLANG, config):
+        return ENGINE_SGLANG
+    if is_engine_available(ENGINE_HF, config):
+        return ENGINE_HF
+    return None
+
+
 # ─────────────────────────────────────────────────────────────
 # Discovery functions
 # ─────────────────────────────────────────────────────────────
@@ -286,14 +315,10 @@ def discover_gguf_models(config: "AppConfig", port_counter: list[int]) -> dict:
 
 def discover_hf_models(config: "AppConfig", port_counter: list[int]) -> dict:
     """Discover HuggingFace checkpoints and pick the best available engine."""
-    # Choose the best available engine for HF models
-    if is_engine_available(ENGINE_VLLM, config):
-        preferred_engine = ENGINE_VLLM
-    elif is_engine_available(ENGINE_SGLANG, config):
-        preferred_engine = ENGINE_SGLANG
-    elif is_engine_available(ENGINE_HF, config):
-        preferred_engine = ENGINE_HF
-    else:
+    if not any(
+        is_engine_available(engine, config)
+        for engine in (ENGINE_TRTLLM, ENGINE_VLLM, ENGINE_SGLANG, ENGINE_HF)
+    ):
         return {}
 
     discovered = {}
@@ -347,11 +372,26 @@ def discover_hf_models(config: "AppConfig", port_counter: list[int]) -> dict:
 
             slug = _slug(f"hf-{dir_name}", path)
             tier = _classify_tier(size_gb, config, dir_name)
+            preferred_engine = _preferred_hf_engine(dir_name, hf_config, config)
+            if preferred_engine is None:
+                continue
+
+            model_value = path
+            model_dir = ""
+            tokenizer = ""
+            if preferred_engine == ENGINE_TRTLLM:
+                # Keep the local checkpoint path for startup, but expose the repo
+                # id so clients can select the model naturally.
+                model_value = dir_name
+                model_dir = path
+                tokenizer = path
 
             backend = BackendConfig(
                 engine=preferred_engine,
                 port=port_counter[0],
-                model=path,
+                model=model_value,
+                model_dir=model_dir,
+                tokenizer=tokenizer,
                 log=str(config.data_dir / "logs" / f"backend-{slug}.log"),
                 ctx_size=min(_estimate_ctx(size_gb), hf_config.get("max_position_embeddings", 131072)),
                 dtype="auto",
