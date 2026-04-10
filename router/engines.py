@@ -32,11 +32,11 @@ _engine_available_cache: dict[str, bool] = {}
 
 def _can_import(module: str) -> bool:
     try:
-        subprocess.run(
+        result = subprocess.run(
             ["python3", "-c", f"import {module}"],
             capture_output=True, timeout=10,
         )
-        return True
+        return result.returncode == 0
     except Exception:
         return False
 
