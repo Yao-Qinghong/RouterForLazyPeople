@@ -23,7 +23,7 @@ Your App (OpenAI / Anthropic SDK / OpenClaw / Open WebUI)
 
 - **Lazy loading** — models start on first request, stop automatically after idle
 - **Smart routing** — keyword + token-count classifier picks fast / mid / deep tier
-- **Multi-engine** — llama.cpp, vLLM, SGLang, TensorRT-LLM, HuggingFace TGI
+- **Multi-engine** — llama.cpp, vLLM, SGLang, TensorRT-LLM, managed Docker TensorRT-LLM fallback, HuggingFace TGI
 - **Auto-discovery** — scans your model directories and registers GGUF / HF / TRT-LLM models automatically
 - **OpenAI-compatible** — drop-in for any OpenAI SDK client, Open WebUI, OpenClaw, Cursor, Continue, Jan
 - **Anthropic-compatible** — drop-in for Anthropic SDK, Claude Code, `@anthropic-ai/sdk`
@@ -128,11 +128,11 @@ backends:
     idle_timeout: 600
 ```
 
-Commented examples for vLLM, SGLang, HuggingFace TGI, and TensorRT-LLM are included in the file.
+Commented examples for vLLM, SGLang, HuggingFace TGI, local TensorRT-LLM, and managed Docker TensorRT-LLM are included in the file.
 
 ### `config/settings.yaml` — router behaviour
 
-Ports, log rotation, model scan directories, routing keywords, tier thresholds, proxy concurrency — all editable without touching Python code.
+Ports, log rotation, model scan directories, routing keywords, tier thresholds, proxy concurrency, and managed Docker TRT-LLM defaults are all editable without touching Python code.
 
 It also contains optional auth, CORS, audit logging, model aliases, and preload settings.
 The `rate_limit` section is reserved for future use and is not enforced by the router yet.
@@ -357,9 +357,11 @@ If you need throttling today, put the router behind a reverse proxy or API gatew
 | **vLLM** | HuggingFace | High throughput, needs CUDA 12.1+ |
 | **SGLang** | HuggingFace | Fast structured generation, needs CUDA 12.1+ |
 | **TensorRT-LLM** | TRT engines | Maximum speed on NVIDIA hardware, needs CUDA 12.2+ |
+| **TensorRT-LLM (Docker fallback)** | HuggingFace / NVFP4 | Router-managed Docker fallback for NVIDIA NVFP4 checkpoints when local `tensorrt_llm` is not installed |
 | **HuggingFace TGI** | HuggingFace | Broad model support |
 
 TensorRT-LLM backends include an **auto-tuner** that searches for the largest context window that fits in GPU memory — no manual config needed.
+For HF NVFP4 checkpoints, the router now prefers local `trt-llm` first, then a managed Docker TRT-LLM fallback, before falling back to generic HF engines.
 
 ---
 

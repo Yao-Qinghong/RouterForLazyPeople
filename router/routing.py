@@ -16,7 +16,7 @@ round-robining randomly:
   - Round-robins only among backends with identical measured speed
 
 Engine capability ranking (higher = preferred when speed unknown):
-  trt-llm > vllm > sglang > llama.cpp > huggingface > openai > ollama
+  trt-llm > trt-llm-docker > vllm > sglang > llama.cpp > huggingface > openai > ollama
 """
 
 import itertools
@@ -31,12 +31,13 @@ if TYPE_CHECKING:
 # ─────────────────────────────────────────────────────────────
 ENGINE_PRIORITY: dict[str, int] = {
     "trt-llm":     1,   # fastest raw throughput, NVIDIA-optimised
-    "vllm":        2,   # best for concurrent users (paged attention)
-    "sglang":      3,   # strong concurrency, long-context optimised
-    "llama.cpp":   4,   # flexible CPU+GPU, GGUF, great single-user
-    "huggingface": 5,   # reference impl, slower
-    "openai":      6,   # external server (LM Studio etc.) — speed unknown
-    "ollama":      7,   # external server — speed unknown
+    "trt-llm-docker": 2,  # same runtime, but Docker-mediated start/stop
+    "vllm":        3,   # best for concurrent users (paged attention)
+    "sglang":      4,   # strong concurrency, long-context optimised
+    "llama.cpp":   5,   # flexible CPU+GPU, GGUF, great single-user
+    "huggingface": 6,   # reference impl, slower
+    "openai":      7,   # external server (LM Studio etc.) — speed unknown
+    "ollama":      8,   # external server — speed unknown
 }
 
 # Benchmark results injected at startup from ~/.llm-router/benchmarks/

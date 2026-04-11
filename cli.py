@@ -828,7 +828,7 @@ def _read_tail(path: str, max_lines: int = 80) -> str:
     return "\n".join(lines[-max_lines:])
 
 
-def _diagnose_backend_failure(text: str) -> list[str]:
+def _diagnose_backend_failure(text: str, engine: str = "") -> list[str]:
     """Classify common backend startup failures from the router error plus backend log tail."""
     lower = text.lower()
     hints = []
@@ -844,15 +844,22 @@ def _diagnose_backend_failure(text: str) -> list[str]:
         hints.append("Engine/model compatibility failure. Try a llama.cpp GGUF backend first, or install a vLLM version that supports this model/quantization.")
     if "no such file" in lower or "does not exist" in lower or "not found" in lower:
         hints.append("Path/config problem. Confirm the model path exists or remove stale scan_dirs entries.")
+    if engine == "trt-llm-docker":
+        hints.append("Managed Docker TRT-LLM needs a working Docker daemon plus access to the configured TensorRT-LLM image. Test with 'docker ps' and check Docker permissions/image pull errors in the backend log.")
     if "failed to start" in lower and not hints:
         hints.append("Backend did not become healthy. Inspect the backend log shown below for the exact engine error.")
     return hints[:4]
 
 
-def _print_backend_failure_help(key: str, error_text: str, log_path: str | None = None):
+def _print_backend_failure_help(
+    key: str,
+    error_text: str,
+    log_path: str | None = None,
+    engine: str = "",
+):
     log_path = log_path or _extract_log_path(error_text)
     log_tail = _read_tail(log_path) if log_path else ""
-    hints = _diagnose_backend_failure(error_text + "\n" + log_tail)
+    hints = _diagnose_backend_failure(error_text + "\n" + log_tail, engine=engine)
 
     if hints:
         print("      diagnosis:")
@@ -1013,7 +1020,12 @@ def cmd_bench(args):
             except Exception as e:
                 error_text = _router_exception_text(e)
                 print(f"failed: {error_text}")
-                _print_backend_failure_help(key, error_text, cfg.get("log"))
+                _print_backend_failure_help(
+                    key,
+                    error_text,
+                    cfg.get("log"),
+                    engine=engine,
+                )
                 results.append({"backend_key": key, "thinking_mode": thinking_mode, "error": error_text})
             finally:
                 if started_by_bench and attempted_start and not getattr(args, "keep_running", False):

@@ -129,6 +129,24 @@ class RateLimitConfig:
 
 
 @dataclass
+class TRTLLMDockerSettings:
+    enabled: bool = True
+    image: str = "nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc7"
+    container_port: int = 8000
+    hf_cache_dir: Path = Path("~/.cache/huggingface")
+    log_dir: Path = Path("~/.llm-router/trtllm-logs")
+    env: dict = field(default_factory=lambda: {
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    })
+    serve_defaults: dict = field(default_factory=lambda: {
+        "max_seq_len": 65536,
+        "max_num_tokens": 16384,
+        "max_batch_size": 4,
+        "kv_cache_free_gpu_memory_fraction": 0.75,
+    })
+
+
+@dataclass
 class BackendCapabilities:
     supports_tools: bool = False
     supports_json_schema: bool = False
@@ -166,6 +184,7 @@ class BackendConfig:
     wrapper_script: str = ""
     model_type: str = ""
     trt_config: dict = field(default_factory=dict)
+    docker_config: dict = field(default_factory=dict)
     extra_args: list = field(default_factory=list)
     capabilities: BackendCapabilities = field(default_factory=BackendCapabilities)
 
@@ -205,7 +224,7 @@ def _estimate_vram(engine: str, size_gb: float | None) -> float | None:
         return None
     if engine == "llama.cpp":
         return round(size_gb * 1.15, 2)
-    elif engine in ("vllm", "sglang", "huggingface", "trt-llm"):
+    elif engine in ("vllm", "sglang", "huggingface", "trt-llm", "trt-llm-docker"):
         return round(size_gb * 1.3, 2)
     return None
 
@@ -225,6 +244,7 @@ class AppConfig:
     cors: CORSConfig
     audit: AuditConfig
     rate_limit: RateLimitConfig
+    trtllm_docker: TRTLLMDockerSettings
     llama_bin: Path
     data_dir: Path
     settings_file: Path
@@ -406,6 +426,23 @@ def load_config(
         per_key_overrides=rl.get("per_key_overrides", {}),
     )
 
+    # ── TensorRT-LLM Docker fallback ─────────────────────────
+    td = raw.get("trtllm_docker", {})
+    trtllm_docker = TRTLLMDockerSettings(
+        enabled=bool(td.get("enabled", True)),
+        image=str(td.get("image", TRTLLMDockerSettings.image)),
+        container_port=int(td.get("container_port", 8000)),
+        hf_cache_dir=_expand(td.get("hf_cache_dir", "~/.cache/huggingface")),
+        log_dir=_expand(td.get("log_dir", "~/.llm-router/trtllm-logs")),
+        env=dict(td.get("env", {"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})),
+        serve_defaults=dict(td.get("serve_defaults", {
+            "max_seq_len": 65536,
+            "max_num_tokens": 16384,
+            "max_batch_size": 4,
+            "kv_cache_free_gpu_memory_fraction": 0.75,
+        })),
+    )
+
     # ── Model aliases ─────────────────────────────────────────
     model_aliases = raw.get("model_aliases", {})
 
@@ -428,6 +465,7 @@ def load_config(
         cors=cors,
         audit=audit,
         rate_limit=rate_limit,
+        trtllm_docker=trtllm_docker,
         llama_bin=llama_bin,
         data_dir=data_dir,
         settings_file=sf,
@@ -471,6 +509,11 @@ def load_backends(config: AppConfig) -> dict[str, BackendConfig]:
         for path_key in ("model", "model_dir", "tokenizer", "wrapper_script"):
             if path_key in cfg and cfg[path_key]:
                 cfg[path_key] = os.path.expanduser(str(cfg[path_key]))
+        docker_cfg = cfg.get("docker_config")
+        if isinstance(docker_cfg, dict):
+            for path_key in ("hf_cache_dir", "log_dir", "launcher_script"):
+                if path_key in docker_cfg and docker_cfg[path_key]:
+                    docker_cfg[path_key] = os.path.expanduser(str(docker_cfg[path_key]))
 
         # Provide defaults that the rest of the code expects
         cfg.setdefault("port", 8080)

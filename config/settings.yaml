@@ -58,6 +58,24 @@ discovery:
     - 8002    # TRT-LLM / generic
     - 30000   # SGLang alternative
 
+# ── Managed Docker TRT-LLM fallback ─────────────────────────
+# Used for NVFP4 HuggingFace checkpoints when local tensorrt_llm
+# is not installed but Docker is available. The router manages the
+# container lifecycle like any other lazy-start backend.
+trtllm_docker:
+  enabled: true
+  image: "nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc7"
+  container_port: 8000
+  hf_cache_dir: "~/.cache/huggingface"
+  log_dir: "~/.llm-router/trtllm-logs"
+  env:
+    PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  serve_defaults:
+    max_seq_len: 65536
+    max_num_tokens: 16384
+    max_batch_size: 4
+    kv_cache_free_gpu_memory_fraction: 0.75
+
 # ── Tier thresholds (model file size in GB) ──────────────────
 # fast  = small models, quick responses, simple questions
 # mid   = balanced quality and speed

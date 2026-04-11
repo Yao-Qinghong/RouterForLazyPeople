@@ -9,6 +9,7 @@ restarting, and preloading of backend inference server processes.
 
 import asyncio
 import logging
+import os
 import subprocess
 import time
 from typing import TYPE_CHECKING
@@ -16,10 +17,11 @@ from typing import TYPE_CHECKING
 import httpx
 
 from router.engines import (
-    ENGINE_LLAMA, ENGINE_TRTLLM, ENGINE_OLLAMA, ENGINE_OPENAI,
+    ENGINE_LLAMA, ENGINE_TRTLLM, ENGINE_TRTLLM_DOCKER, ENGINE_OLLAMA, ENGINE_OPENAI,
     is_engine_available, health_url,
     build_llama_cmd, build_vllm_cmd, build_sglang_cmd,
-    build_hf_cmd, build_trtllm_cmd, build_ollama_cmd,
+    build_hf_cmd, build_trtllm_cmd, build_trtllm_docker_cmd, build_ollama_cmd,
+    resolve_trtllm_docker_config,
 )
 from router.trt_tuner import TRTLLMTuner
 
@@ -84,7 +86,6 @@ class BackendManager:
         cfg = self.backends[key]
         log_path = cfg["log"]
         # Ensure log directory exists
-        import os
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
         handle = open(log_path, "a")
         self.log_handles[key] = handle
@@ -106,12 +107,49 @@ class BackendManager:
             return build_sglang_cmd(cfg)
         elif engine == ENGINE_TRTLLM:
             return build_trtllm_cmd(cfg, trt_config or {})
+        elif engine == ENGINE_TRTLLM_DOCKER:
+            return build_trtllm_docker_cmd(key, cfg, self.config)
         elif engine == "huggingface":
             return build_hf_cmd(cfg)
         elif engine == ENGINE_OLLAMA:
             return build_ollama_cmd(cfg)
         else:
             raise ValueError(f"Unknown engine '{engine}' for backend '{key}'")
+
+    def _docker_config(self, key: str) -> dict:
+        return resolve_trtllm_docker_config(key, self.backends[key], self.config)
+
+    def _remove_docker_container(self, container_name: str):
+        subprocess.run(
+            ["docker", "rm", "-f", container_name],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+    def _append_docker_logs(self, key: str, container_name: str, lines: int = 200):
+        log_handle = self.log_handles.get(key) or self._open_log(key)
+        try:
+            result = subprocess.run(
+                ["docker", "logs", "--tail", str(lines), container_name],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+            payload = (result.stdout or "") + (result.stderr or "")
+            if payload.strip():
+                log_handle.write(
+                    "\n\n=== docker logs tail "
+                    f"({container_name}, last {lines} lines) ===\n"
+                )
+                log_handle.write(payload)
+                if not payload.endswith("\n"):
+                    log_handle.write("\n")
+                log_handle.flush()
+        except Exception as exc:
+            log_handle.write(f"\n\n[docker logs unavailable for {container_name}: {exc}]\n")
+            log_handle.flush()
 
     async def _start_process(self, key: str, trt_config: dict | None = None) -> bool:
         """Spawn the backend subprocess and wait for it to become healthy."""
@@ -125,6 +163,12 @@ class BackendManager:
         # Ollama backends connect to an existing Ollama server
         if engine == ENGINE_OLLAMA:
             return await self._start_ollama_backend(key)
+
+        if engine == ENGINE_TRTLLM_DOCKER:
+            if not is_engine_available(engine, self.config):
+                logger.error(f"[{key}] Engine '{engine}' is not installed")
+                return False
+            return await self._start_trtllm_docker_backend(key)
 
         if not is_engine_available(engine, self.config):
             logger.error(f"[{key}] Engine '{engine}' is not installed")
@@ -170,6 +214,49 @@ class BackendManager:
             return False
 
         logger.info(f"[{key}] Ready on port {cfg['port']} (PID {proc.pid})")
+        return True
+
+    async def _start_trtllm_docker_backend(self, key: str) -> bool:
+        """Start a managed Docker-backed TRT-LLM server and wait for /v1/models."""
+        cfg = self.backends[key]
+        docker_cfg = self._docker_config(key)
+        os.makedirs(docker_cfg["hf_cache_dir"], exist_ok=True)
+        os.makedirs(docker_cfg["log_dir"], exist_ok=True)
+
+        cmd = self._build_cmd(key)
+        log_file = self._open_log(key)
+        self._remove_docker_container(docker_cfg["container_name"])
+        logger.info(
+            f"[{key}] Starting ({cfg.get('engine')}) on port {cfg['port']} "
+            f"with container {docker_cfg['container_name']}..."
+        )
+        result = subprocess.run(cmd, stdout=log_file, stderr=log_file, check=False)
+        if result.returncode != 0:
+            logger.warning(
+                f"[{key}] Docker launcher exited with code {result.returncode}"
+            )
+            self._append_docker_logs(key, docker_cfg["container_name"])
+            return False
+
+        self.processes[key] = _DockerSentinel(docker_cfg["container_name"])
+        self.last_used[key] = time.time()
+
+        healthy = await self._wait_healthy(key)
+        if not healthy:
+            logger.warning(
+                f"[{key}] Failed health check for container "
+                f"{docker_cfg['container_name']} on port {cfg['port']}"
+            )
+            self._append_docker_logs(key, docker_cfg["container_name"])
+            self._remove_docker_container(docker_cfg["container_name"])
+            self.processes.pop(key, None)
+            self.last_used.pop(key, None)
+            return False
+
+        logger.info(
+            f"[{key}] Ready on port {cfg['port']} "
+            f"(container {docker_cfg['container_name']})"
+        )
         return True
 
     async def _start_external_backend(self, key: str) -> bool:
@@ -354,6 +441,8 @@ class BackendManager:
         if proc and isinstance(proc, _ExternalSentinel):
             # External servers are not ours to stop — just disconnect
             pass
+        elif proc and isinstance(proc, _DockerSentinel):
+            self._remove_docker_container(proc.container_name)
         elif proc and isinstance(proc, _OllamaSentinel):
             # Ollama backends: unload via API
             self._unload_ollama(key)
@@ -364,6 +453,8 @@ class BackendManager:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        elif self.backends.get(key, {}).get("engine") == ENGINE_TRTLLM_DOCKER:
+            self._remove_docker_container(self._docker_config(key)["container_name"])
         self.processes.pop(key, None)
         self.last_used.pop(key, None)
         self.active_configs.pop(key, None)
@@ -474,7 +565,7 @@ class BackendManager:
                 "description":     cfg.get("description", key),
                 "auto_discovered": cfg.get("auto_discovered", False),
                 "tier":            cfg.get("tier"),
-                "pid":             self.processes[key].pid if running and not isinstance(self.processes.get(key), (_OllamaSentinel, _ExternalSentinel)) else None,
+                "pid":             self.processes[key].pid if running and not isinstance(self.processes.get(key), (_OllamaSentinel, _ExternalSentinel, _DockerSentinel)) else None,
                 "log":             cfg.get("log", ""),
             }
             if key in self.active_configs:
@@ -507,6 +598,35 @@ class _ExternalSentinel:
     def kill(self): pass
     def terminate(self): pass
     def wait(self, timeout=None): pass
+
+
+class _DockerSentinel:
+    """Sentinel for managed Docker containers started by the router."""
+    def __init__(self, container_name: str):
+        self.container_name = container_name
+        self.pid = None
+
+    def poll(self):
+        try:
+            result = subprocess.run(
+                ["docker", "inspect", "-f", "{{.State.Running}}", self.container_name],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            return None if result.returncode == 0 and result.stdout.strip() == "true" else 1
+        except Exception:
+            return 1
+
+    def kill(self):
+        pass
+
+    def terminate(self):
+        pass
+
+    def wait(self, timeout=None):
+        pass
 
 
 class _OllamaSentinel:

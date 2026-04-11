@@ -1,19 +1,34 @@
 """Tests for VRAM-aware lifecycle management in router/lifecycle.py."""
 
+import subprocess
 import time
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from router.config import BackendConfig
-from router.lifecycle import BackendManager
+from router.lifecycle import BackendManager, _DockerSentinel
 
 
 def _make_config():
     """Minimal AppConfig mock for BackendManager."""
     return SimpleNamespace(
-        data_dir=SimpleNamespace(__truediv__=lambda self, x: f"/tmp/{x}"),
+        data_dir=Path("/tmp"),
+        trtllm_docker=SimpleNamespace(
+            image="nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc7",
+            container_port=8000,
+            hf_cache_dir=Path("/tmp/hf-cache"),
+            log_dir=Path("/tmp/trtllm-logs"),
+            env={"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"},
+            serve_defaults={
+                "max_seq_len": 65536,
+                "max_num_tokens": 16384,
+                "max_batch_size": 4,
+                "kv_cache_free_gpu_memory_fraction": 0.75,
+            },
+        ),
     )
 
 
@@ -224,3 +239,117 @@ class TestEnsureRunningVram:
             with patch("router.sysinfo.query_free_vram", return_value=None):
                 # Should NOT raise despite huge vram_estimate — no GPU detected
                 await mgr.ensure_running("model")
+
+
+class TestManagedTRTLLMDocker:
+    @pytest.mark.asyncio
+    async def test_start_uses_native_docker_run_command(self, tmp_path):
+        backends = {
+            "hf-nvidia": BackendConfig(
+                engine="trt-llm-docker",
+                port=8111,
+                model="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+                log=str(tmp_path / "backend.log"),
+                docker_config={
+                    "hf_cache_dir": str(tmp_path / "hf-cache"),
+                    "log_dir": str(tmp_path / "docker-logs"),
+                },
+            ),
+        }
+        mgr = _make_manager(backends)
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("router.lifecycle.is_engine_available", return_value=True):
+            with patch("router.lifecycle.subprocess.run", side_effect=fake_run):
+                with patch.object(mgr, "_wait_healthy", AsyncMock(return_value=True)):
+                    ok = await mgr._start_process("hf-nvidia")
+
+        assert ok is True
+        assert any(cmd[:3] == ["docker", "run", "-d"] for cmd in calls)
+        docker_run = next(cmd for cmd in calls if cmd[:3] == ["docker", "run", "-d"])
+        assert "--name" in docker_run and docker_run[docker_run.index("--name") + 1] == "llm-router-hf-nvidia"
+        assert "-p" in docker_run and docker_run[docker_run.index("-p") + 1] == "8111:8000"
+
+    def test_stop_removes_docker_container(self):
+        backends = {
+            "hf-nvidia": BackendConfig(
+                engine="trt-llm-docker",
+                port=8111,
+                model="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+                log="/tmp/backend.log",
+            ),
+        }
+        mgr = _make_manager(backends)
+        mgr.processes["hf-nvidia"] = _DockerSentinel("llm-router-hf-nvidia")
+
+        with patch("router.lifecycle.subprocess.run") as run_mock:
+            mgr.stop("hf-nvidia")
+
+        run_mock.assert_any_call(
+            ["docker", "rm", "-f", "llm-router-hf-nvidia"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_launcher_script_bypasses_native_docker_run(self, tmp_path):
+        backends = {
+            "hf-nvidia": BackendConfig(
+                engine="trt-llm-docker",
+                port=8111,
+                model="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+                log=str(tmp_path / "backend.log"),
+                docker_config={"launcher_script": "/tmp/start-trt.sh"},
+            ),
+        }
+        mgr = _make_manager(backends)
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("router.lifecycle.is_engine_available", return_value=True):
+            with patch("router.lifecycle.subprocess.run", side_effect=fake_run):
+                with patch.object(mgr, "_wait_healthy", AsyncMock(return_value=True)):
+                    ok = await mgr._start_process("hf-nvidia")
+
+        assert ok is True
+        assert ["/tmp/start-trt.sh"] in calls
+        assert not any(cmd[:3] == ["docker", "run", "-d"] for cmd in calls)
+
+    @pytest.mark.asyncio
+    async def test_failed_health_check_appends_docker_logs(self, tmp_path):
+        log_path = tmp_path / "backend.log"
+        backends = {
+            "hf-nvidia": BackendConfig(
+                engine="trt-llm-docker",
+                port=8111,
+                model="nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+                log=str(log_path),
+                docker_config={
+                    "hf_cache_dir": str(tmp_path / "hf-cache"),
+                    "log_dir": str(tmp_path / "docker-logs"),
+                },
+            ),
+        }
+        mgr = _make_manager(backends)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:3] == ["docker", "logs", "--tail"]:
+                return MagicMock(returncode=0, stdout="container stacktrace\n", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("router.lifecycle.is_engine_available", return_value=True):
+            with patch("router.lifecycle.subprocess.run", side_effect=fake_run):
+                with patch.object(mgr, "_wait_healthy", AsyncMock(return_value=False)):
+                    ok = await mgr._start_process("hf-nvidia")
+
+        assert ok is False
+        assert "docker logs tail" in log_path.read_text()
+        assert "container stacktrace" in log_path.read_text()
