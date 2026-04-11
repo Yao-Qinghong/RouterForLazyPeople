@@ -324,10 +324,12 @@ def discover_gguf_models(config: "AppConfig", port_counter: list[int]) -> dict:
 
 def discover_hf_models(config: "AppConfig", port_counter: list[int]) -> dict:
     """Discover HuggingFace checkpoints and pick the best available engine."""
-    if not any(
-        is_engine_available(engine, config)
-        for engine in (ENGINE_TRTLLM, ENGINE_TRTLLM_DOCKER, ENGINE_VLLM, ENGINE_SGLANG, ENGINE_HF)
-    ):
+    hf_engines = (ENGINE_TRTLLM, ENGINE_TRTLLM_DOCKER, ENGINE_VLLM, ENGINE_SGLANG, ENGINE_HF)
+    if not any(is_engine_available(engine, config) for engine in hf_engines):
+        logger.warning(
+            "HF model discovery skipped — no suitable engine available. "
+            "Install one of: tensorrt_llm, docker (for trt-llm-docker), vllm, sglang, transformers"
+        )
         return {}
 
     discovered = {}
@@ -359,11 +361,13 @@ def discover_hf_models(config: "AppConfig", port_counter: list[int]) -> dict:
             if path in seen_paths:
                 continue
             if not _is_hf_checkpoint(path):
+                logger.debug("HF discovery: skipping %s (not a valid checkpoint)", path)
                 continue
             seen_paths.add(path)
 
             size_gb = _hf_model_size_gb(path)
             if size_gb < 0.3:
+                logger.debug("HF discovery: skipping %s (too small: %.2f GB)", path, size_gb)
                 continue
             if port_counter[0] > config.discovery.port_end:
                 break
@@ -385,6 +389,12 @@ def discover_hf_models(config: "AppConfig", port_counter: list[int]) -> dict:
             tier = _classify_tier(size_gb, config, dir_name)
             preferred_engine = _preferred_hf_engine(dir_name, hf_config, config, stable_model_id=repo_id)
             if preferred_engine is None:
+                logger.warning(
+                    "HF discovery: skipping %s — no available engine can serve it "
+                    "(available engines: %s)",
+                    dir_name,
+                    [e for e in hf_engines if is_engine_available(e, config)] or ["none"],
+                )
                 continue
 
             model_value = path

@@ -53,10 +53,10 @@ discovery:
   #         SGLang alt (30000). Add your own ports here as needed.
   probe_ports:
     - 8080    # llama.cpp default
-    - 8000    # vLLM / SGLang default
     - 8001    # vLLM / SGLang alternative
     - 8002    # TRT-LLM / generic
     - 30000   # SGLang alternative
+    # 8000 intentionally excluded — managed by nemotron-nano-nvfp4 backend (backends.yaml)
 
 # ── Managed Docker TRT-LLM fallback ─────────────────────────
 # Used for NVFP4 HuggingFace checkpoints when local tensorrt_llm
