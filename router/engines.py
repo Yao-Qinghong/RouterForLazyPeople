@@ -291,28 +291,17 @@ def build_trtllm_docker_cmd(key: str, cfg: dict, config: "AppConfig") -> list[st
     inner_cmd += f"{' '.join(shlex.quote(part) for part in serve_parts)} 2>&1 | tee {shlex.quote(log_file)}"
 
     cmd = [
-        "docker",
-        "run",
-        "-d",
-        "--name",
-        docker_cfg["container_name"],
-        "--ipc",
-        "host",
-        "--gpus",
-        "all",
-        "--ulimit",
-        "memlock=-1",
-        "--ulimit",
-        "stack=67108864",
-        "-p",
-        f"{cfg['port']}:{docker_cfg['container_port']}",
-        "-v",
-        f"{docker_cfg['hf_cache_dir']}:/root/.cache/huggingface",
-        "-v",
-        f"{docker_cfg['log_dir']}:/logs",
+        "docker", "run", "-d",
+        "--name",    docker_cfg["container_name"],
+        "--restart", "unless-stopped",
+        "--ipc",     "host",
+        "--gpus",    "all",
+        "--ulimit",  "memlock=-1",
+        "--ulimit",  "stack=67108864",
+        "-p", f"{cfg['port']}:{docker_cfg['container_port']}",
+        "-v", f"{docker_cfg['hf_cache_dir']}:/root/.cache/huggingface",
+        "-v", f"{docker_cfg['log_dir']}:/logs",
     ]
-    for name, value in docker_cfg["env"].items():
-        cmd += ["-e", f"{name}={value}"]
     cmd += [
         docker_cfg["image"],
         "bash",

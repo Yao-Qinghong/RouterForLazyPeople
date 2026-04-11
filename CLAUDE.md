@@ -71,12 +71,13 @@ proxy.py:
 3. Token count > `token_threshold_deep` → `deep`
 4. Deep keywords match → `deep`
 5. Token count > `token_threshold_mid` or mid keywords → `mid`
-6. Default → `fast`
+6. Structural signals raise tier to at least `mid`: JSON schema response format, system prompt > 2000 tokens, or > 10 messages
+7. Default → `fast`
 
 `_pick(backends, tier)` selects the best backend within a tier:
 
 1. Highest measured TG tok/s from `python cli.py bench` results (cached in `_bench`)
-2. Engine capability rank fallback: `trt-llm > vllm > sglang > llama.cpp > huggingface > openai > ollama`
+2. Engine capability rank fallback: `trt-llm > trt-llm-docker > vllm > sglang > llama.cpp > huggingface > openai > ollama`
 3. Round-robin only among backends with identical score (load balancing)
 
 Benchmark data is injected at startup via `set_benchmark_results(load_all_results(config))` and refreshed after `/rescan`. Without benchmarks, routing falls back to engine rank silently.
@@ -144,9 +145,7 @@ Both translators handle streaming (SSE) and non-streaming paths separately.
 `build_backend_registry(config)` merges in priority order (manual wins on key collision):
 1. Manually-defined backends from `config/backends.yaml`
 2. Auto-detected running servers (`detect_running_servers`)
-3. GGUF files in `config.scan_dirs.gguf`
-4. HuggingFace checkpoints in `config.scan_dirs.hf`
-5. TRT-LLM engines in `config.scan_dirs.trtllm`
+3. Discovered model files — merged as `{**gguf, **hf, **trt}`, so on slug collision **TRT-LLM > HF > GGUF** takes the winning config
 
 Applies overrides from `~/.llm-router/overrides.json` (exclude/patch individual backends).
 

@@ -125,21 +125,20 @@ backends:
   #     kv_cache_dtype: int8
   #     chunked_context: true
 
-  # ── Managed Docker TensorRT-LLM example ──────────────────────
-  # nemotron-trt-docker:
-  #   engine: trt-llm-docker
-  #   port: 8095
-  #   model: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
-  #   idle_timeout: 600
-  #   startup_wait: 180
-  #   tier: fast
-  #   description: "Nemotron Nano NVFP4 via managed Docker TRT-LLM"
-  #   docker_config:
-  #     image: "nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc7"
-  #     serve_args:
-  #       max_seq_len: 65536
-  #       max_num_tokens: 16384
-  #       max_batch_size: 4
-  #       kv_cache_free_gpu_memory_fraction: 0.75
-  #     # Optional escape hatch for custom launch flows:
-  #     # launcher_script: "~/start-nemotron-30B-nano-nvfp4.sh"
+  # ── Managed Docker TensorRT-LLM ──────────────────────────────
+  nemotron-nano-nvfp4:
+    engine: trt-llm-docker
+    port: 8090
+    model: "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
+    idle_timeout: 600
+    startup_wait: 300
+    tier: fast
+    description: "Nemotron Nano 30B NVFP4 via TRT-LLM Docker (DGX Spark)"
+    docker_config:
+      container_name: "llm-router-nemotron-nvfp4"
+      image: "nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc7"
+      serve_args:
+        max_seq_len: 65536
+        max_num_tokens: 16384
+        max_batch_size: 4
+        kv_cache_free_gpu_memory_fraction: 0.75
