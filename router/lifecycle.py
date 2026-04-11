@@ -10,6 +10,8 @@ restarting, and preloading of backend inference server processes.
 import asyncio
 import logging
 import os
+import signal
+import socket
 import subprocess
 import time
 from typing import TYPE_CHECKING
@@ -174,20 +176,8 @@ class BackendManager:
             logger.error(f"[{key}] Engine '{engine}' is not installed")
             return False
 
-        # Warn if the port is already in use by another process
-        try:
-            from router.sysinfo import detect_existing_llm_processes
-            conflicts = [p for p in detect_existing_llm_processes(ports=[cfg["port"]])
-                         if p["port"] == cfg["port"]]
-            if conflicts:
-                c = conflicts[0]
-                logger.warning(
-                    f"[{key}] Port {cfg['port']} already in use by PID {c['pid']} "
-                    f"({c['cmdline'][:60]}). "
-                    f"Stop that process first or change the port in backends.yaml."
-                )
-        except Exception:
-            pass
+        # Clear any process squatting on our port (zombie from previous start, or unrelated)
+        self._kill_port(cfg["port"], key)
 
         try:
             cmd = self._build_cmd(key, trt_config)
@@ -222,6 +212,9 @@ class BackendManager:
         docker_cfg = self._docker_config(key)
         os.makedirs(docker_cfg["hf_cache_dir"], exist_ok=True)
         os.makedirs(docker_cfg["log_dir"], exist_ok=True)
+
+        # Clear any process on the target port (stale container or zombie)
+        self._kill_port(cfg["port"], key)
 
         cmd = self._build_cmd(key)
         log_file = self._open_log(key)
@@ -351,6 +344,62 @@ class BackendManager:
             f"Backend '{key}' failed all {len(search_space)} tuning attempts. "
             f"Check {cfg['log']}"
         )
+
+    def _kill_port(self, port: int, key: str) -> bool:
+        """
+        Kill any process currently listening on *port* so we can bind it.
+        This clears both port conflicts from unrelated programs and zombie
+        processes left over from a previous failed backend start.
+        Returns True if something was killed (caller should sleep briefly).
+        """
+        # Quick check: is the port actually occupied?
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            if s.connect_ex(("127.0.0.1", port)) != 0:
+                return False  # Port is free — nothing to do
+
+        logger.info(f"[{key}] Port {port} already in use — finding and killing occupying process")
+        killed_any = False
+
+        # Try lsof first (macOS + most Linux distributions)
+        try:
+            r = subprocess.run(
+                ["lsof", "-t", "-i", f"TCP:{port}", "-s", "TCP:LISTEN"],
+                capture_output=True, text=True, timeout=5, check=False,
+            )
+            for pid_str in r.stdout.split():
+                if pid_str.isdigit():
+                    pid = int(pid_str)
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                        logger.info(f"[{key}] Killed PID {pid} (was on port {port})")
+                        killed_any = True
+                    except ProcessLookupError:
+                        pass
+                    except PermissionError:
+                        logger.warning(
+                            f"[{key}] Permission denied killing PID {pid} on port {port} — "
+                            f"stop that process manually and retry"
+                        )
+        except FileNotFoundError:
+            # lsof not available — fall back to fuser (Linux)
+            try:
+                result = subprocess.run(
+                    ["fuser", "-k", f"{port}/tcp"],
+                    capture_output=True, timeout=5, check=False,
+                )
+                killed_any = result.returncode == 0
+                if killed_any:
+                    logger.info(f"[{key}] fuser killed process on port {port}")
+            except FileNotFoundError:
+                logger.warning(
+                    f"[{key}] Cannot free port {port}: neither lsof nor fuser is available. "
+                    f"Kill the occupying process manually."
+                )
+
+        if killed_any:
+            time.sleep(1.0)  # Give the OS time to release the port
+        return killed_any
 
     def _evict_for_vram(self, needed_gb: float, exclude_key: str = "") -> bool:
         """
