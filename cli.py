@@ -998,7 +998,10 @@ def cmd_bench(args):
                 if started_by_bench:
                     print("      start...", end=" ", flush=True)
                     attempted_start = True
-                    _post_router(f"/start/{key}", timeout=120).read()
+                    # Use the backend's startup_wait as the HTTP timeout (floor 120s).
+                    # trt-llm-docker backends need up to 600s+ for CUDA graph warmup.
+                    start_timeout = max(int(cfg.get("startup_wait", 120)), 120) + 30
+                    _post_router(f"/start/{key}", timeout=start_timeout).read()
                     start_ok = True
                     print("up", end="  ", flush=True)
                 else:
