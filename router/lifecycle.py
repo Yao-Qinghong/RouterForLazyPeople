@@ -379,6 +379,14 @@ class BackendManager:
         for _, k in running:
             if free_gb >= needed_gb:
                 return True
+            proc = self.processes.get(k)
+            if isinstance(proc, _ExternalSentinel):
+                logger.warning(
+                    f"[{k}] Cannot evict — external server on port "
+                    f"{self.backends[k].get('port')} is not managed by the router. "
+                    f"Stop it manually to free VRAM."
+                )
+                continue
             evict_gb = self.backends[k].get("vram_estimate_gb")
             logger.info(f"[{k}] Evicting to free ~{evict_gb or '?'} GB VRAM")
             self.stop(k)
