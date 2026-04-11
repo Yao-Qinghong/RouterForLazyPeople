@@ -160,9 +160,10 @@ def _estimate_ctx(size_gb: float) -> int:
 
 def _estimate_startup(size_gb: float) -> int:
     if size_gb < 15:  return 30
-    if size_gb < 40:  return 45
-    if size_gb < 80:  return 90
-    return 120
+    if size_gb < 40:  return 60
+    if size_gb < 60:  return 120
+    if size_gb < 80:  return 180
+    return 240
 
 
 def _estimate_idle(tier: str, config: "AppConfig") -> int:

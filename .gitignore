@@ -19,6 +19,9 @@ metrics/
 # macOS
 .DS_Store
 
+# Claude Code worktrees (machine-specific absolute paths)
+.claude/worktrees/
+
 # Editor
 .idea/
 .vscode/
