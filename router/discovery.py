@@ -175,9 +175,10 @@ def _docker_startup_wait(size_gb: float) -> int:
     warmup which can take 60-120s on the first run for NVFP4 models.
     """
     base = _estimate_startup(size_gb)
-    # Double the size-based estimate and floor at 240s (4 min).
-    # For the 75GB Super model this gives ~480s (8 min) which is realistic.
-    return max(base * 2, 240)
+    # Double the size-based estimate and floor at 600s (10 min).
+    # First run includes GEMM autotuner warmup which can take 5-10 min on Blackwell.
+    # After the first run the kernel cache is persisted and startup is much faster.
+    return max(base * 2, 600)
 
 
 def _estimate_idle(tier: str, config: "AppConfig") -> int:

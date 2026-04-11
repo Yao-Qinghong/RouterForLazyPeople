@@ -289,6 +289,11 @@ def build_trtllm_docker_cmd(key: str, cfg: dict, config: "AppConfig") -> list[st
         inner_cmd += f"export {exports}\n"
     inner_cmd += f"{' '.join(shlex.quote(part) for part in serve_parts)} 2>&1 | tee {shlex.quote(log_file)}"
 
+    # TRT-LLM stores GEMM/autotuner kernel cache here on first run.
+    # Mounting it prevents the expensive autotuner warmup on every container restart.
+    trtllm_cache = os.path.expanduser("~/.cache/tensorrt_llm")
+    os.makedirs(trtllm_cache, exist_ok=True)
+
     cmd = [
         "docker", "run", "-d",
         "--name",    docker_cfg["container_name"],
@@ -299,6 +304,7 @@ def build_trtllm_docker_cmd(key: str, cfg: dict, config: "AppConfig") -> list[st
         "--ulimit",  "stack=67108864",
         "-p", f"{cfg['port']}:{docker_cfg['container_port']}",
         "-v", f"{docker_cfg['hf_cache_dir']}:/root/.cache/huggingface",
+        "-v", f"{trtllm_cache}:/root/.cache/tensorrt_llm",
         "-v", f"{docker_cfg['log_dir']}:/logs",
     ]
     cmd += [
