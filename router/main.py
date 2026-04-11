@@ -160,6 +160,25 @@ def _log_routing_guidance(backends: dict, log) -> None:
         )
 
 
+def _apply_measured_tiers(backends: dict, bench_results: dict) -> None:
+    """Promote backend tiers to match measured TG speed from benchmarks.
+
+    When a backend's measured tier (from bench) differs from its configured
+    tier, trust the benchmark — a model that does 49 tok/s belongs in fast
+    regardless of its file size.
+    """
+    for key, result in bench_results.items():
+        measured = result.get("tier_measured")
+        if measured and key in backends:
+            old = backends[key].get("tier")
+            if old != measured:
+                logger.info(
+                    f"[{key}] Tier updated {old} → {measured} "
+                    f"(measured {result.get('tg_tok_s', '?')} tok/s)"
+                )
+                backends[key]["tier"] = measured
+
+
 def create_app(settings_path: Path | None = None) -> FastAPI:
     """
     FastAPI app factory. Called by uvicorn --factory flag.
@@ -252,10 +271,12 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
 
         # Inject cached benchmark results into the router so best-engine
         # selection uses measured TG speed from previous bench runs.
+        # Also promote backend tiers to match measured speed.
         from router.benchmark import load_all_results
         from router.routing import set_benchmark_results
         _bench_results = load_all_results(config)
         set_benchmark_results(_bench_results)
+        _apply_measured_tiers(backends, _bench_results)
         if _bench_results:
             logger.info(f"  Benchmarks loaded: {len(_bench_results)} backend(s) have measured TG speed")
             for bkey, br in _bench_results.items():
@@ -521,7 +542,9 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
         # Refresh benchmark data so new/renamed backends get correct routing weights
         from router.benchmark import load_all_results
         from router.routing import set_benchmark_results
-        set_benchmark_results(load_all_results(cfg))
+        _bench_results = load_all_results(cfg)
+        set_benchmark_results(_bench_results)
+        _apply_measured_tiers(manager.backends, _bench_results)
         discovered = sum(1 for v in new_backends.values() if v.get("auto_discovered"))
         return {
             "total":     len(new_backends),
