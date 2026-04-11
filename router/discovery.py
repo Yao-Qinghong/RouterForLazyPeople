@@ -353,10 +353,14 @@ def discover_hf_models(config: "AppConfig", port_counter: list[int]) -> dict:
                     pass
 
         # HF cache: ~/.cache/huggingface/hub/models--org--name/snapshots/hash/
+        # Only take the newest snapshot per repo to avoid duplicate backends when
+        # a model has been downloaded multiple times (e.g. two revisions cached).
         if "huggingface" in scan_dir:
-            for entry in Path(scan_dir).glob("models--*/snapshots/*"):
-                if entry.is_dir():
-                    candidates.append(str(entry))
+            for snapshots_dir in Path(scan_dir).glob("models--*/snapshots"):
+                snapshot_dirs = [e for e in snapshots_dir.iterdir() if e.is_dir()]
+                if snapshot_dirs:
+                    newest = max(snapshot_dirs, key=lambda e: e.stat().st_mtime)
+                    candidates.append(str(newest))
 
         for path in candidates:
             if path in seen_paths:
