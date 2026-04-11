@@ -170,13 +170,18 @@ def _apply_measured_tiers(backends: dict, bench_results: dict) -> None:
     for key, result in bench_results.items():
         measured = result.get("tier_measured")
         if measured and key in backends:
-            old = backends[key].get("tier")
+            backend = backends[key]
+            old = backend.get("tier") if hasattr(backend, "get") else backend.get("tier", "")
             if old != measured:
                 logger.info(
                     f"[{key}] Tier updated {old} → {measured} "
                     f"(measured {result.get('tg_tok_s', '?')} tok/s)"
                 )
-                backends[key]["tier"] = measured
+                # BackendConfig is a dataclass — use setattr, not item assignment
+                if hasattr(backend, "__dataclass_fields__"):
+                    setattr(backend, "tier", measured)
+                else:
+                    backend["tier"] = measured
 
 
 def create_app(settings_path: Path | None = None) -> FastAPI:
