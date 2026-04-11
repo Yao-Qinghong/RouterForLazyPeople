@@ -166,6 +166,20 @@ def _estimate_startup(size_gb: float) -> int:
     return 240
 
 
+def _docker_startup_wait(size_gb: float) -> int:
+    """
+    Startup timeout for trt-llm-docker backends.
+
+    Much larger than native because it includes: Docker container start,
+    Python/TRT-LLM import (~15s), weight loading, and autotuner JIT
+    warmup which can take 60-120s on the first run for NVFP4 models.
+    """
+    base = _estimate_startup(size_gb)
+    # Double the size-based estimate and floor at 240s (4 min).
+    # For the 75GB Super model this gives ~480s (8 min) which is realistic.
+    return max(base * 2, 240)
+
+
 def _estimate_idle(tier: str, config: "AppConfig") -> int:
     return {
         "fast": config.idle_timeouts.fast,
@@ -437,7 +451,7 @@ def discover_hf_models(config: "AppConfig", port_counter: list[int]) -> dict:
                 gpu_memory_fraction=0.90,
                 trust_remote_code=True,
                 idle_timeout=_estimate_idle(tier, config),
-                startup_wait=_estimate_startup(size_gb) + 30,
+                startup_wait=_docker_startup_wait(size_gb) if preferred_engine == ENGINE_TRTLLM_DOCKER else _estimate_startup(size_gb) + 30,
                 description=f"{dir_name} ({size_gb:.1f} GB, {arch}) [{preferred_engine}, auto]",
                 auto_discovered=True,
                 tier=tier,
