@@ -269,7 +269,7 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
             logger.info(
                 "  No benchmark data found. Run: python cli.py bench\n"
                 "  Without benchmarks, routing picks best engine by capability rank "
-                "(trt-llm > vllm > sglang > llama.cpp > openai > ollama)"
+                "(trt-llm > trt-llm-docker > vllm > sglang > llama.cpp > openai > ollama)"
             )
 
         # Store shared objects on app.state for route handlers

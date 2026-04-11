@@ -5,6 +5,7 @@ import json
 import subprocess
 import sys
 import urllib.error
+from types import SimpleNamespace
 
 import cli
 
@@ -208,6 +209,17 @@ class TestUpdateAndSysinfo:
         assert "compatibility failure" in out
         assert "vLLM version" in out
 
+    def test_backend_failure_help_adds_docker_hint_for_managed_trt(self, capsys):
+        cli._print_backend_failure_help(
+            "hf-test",
+            "Backend 'hf-test' failed to start",
+            None,
+            engine="trt-llm-docker",
+        )
+
+        out = capsys.readouterr().out
+        assert "Managed Docker TRT-LLM" in out
+
     def test_bench_thinking_mode_defaults_to_no_think(self):
         assert cli._bench_thinking_mode(argparse.Namespace()) == "no_think"
         assert cli._bench_thinking_mode(argparse.Namespace(thinking=True)) == "think"
@@ -355,3 +367,73 @@ class TestUpdateAndSysinfo:
         assert ["git", "pull", "--ff-only", "--quiet"] in run_calls
         assert ["git", "checkout", "--quiet", "oldsha"] in run_calls
         assert llama_bin.read_text() == "old-binary"
+
+    def test_bench_treats_trtllm_docker_as_managed_backend(self, monkeypatch, capsys):
+        backends = {
+            "docker-trt": {
+                "engine": "trt-llm-docker",
+                "tier": "fast",
+                "port": 8111,
+                "model": "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+                "log": "/tmp/backend.log",
+            }
+        }
+        status = {"docker-trt": {"running": True, "log": "/tmp/backend.log"}}
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(self._payload).encode()
+
+        class FakePostResponse:
+            def read(self):
+                return b"{}"
+
+        async def fake_measure_backend(key, cfg, config, thinking_mode="no_think"):
+            return {
+                "backend_key": key,
+                "thinking_mode": thinking_mode,
+                "engine": cfg["engine"],
+                "tier_assigned": cfg["tier"],
+                "tg_tok_s": 42.0,
+                "pp_tok_s": 300.0,
+                "ttft_ms": 500.0,
+                "validated": True,
+            }
+
+        monkeypatch.setattr(
+            "urllib.request.urlopen",
+            lambda url, timeout=5: FakeResponse(backends),
+        )
+        monkeypatch.setattr(cli, "_fetch_router_status", lambda: status)
+        monkeypatch.setattr("router.benchmark.measure_backend", fake_measure_backend)
+        monkeypatch.setattr("router.benchmark.save_result", lambda result, config: None)
+        monkeypatch.setattr("router.benchmark.format_results", lambda results: "formatted")
+        monkeypatch.setattr("router.config.load_config", lambda: SimpleNamespace())
+        monkeypatch.setattr(cli, "_post_router", lambda path, timeout=30: FakePostResponse())
+
+        cli.cmd_bench(
+            argparse.Namespace(
+                results=False,
+                all=False,
+                backend="docker-trt",
+                start_stopped=False,
+                keep_running=False,
+                thinking=False,
+                default_thinking=False,
+                list=False,
+            )
+        )
+
+        out = capsys.readouterr().out
+        assert "Skipping external servers" not in out
+        assert "[1/1] docker-trt" in out
+        assert "formatted" in out

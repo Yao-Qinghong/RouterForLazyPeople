@@ -6,6 +6,8 @@ Supports: llama.cpp, vLLM, SGLang, TensorRT-LLM, HuggingFace TGI, Ollama,
 """
 
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -17,13 +19,23 @@ if TYPE_CHECKING:
 # Engine identifiers — use these constants everywhere
 ENGINE_LLAMA  = "llama.cpp"
 ENGINE_TRTLLM = "trt-llm"
+ENGINE_TRTLLM_DOCKER = "trt-llm-docker"
 ENGINE_VLLM   = "vllm"
 ENGINE_SGLANG = "sglang"
 ENGINE_HF     = "huggingface"
 ENGINE_OLLAMA = "ollama"
 ENGINE_OPENAI = "openai"   # passthrough to any running OpenAI-compatible server
 
-ALL_ENGINES = [ENGINE_LLAMA, ENGINE_TRTLLM, ENGINE_VLLM, ENGINE_SGLANG, ENGINE_HF, ENGINE_OLLAMA, ENGINE_OPENAI]
+ALL_ENGINES = [
+    ENGINE_LLAMA,
+    ENGINE_TRTLLM,
+    ENGINE_TRTLLM_DOCKER,
+    ENGINE_VLLM,
+    ENGINE_SGLANG,
+    ENGINE_HF,
+    ENGINE_OLLAMA,
+    ENGINE_OPENAI,
+]
 
 # ─────────────────────────────────────────────────────────────
 # Availability detection
@@ -34,8 +46,23 @@ _engine_available_cache: dict[str, bool] = {}
 def _can_import(module: str) -> bool:
     try:
         result = subprocess.run(
-            ["python3", "-c", f"import {module}"],
+            [_python_bin(), "-c", f"import {module}"],
             capture_output=True, timeout=10,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _docker_available() -> bool:
+    docker = shutil.which("docker")
+    if not docker:
+        return False
+    try:
+        result = subprocess.run(
+            [docker, "info"],
+            capture_output=True,
+            timeout=10,
         )
         return result.returncode == 0
     except Exception:
@@ -52,6 +79,7 @@ def is_engine_available(engine: str, config: "AppConfig") -> bool:
         ENGINE_VLLM:   lambda: shutil.which("vllm") is not None or _can_import("vllm"),
         ENGINE_SGLANG: lambda: shutil.which("sglang") is not None or _can_import("sglang"),
         ENGINE_TRTLLM: lambda: _can_import("tensorrt_llm"),
+        ENGINE_TRTLLM_DOCKER: lambda: getattr(config.trtllm_docker, "enabled", True) and _docker_available(),
         ENGINE_HF:     lambda: _can_import("transformers"),
         ENGINE_OLLAMA: lambda: shutil.which("ollama") is not None or _is_ollama_running(),
         ENGINE_OPENAI: lambda: True,   # no local binary required; server already running
@@ -88,6 +116,48 @@ def _python_bin() -> str:
     backends inherit the project venv instead of falling back to /usr/bin/python3.
     """
     return sys.executable or "python3"
+
+
+def _safe_container_name(key: str) -> str:
+    safe = re.sub(r"[^a-z0-9_.-]+", "-", key.lower()).strip("-")
+    return safe or "trtllm"
+
+
+def resolve_trtllm_docker_config(key: str, cfg: dict, config: "AppConfig") -> dict:
+    """Merge app defaults with per-backend docker overrides."""
+    app_defaults = getattr(config, "trtllm_docker")
+    backend_cfg = dict(cfg.get("docker_config") or {})
+    merged_env = dict(getattr(app_defaults, "env", {}) or {})
+    merged_env.update(dict(backend_cfg.get("env") or {}))
+    merged_serve_args = dict(getattr(app_defaults, "serve_defaults", {}) or {})
+    merged_serve_args.update(dict(backend_cfg.get("serve_args") or {}))
+
+    return {
+        "image": str(backend_cfg.get("image") or app_defaults.image),
+        "container_name": str(
+            backend_cfg.get("container_name")
+            or f"llm-router-{_safe_container_name(key)}"
+        ),
+        "container_port": int(backend_cfg.get("container_port") or app_defaults.container_port),
+        "hf_cache_dir": os.path.expanduser(str(backend_cfg.get("hf_cache_dir") or app_defaults.hf_cache_dir)),
+        "log_dir": os.path.expanduser(str(backend_cfg.get("log_dir") or app_defaults.log_dir)),
+        "env": merged_env,
+        "serve_args": merged_serve_args,
+        "launcher_script": os.path.expanduser(str(backend_cfg.get("launcher_script") or "")).strip(),
+    }
+
+
+def _append_cli_arg(parts: list[str], flag: str, value) -> None:
+    if value is None or value is False:
+        return
+    if value is True:
+        parts.append(flag)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            _append_cli_arg(parts, flag, item)
+        return
+    parts.extend([flag, str(value)])
 
 
 # ─────────────────────────────────────────────────────────────
@@ -191,6 +261,55 @@ def build_trtllm_cmd(cfg: dict, trt_config: dict, config: "AppConfig" = None) ->
     return cmd
 
 
+def build_trtllm_docker_cmd(key: str, cfg: dict, config: "AppConfig") -> list[str]:
+    docker_cfg = resolve_trtllm_docker_config(key, cfg, config)
+    launcher_script = docker_cfg.get("launcher_script")
+    if launcher_script:
+        return [launcher_script]
+
+    model = cfg.get("model") or cfg.get("model_dir", "")
+    serve_parts = [
+        "trtllm-serve",
+        model,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(docker_cfg["container_port"]),
+    ]
+    for arg_name, arg_value in docker_cfg["serve_args"].items():
+        _append_cli_arg(serve_parts, f"--{arg_name}", arg_value)
+
+    log_file = f"/logs/{docker_cfg['container_name']}.log"
+    inner_cmd = ""
+    if docker_cfg["env"]:
+        exports = " ".join(
+            f"{name}={shlex.quote(str(value))}"
+            for name, value in docker_cfg["env"].items()
+        )
+        inner_cmd += f"export {exports}\n"
+    inner_cmd += f"{' '.join(shlex.quote(part) for part in serve_parts)} 2>&1 | tee {shlex.quote(log_file)}"
+
+    cmd = [
+        "docker", "run", "-d",
+        "--name",    docker_cfg["container_name"],
+        "--restart", "unless-stopped",
+        "--ipc",     "host",
+        "--gpus",    "all",
+        "--ulimit",  "memlock=-1",
+        "--ulimit",  "stack=67108864",
+        "-p", f"{cfg['port']}:{docker_cfg['container_port']}",
+        "-v", f"{docker_cfg['hf_cache_dir']}:/root/.cache/huggingface",
+        "-v", f"{docker_cfg['log_dir']}:/logs",
+    ]
+    cmd += [
+        docker_cfg["image"],
+        "bash",
+        "-lc",
+        inner_cmd,
+    ]
+    return cmd
+
+
 def build_hf_cmd(cfg: dict, config: "AppConfig" = None) -> list[str]:
     model = cfg.get("model") or cfg.get("model_dir", "")
 
@@ -240,7 +359,7 @@ def health_url(cfg: dict) -> str:
     engine = cfg.get("engine", ENGINE_LLAMA)
     if engine == ENGINE_OLLAMA:
         return f"http://localhost:{cfg['port']}/api/tags"
-    if engine == ENGINE_OPENAI:
+    if engine in (ENGINE_OPENAI, ENGINE_TRTLLM_DOCKER):
         return f"http://localhost:{cfg['port']}/v1/models"
     return f"http://localhost:{cfg['port']}/health"
 
@@ -252,6 +371,7 @@ def get_cmd_builder(engine: str):
         ENGINE_VLLM:   build_vllm_cmd,
         ENGINE_SGLANG: build_sglang_cmd,
         ENGINE_TRTLLM: None,  # handled specially — needs trt_config
+        ENGINE_TRTLLM_DOCKER: None,  # handled specially — needs backend key + merged docker config
         ENGINE_HF:     build_hf_cmd,
         ENGINE_OLLAMA: build_ollama_cmd,
     }

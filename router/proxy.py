@@ -45,11 +45,12 @@ _MODEL_MATCH_ENGINE_PRIORITY = {
     # can select a real model name without knowing an internal backend key.
     "openai": 0,
     "trt-llm": 1,
-    "vllm": 2,
-    "sglang": 3,
-    "llama.cpp": 4,
-    "huggingface": 5,
-    "ollama": 6,
+    "trt-llm-docker": 2,
+    "vllm": 3,
+    "sglang": 4,
+    "llama.cpp": 5,
+    "huggingface": 6,
+    "ollama": 7,
 }
 
 

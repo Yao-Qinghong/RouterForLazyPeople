@@ -28,8 +28,9 @@ from typing import TYPE_CHECKING
 
 from router.engines import (
     ENGINE_LLAMA, ENGINE_VLLM, ENGINE_SGLANG, ENGINE_HF, ENGINE_TRTLLM,
+    ENGINE_TRTLLM_DOCKER,
     ENGINE_OLLAMA, ENGINE_OPENAI,
-    is_engine_available,
+    is_engine_available, resolve_trtllm_docker_config,
 )
 from router.config import BackendConfig, _infer_capabilities, _estimate_vram
 
@@ -224,10 +225,18 @@ def _hf_prefers_trtllm(model_name: str, hf_config: dict) -> bool:
     return any("nvfp4" in str(value).lower() for value in haystacks)
 
 
-def _preferred_hf_engine(model_name: str, hf_config: dict, config: "AppConfig") -> str | None:
+def _preferred_hf_engine(
+    model_name: str,
+    hf_config: dict,
+    config: "AppConfig",
+    stable_model_id: str | None = None,
+) -> str | None:
     """Pick the best serving engine for a single HF checkpoint."""
-    if _hf_prefers_trtllm(model_name, hf_config) and is_engine_available(ENGINE_TRTLLM, config):
-        return ENGINE_TRTLLM
+    if _hf_prefers_trtllm(model_name, hf_config):
+        if is_engine_available(ENGINE_TRTLLM, config):
+            return ENGINE_TRTLLM
+        if stable_model_id and is_engine_available(ENGINE_TRTLLM_DOCKER, config):
+            return ENGINE_TRTLLM_DOCKER
     if is_engine_available(ENGINE_VLLM, config):
         return ENGINE_VLLM
     if is_engine_available(ENGINE_SGLANG, config):
@@ -315,10 +324,12 @@ def discover_gguf_models(config: "AppConfig", port_counter: list[int]) -> dict:
 
 def discover_hf_models(config: "AppConfig", port_counter: list[int]) -> dict:
     """Discover HuggingFace checkpoints and pick the best available engine."""
-    if not any(
-        is_engine_available(engine, config)
-        for engine in (ENGINE_TRTLLM, ENGINE_VLLM, ENGINE_SGLANG, ENGINE_HF)
-    ):
+    hf_engines = (ENGINE_TRTLLM, ENGINE_TRTLLM_DOCKER, ENGINE_VLLM, ENGINE_SGLANG, ENGINE_HF)
+    if not any(is_engine_available(engine, config) for engine in hf_engines):
+        logger.warning(
+            "HF model discovery skipped — no suitable engine available. "
+            "Install one of: tensorrt_llm, docker (for trt-llm-docker), vllm, sglang, transformers"
+        )
         return {}
 
     discovered = {}
@@ -350,11 +361,13 @@ def discover_hf_models(config: "AppConfig", port_counter: list[int]) -> dict:
             if path in seen_paths:
                 continue
             if not _is_hf_checkpoint(path):
+                logger.debug("HF discovery: skipping %s (not a valid checkpoint)", path)
                 continue
             seen_paths.add(path)
 
             size_gb = _hf_model_size_gb(path)
             if size_gb < 0.3:
+                logger.debug("HF discovery: skipping %s (too small: %.2f GB)", path, size_gb)
                 continue
             if port_counter[0] > config.discovery.port_end:
                 break
@@ -363,28 +376,48 @@ def discover_hf_models(config: "AppConfig", port_counter: list[int]) -> dict:
             arch = (hf_config.get("architectures") or ["Unknown"])[0]
             model_type = hf_config.get("model_type", "unknown")
 
+            repo_id = None
             dir_name = Path(path).name
             if "snapshots" in path:
                 for part in Path(path).parts:
                     if part.startswith("models--"):
-                        dir_name = part.replace("models--", "").replace("--", "/")
+                        repo_id = part.replace("models--", "").replace("--", "/")
+                        dir_name = repo_id
                         break
 
             slug = _slug(f"hf-{dir_name}", path)
             tier = _classify_tier(size_gb, config, dir_name)
-            preferred_engine = _preferred_hf_engine(dir_name, hf_config, config)
+            preferred_engine = _preferred_hf_engine(dir_name, hf_config, config, stable_model_id=repo_id)
             if preferred_engine is None:
+                logger.warning(
+                    "HF discovery: skipping %s — no available engine can serve it "
+                    "(available engines: %s)",
+                    dir_name,
+                    [e for e in hf_engines if is_engine_available(e, config)] or ["none"],
+                )
                 continue
 
             model_value = path
             model_dir = ""
             tokenizer = ""
+            docker_config = {}
             if preferred_engine == ENGINE_TRTLLM:
                 # Keep the local checkpoint path for startup, but expose the repo
                 # id so clients can select the model naturally.
-                model_value = dir_name
+                model_value = repo_id or dir_name
                 model_dir = path
                 tokenizer = path
+            elif preferred_engine == ENGINE_TRTLLM_DOCKER:
+                model_value = repo_id or dir_name
+                docker_config = resolve_trtllm_docker_config(
+                    slug,
+                    {
+                        "model": model_value,
+                        "port": port_counter[0],
+                        "docker_config": {},
+                    },
+                    config,
+                )
 
             backend = BackendConfig(
                 engine=preferred_engine,
@@ -392,6 +425,7 @@ def discover_hf_models(config: "AppConfig", port_counter: list[int]) -> dict:
                 model=model_value,
                 model_dir=model_dir,
                 tokenizer=tokenizer,
+                docker_config=docker_config,
                 log=str(config.data_dir / "logs" / f"backend-{slug}.log"),
                 ctx_size=min(_estimate_ctx(size_gb), hf_config.get("max_position_embeddings", 131072)),
                 dtype="auto",
