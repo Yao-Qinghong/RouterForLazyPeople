@@ -167,8 +167,6 @@ Applies overrides from `~/.llm-router/overrides.json` (exclude/patch individual 
 | `POST /rescan` | Re-detect running servers + re-scan model dirs + refresh benchmarks |
 | `POST /retune/{key}` | Force TRT-LLM re-tune from scratch |
 
-### Reference artifacts
+### Entry point
 
-- **`router.py`** (root, 1141 lines) — original monolith kept for historical reference. **Not used by the running system.**
-- **`start_router.sh`** — original shell launcher. **Not used.**
 - **`router-start`** — shell wrapper that auto-selects `.venv/bin/python` → `python3` → `python`. Used as the ExecStart in both launchd (macOS) and systemd (Linux) service units.
