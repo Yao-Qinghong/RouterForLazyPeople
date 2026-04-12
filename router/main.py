@@ -389,6 +389,7 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
                 "auto_discovered": v.get("auto_discovered", False),
                 "tier":            v.get("tier"),
                 "size_gb":         v.get("size_gb"),
+                "startup_wait":    v.get("startup_wait", 30),
             }
             for k, v in backends.items()
         }
