@@ -471,7 +471,10 @@ def _print_status(data: dict):
         return
 
     running_count = sum(1 for info in data.values() if info.get("running"))
-    measured_count = sum(1 for info in data.values() if info.get("bench_tg_tok_s") is not None)
+    measured_count = sum(
+        1 for info in data.values()
+        if info.get("bench_tg_tok_s") is not None or info.get("bench_pp_tok_s") is not None
+    )
     print(f"Router: {_router_url()}")
     print(f"Registered backends: {len(data)} | running: {running_count} | benchmarked: {measured_count}")
     print()
@@ -717,8 +720,8 @@ def _print_benchmark_usage_help(measured: list[dict]):
 def _print_benchmark_leaderboard(results_by_key: dict):
     """Print cached active-benchmark results as a speed tier list."""
     results = sorted(results_by_key.values(), key=_benchmark_result_sort_key)
-    measured = [r for r in results if r.get("validated") and not r.get("error")]
-    failures = [r for r in results if r.get("error")]
+    measured = [r for r in results if r.get("validated") or r.get("pp_validated")]
+    failures = [r for r in results if r.get("error") and not r.get("pp_validated")]
 
     if not measured and not failures:
         print("No cached benchmark results yet.")
@@ -738,8 +741,11 @@ def _print_benchmark_leaderboard(results_by_key: dict):
             print(f"{tier.upper()}")
         key = result.get("backend_key", "unknown")
         print(f"  {key}")
+        tg_label = _speed_label(result.get('tg_tok_s'), 'tok/s')
+        if result.get('tg_error'):
+            tg_label = "TG failed"
         print(
-            f"    TG={_speed_label(result.get('tg_tok_s'), 'tok/s')}  "
+            f"    TG={tg_label}  "
             f"PP={_speed_label(result.get('pp_tok_s'), 'tok/s')}  "
             f"TTFT={_speed_label(result.get('ttft_ms'), 'ms')}  "
             f"think={result.get('thinking_mode', '—')}  "
@@ -997,6 +1003,29 @@ def cmd_bench(args):
             attempted_start = False
             start_ok = False
 
+            # VRAM check: warn before starting a model that may not fit
+            vram_est = cfg.get("vram_estimate_gb")
+            if started_by_bench and vram_est:
+                try:
+                    from router.sysinfo import query_free_vram
+                    vram_info = query_free_vram()
+                    if vram_info:
+                        free_gb, total_gb = vram_info
+                        if vram_est > free_gb:
+                            print(f"      ⚠  VRAM warning: model needs ~{vram_est:.1f} GB "
+                                  f"but only {free_gb:.1f}/{total_gb:.1f} GB free")
+                            answer = input("      Continue anyway? [y/N] ").strip().lower()
+                            if answer not in ("y", "yes"):
+                                print("      skipped (VRAM)")
+                                results.append({
+                                    "backend_key": key,
+                                    "thinking_mode": thinking_mode,
+                                    "error": f"Skipped: needs ~{vram_est:.1f} GB VRAM, only {free_gb:.1f} GB free",
+                                })
+                                continue
+                except Exception:
+                    pass  # sysinfo unavailable, proceed anyway
+
             # Ensure backend is running first
             try:
                 if started_by_bench:
@@ -1020,6 +1049,10 @@ def cmd_bench(args):
 
                 if r.get("error"):
                     print(f"ERROR: {r['error']}")
+                elif r.get("tg_error"):
+                    pp_val = r.get('pp_tok_s')
+                    pp_str = f"PP={pp_val:.0f} tok/s" if pp_val else ""
+                    print(f"done  {pp_str}  (TG failed: {r['tg_error'][:50]})")
                 elif r.get("tier_mismatch"):
                     print(f"done  ⚠  TG={r['tg_tok_s']:.0f} tok/s  (tier mismatch)")
                 else:

@@ -129,6 +129,12 @@ class RateLimitConfig:
 
 
 @dataclass
+class BenchmarkConfig:
+    pp_timeout_sec: int = 90
+    tg_timeout_sec: int = 300
+
+
+@dataclass
 class TRTLLMDockerSettings:
     enabled: bool = True
     image: str = "nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc7"
@@ -245,6 +251,7 @@ class AppConfig:
     audit: AuditConfig
     rate_limit: RateLimitConfig
     trtllm_docker: TRTLLMDockerSettings
+    benchmark: BenchmarkConfig
     llama_bin: Path
     data_dir: Path
     settings_file: Path
@@ -427,6 +434,13 @@ def load_config(
         per_key_overrides=rl.get("per_key_overrides", {}),
     )
 
+    # ── Benchmark timeouts ─────────────────────────────────────
+    bm = raw.get("benchmark", {})
+    benchmark_cfg = BenchmarkConfig(
+        pp_timeout_sec=int(bm.get("pp_timeout_sec", 90)),
+        tg_timeout_sec=int(bm.get("tg_timeout_sec", 300)),
+    )
+
     # ── TensorRT-LLM Docker fallback ─────────────────────────
     td = raw.get("trtllm_docker", {})
     trtllm_docker = TRTLLMDockerSettings(
@@ -470,6 +484,7 @@ def load_config(
         audit=audit,
         rate_limit=rate_limit,
         trtllm_docker=trtllm_docker,
+        benchmark=benchmark_cfg,
         llama_bin=llama_bin,
         data_dir=data_dir,
         settings_file=sf,
