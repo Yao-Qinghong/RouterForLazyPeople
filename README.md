@@ -332,10 +332,15 @@ The router classifies each request automatically:
 
 | Condition | Backend |
 |---|---|
+| `[route:key]` prefix in message | exact backend |
+| Tool use / function calling | deep |
 | Prompt > 4000 tokens | deep |
-| Keywords: reason, think, analyze, step by step, debug, refactor… | deep |
-| Keywords: write, implement, code, function, fix, review… | mid |
+| Keywords: reason, think, analyze, step by step, debug, refactor… | soft signal toward deep |
+| Prompt > 500 tokens, or mid keywords | mid |
+| JSON schema response format, system prompt > 2000 tokens, or > 10 messages | at least mid |
 | Everything else | fast |
+
+Keywords are **soft signals** — they influence tier selection but cannot force deep on their own.
 
 Override any time with `[route:key]` prefix or `?backend=key` query param.
 
@@ -369,6 +374,8 @@ By default, only **llama.cpp** is enabled. Other engines can be activated by add
 | **TensorRT-LLM** | TRT engines | disabled | Maximum speed on NVIDIA hardware, needs CUDA 12.2+ |
 | **TensorRT-LLM (Docker)** | HuggingFace / NVFP4 | disabled | Managed Docker fallback for NVFP4 checkpoints |
 | **HuggingFace TGI** | HuggingFace | disabled | Broad model support |
+| **Ollama** | Ollama models | disabled | Connects to running Ollama server |
+| **OpenAI-compatible** | any | disabled | Passthrough to any running server on a port |
 
 Disabled engines are not detected, their models are not discovered, and they cannot be started — even if their binaries are installed. This keeps the router focused and avoids accidental resource use.
 
@@ -409,11 +416,11 @@ python cli.py sysinfo
 
 The router scans these directories at startup (configurable in `settings.yaml`):
 
-- `~/.lmstudio/models`
-- `~/models`
-- `~/llm-models`
-- `~/.cache/huggingface/hub`
-- `~/trt-engines`
+- `~/.lmstudio/models` (GGUF)
+- `~/models` (GGUF, HF)
+- `~/llm-models` (GGUF, HF)
+- `~/.cache/huggingface/hub` (GGUF, HF)
+- `~/trt-engines`, `~/tensorrt-engines`, `~/models/trt-llm` (TRT-LLM)
 
 Any `.gguf` file found is registered automatically with size-based tier assignment. HuggingFace and TRT-LLM discovery only runs when those engines are listed in `engines_enabled`.
 

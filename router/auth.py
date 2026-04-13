@@ -38,7 +38,7 @@ logger = logging.getLogger("llm-router.auth")
 
 # Routes that never require authentication
 PUBLIC_ROUTES = {
-    "/status", "/backends", "/engines", "/sysinfo",
+    "/status", "/backends", "/benchmarks", "/engines", "/sysinfo",
     "/metrics", "/metrics/export", "/metrics/prometheus",
     "/health", "/docs", "/openapi.json", "/redoc",
 }

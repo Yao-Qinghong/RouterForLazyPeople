@@ -53,6 +53,7 @@ Thinking / reasoning behavior:
   - `GET /health`
   - `GET /status`
   - `GET /backends`
+  - `GET /benchmarks`
   - `GET /v1/models`
   - `GET /v1/models/{model_id}`
   - `GET /engines`
@@ -60,7 +61,7 @@ Thinking / reasoning behavior:
   - `GET /metrics`
   - `GET /metrics/export`
   - `GET /metrics/prometheus`
-  - `GET /benchmarks`
+  - `GET /docs`, `GET /openapi.json`, `GET /redoc` (FastAPI auto-generated)
 - Inference routes require `inference` or `all` scope.
 - Admin/control routes require `admin` or `all` scope.
 

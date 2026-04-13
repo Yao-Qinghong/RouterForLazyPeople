@@ -24,7 +24,7 @@ pytest tests/test_routing.py  # single file
 
 # Benchmark all backends (measures real PP/TG tok/s, saves to ~/.llm-router/benchmarks/)
 python cli.py bench
-python cli.py bench --backend fast   # single backend only
+python cli.py bench --backend <backend-key>   # single backend only
 
 # Hardware diagnostics (GPU, CUDA, CPU, installed engine versions, install recommendations)
 python cli.py sysinfo
@@ -66,13 +66,16 @@ proxy.py:
 
 `classify()` assigns a tier in priority order:
 
-1. `[route:key]` prefix in any message → exact backend key
-2. Tool use / function calling → `deep` (small models produce unreliable tool JSON)
-3. Token count > `token_threshold_deep` → `deep`
-4. Deep keywords match → `deep`
-5. Token count > `token_threshold_mid` or mid keywords → `mid`
-6. Structural signals raise tier to at least `mid`: JSON schema response format, system prompt > 2000 tokens, or > 10 messages
-7. Default → `fast`
+1. `[route:key]` prefix in any message → exact backend key (highest priority)
+2. Structural signals determine minimum tier:
+   - Tool use / function calling → `deep`
+   - JSON schema response format → at least `mid`
+   - Token count > `token_threshold_deep` (4000) → `deep`
+   - System prompt > 2000 tokens → at least `mid`
+   - More than 10 messages → at least `mid`
+   - Token count > `token_threshold_mid` (500) → at least `mid`
+3. Keywords as **soft tiebreaker** — can push `fast→mid`, but cannot force `deep` alone. Keywords only confirm `mid→deep` when combined with a structural signal (token count > mid threshold).
+4. Default → `fast`
 
 `_pick(backends, tier)` selects the best backend within a tier:
 
