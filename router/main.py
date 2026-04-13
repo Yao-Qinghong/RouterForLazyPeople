@@ -371,6 +371,8 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
                 info["bench_tier_measured"] = bench.get("tier_measured")
                 info["bench_mismatch"]  = bench.get("tier_mismatch", False)
                 info["bench_timestamp"] = bench.get("timestamp")
+                info["bench_tg_error"]  = bench.get("tg_error")
+                info["bench_pp_validated"] = bench.get("pp_validated", False)
         return state
 
     @app.get("/benchmarks", summary="Cached benchmark results for all backends")

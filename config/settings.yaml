@@ -169,6 +169,13 @@ metrics:
   # Write buffered records to disk every N seconds
   flush_interval_sec: 60
 
+# ── Benchmark timeouts ────────────────────────────────────────
+# Timeouts for the PP and TG benchmark phases.
+# Increase tg_timeout_sec for very large models (70B+) on slow hardware.
+benchmark:
+  pp_timeout_sec: 90     # prompt processing phase (default: 90)
+  tg_timeout_sec: 300    # token generation phase (default: 300)
+
 # ── Model aliases ─────────────────────────────────────────────
 # Map arbitrary model names to backend keys. Useful when clients
 # request "gpt-4" or "gemini-pro" and you want to route them locally.

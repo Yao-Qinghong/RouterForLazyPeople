@@ -101,28 +101,47 @@ async def measure_backend(
         "ttft_ms":      None,
         "validated":    False,
         "error":        None,
+        "pp_error":     None,
+        "tg_error":     None,
+        "pp_validated": False,
         "tier_measured": None,
         "tier_mismatch": False,
         "thinking_mode": thinking_mode,
     }
 
+    # PP phase (independent)
     try:
-        pp = await _run_pp(base, thinking_mode)
+        pp = await _run_pp(base, thinking_mode, timeout=config.benchmark.pp_timeout_sec)
         result["pp_tok_s"] = pp["pp_tok_s"]
         result["ttft_ms"]  = pp["ttft_ms"]
+        result["pp_validated"] = True
+    except Exception as e:
+        result["pp_error"] = str(e)
 
-        tg = await _run_tg(base, thinking_mode)
+    # TG phase (independent)
+    # Use benchmark data from similar models to set a realistic timeout
+    tg_timeout = _estimate_tg_timeout(
+        cfg.get("size_gb"), config,
+        fallback=config.benchmark.tg_timeout_sec,
+    )
+    try:
+        tg = await _run_tg(base, thinking_mode, timeout=tg_timeout)
         result["tg_tok_s"] = tg["tg_tok_s"]
+    except Exception as e:
+        result["tg_error"] = str(e)
 
-        result["validated"]    = True
-        result["tier_measured"] = _tier_from_speed(tg["tg_tok_s"])
+    # Summary
+    if result["pp_validated"] and result["tg_tok_s"] is not None:
+        result["validated"] = True
+    if result["tg_tok_s"] is not None:
+        result["tier_measured"] = _tier_from_speed(result["tg_tok_s"])
         result["tier_mismatch"] = (
             result["tier_measured"] != result["tier_assigned"]
             and result["tier_assigned"] is not None
         )
-
-    except Exception as e:
-        result["error"] = str(e)
+    # Legacy "error" field: only set when BOTH phases failed
+    if result["pp_error"] and result["tg_error"]:
+        result["error"] = f"PP: {result['pp_error']}; TG: {result['tg_error']}"
 
     return result
 
@@ -131,7 +150,7 @@ def _benchmark_prompt(prompt: str, thinking_mode: str) -> str:
     return prompt + _THINKING_PROMPT_SUFFIX[thinking_mode]
 
 
-async def _run_pp(base: str, thinking_mode: str = "no_think") -> dict:
+async def _run_pp(base: str, thinking_mode: str = "no_think", timeout: int = 90) -> dict:
     """
     PP benchmark: long prompt, max_tokens=1, streaming.
     Measures time-to-first-token which equals prompt processing time.
@@ -147,7 +166,7 @@ async def _run_pp(base: str, thinking_mode: str = "no_think") -> dict:
     ttft_ms = None
     prompt_tokens = len(_PP_PROMPT.split())   # rough estimate
 
-    async with httpx.AsyncClient(timeout=60) as client:
+    async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream("POST", f"{base}/chat/completions", json=payload) as resp:
             resp.raise_for_status()
             async for line in resp.aiter_lines():
@@ -162,10 +181,87 @@ async def _run_pp(base: str, thinking_mode: str = "no_think") -> dict:
     return {"ttft_ms": round(ttft_ms, 1), "pp_tok_s": pp_tok_s}
 
 
-async def _run_tg(base: str, thinking_mode: str = "no_think") -> dict:
+_TG_MIN_TOKENS = 5    # absolute minimum for any measurement
+_TG_ENOUGH_TOKENS = 20  # enough for a reliable estimate — exit early
+_TG_TIMEOUT_SAFETY = 5  # multiply estimated time by this for the timeout
+
+
+def _estimate_tg_timeout(
+    size_gb: float | None,
+    config: "AppConfig",
+    fallback: int = 300,
+) -> int:
+    """Estimate a TG timeout using benchmarked models of similar size.
+
+    If we already have TG results for other models, extrapolate: larger
+    models are slower roughly in proportion to file size.  The estimated
+    generation time is multiplied by ``_TG_TIMEOUT_SAFETY`` so we don't
+    cut it too close.  Returns the configured fallback when no prior
+    data exists.
+    """
+    if size_gb is None or size_gb <= 0:
+        return fallback
+
+    all_results = load_all_results(config)
+    # Collect (size_gb, tg_tok_s) pairs from prior benchmarks
+    refs: list[tuple[float, float]] = []
+    for r in all_results.values():
+        tg = r.get("tg_tok_s")
+        if tg and tg > 0:
+            # Look up this backend's size from the description or
+            # from the config registry; fall back to skipping.
+            ref_size = _extract_size_from_result(r, config)
+            if ref_size and ref_size > 0:
+                refs.append((ref_size, tg))
+
+    if not refs:
+        return fallback
+
+    # Pick the reference closest in size to the target
+    refs.sort(key=lambda pair: abs(pair[0] - size_gb))
+    ref_size, ref_tg = refs[0]
+
+    # Estimate: speed scales roughly inversely with size
+    estimated_tg = ref_tg * (ref_size / size_gb)
+    if estimated_tg <= 0:
+        return fallback
+
+    # Time to generate _TG_ENOUGH_TOKENS at estimated speed, with safety margin
+    estimated_sec = (_TG_ENOUGH_TOKENS / estimated_tg) * _TG_TIMEOUT_SAFETY
+    # Clamp: at least 30s, at most the configured fallback
+    timeout = max(30, min(int(estimated_sec), fallback))
+    logger.info(
+        "TG timeout estimate for %.1f GB model: %.1f tok/s (from %.1f GB ref @ %.1f tok/s) → %ds",
+        size_gb, estimated_tg, ref_size, ref_tg, timeout,
+    )
+    return timeout
+
+
+def _extract_size_from_result(result: dict, config: "AppConfig") -> float | None:
+    """Get the model size_gb for a benchmark result by looking up the backend registry."""
+    key = result.get("backend_key")
+    if not key:
+        return None
+    # Try the live backend registry via config's backends file
+    try:
+        from router.registry import build_backend_registry
+        backends = build_backend_registry(config)
+        cfg = backends.get(key, {})
+        if isinstance(cfg, dict):
+            return cfg.get("size_gb")
+        return getattr(cfg, "size_gb", None)
+    except Exception:
+        return None
+
+
+async def _run_tg(base: str, thinking_mode: str = "no_think", timeout: int = 300) -> dict:
     """
     TG benchmark: short prompt, max_tokens=80, streaming.
     Measures token generation speed after the first token.
+
+    Exits early once _TG_ENOUGH_TOKENS are collected (no need to wait
+    for all 80).  On timeout, uses whatever tokens were already received
+    as long as there are at least _TG_MIN_TOKENS.
     """
     payload = {
         "model":       "benchmark",
@@ -178,23 +274,33 @@ async def _run_tg(base: str, thinking_mode: str = "no_think") -> dict:
     ttft_s = None
     token_count = 0
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        async with client.stream("POST", f"{base}/chat/completions", json=payload) as resp:
-            resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line.startswith("data:") or "[DONE]" in line:
-                    continue
-                try:
-                    chunk = json.loads(line[5:])
-                    delta = chunk["choices"][0]["delta"].get("content", "")
-                    if delta:
-                        if ttft_s is None:
-                            ttft_s = time.perf_counter() - t0
-                        token_count += 1
-                except Exception:
-                    continue
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("POST", f"{base}/chat/completions", json=payload) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data:") or "[DONE]" in line:
+                        continue
+                    try:
+                        chunk = json.loads(line[5:])
+                        delta = chunk["choices"][0]["delta"].get("content", "")
+                        if delta:
+                            if ttft_s is None:
+                                ttft_s = time.perf_counter() - t0
+                            token_count += 1
+                            if token_count >= _TG_ENOUGH_TOKENS:
+                                break
+                    except Exception:
+                        continue
+    except (httpx.TimeoutException, httpx.ReadTimeout):
+        if token_count >= _TG_MIN_TOKENS:
+            logger.warning("TG benchmark timed out after %d tokens — using partial data", token_count)
+        else:
+            raise RuntimeError(
+                f"TG timed out after {token_count} token(s) — need at least {_TG_MIN_TOKENS}"
+            )
 
-    if token_count < 5:
+    if token_count < _TG_MIN_TOKENS:
         raise RuntimeError(f"Too few tokens generated ({token_count}) — model may have refused")
 
     total_s = time.perf_counter() - t0
@@ -267,17 +373,21 @@ def format_results(results: list[dict]) -> str:
 
     for r in results:
         thinking = r.get("thinking_mode", "—")
-        if r.get("error"):
+
+        # Total failure: both PP and TG failed (or legacy error with no PP data)
+        if r.get("error") and not r.get("pp_tok_s"):
             lines.append(f"{r['backend_key']:<22} {thinking:<8}  ERROR: {r['error'][:55]}")
             continue
 
         pp   = f"{r['pp_tok_s']:.0f}" if r.get("pp_tok_s") else "—"
         tg   = f"{r['tg_tok_s']:.0f}" if r.get("tg_tok_s") else "—"
         ttft = f"{r['ttft_ms']:.0f}" if r.get("ttft_ms") else "—"
-        assigned = r.get("tier_assigned", "—")
-        measured = r.get("tier_measured", "—")
+        assigned = r.get("tier_assigned") or "—"
+        measured = r.get("tier_measured") or "—"
 
-        if r.get("tier_mismatch"):
+        if r.get("tg_error"):
+            status = f"PP only (TG failed: {r['tg_error'][:40]})"
+        elif r.get("tier_mismatch"):
             status = f"⚠  assigned={assigned} but speed suggests {measured}"
         else:
             status = "✓"
