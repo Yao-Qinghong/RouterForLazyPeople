@@ -6,7 +6,7 @@ Sits between your chat apps and your local models — starts them on demand, sto
 
 Built for local-LLM tinkering on limited hardware: keep many models available, automatically choose between them, and avoid keeping every model loaded at once.
 
-> **Full disclosure:** This is a fully vibe-coded project. The human behind it is not a software engineer and had no idea what he was doing — Claude did all the actual coding. Use accordingly.
+> **Full disclosure:** This is a fully vibe-coded project. The human behind it is an application support engineer who decided to let Claude do all the actual coding instead of writing it himself. Use accordingly.
 >
 > **Current status:** active pre-release development, focused first on one operator-owned DGX Spark / CUDA Linux workstation. Core router and CLI paths have automated tests, but the project has **not** completed a public-release QA matrix across engines, clients, operating systems, GPUs, and OOM cases. See [`docs/POSITIONING.md`](docs/POSITIONING.md) for scope, related projects, and release-readiness notes.
 
