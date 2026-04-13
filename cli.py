@@ -504,10 +504,14 @@ def _print_status(data: dict):
     if running_count:
         print("Benchmark currently running backend(s):")
         print("  ./router-start bench")
+        print("Benchmark all models (sequentially, stops each after measuring):")
+        print("  ./router-start bench --all --start-stopped")
     else:
         print("No model backend is running. That is OK: the router lazy-loads one model per request.")
-        print("DGX Spark safe benchmark:")
+        print("DGX Spark safe benchmark (one model at a time):")
         print("  ./router-start bench --backend <backend-key> --start-stopped")
+        print("Benchmark all models (sequentially, stops each after measuring):")
+        print("  ./router-start bench --all --start-stopped")
 
     print()
     print("If the list is wrong: edit config/settings.yaml scan_dirs, then run ./router-start rescan")
