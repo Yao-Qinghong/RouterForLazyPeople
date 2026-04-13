@@ -8,7 +8,7 @@ Built for local-LLM tinkering on limited hardware: keep many models available, a
 
 > **Full disclosure:** This is a fully vibe-coded project. The human behind it is an application support engineer who decided to let Claude do all the actual coding instead of writing it himself. Use accordingly.
 >
-> **Current status:** active pre-release development, focused first on one operator-owned DGX Spark / CUDA Linux workstation. Core router and CLI paths have automated tests, but the project has **not** completed a public-release QA matrix across engines, clients, operating systems, GPUs, and OOM cases. See [`docs/POSITIONING.md`](docs/POSITIONING.md) for scope, related projects, and release-readiness notes.
+> **Current status:** active pre-release development, focused first on one operator-owned DGX Spark / CUDA Linux workstation. Only **llama.cpp** is working-ish right now (not fully tested yet). All other engines (vLLM, SGLang, TRT-LLM, HuggingFace, Ollama) are coded but untested and disabled by default — they will be validated and enabled in a later phase. See [`docs/POSITIONING.md`](docs/POSITIONING.md) for scope and release-readiness notes.
 
 ```
 Your App (OpenAI / Anthropic SDK / OpenClaw / Open WebUI)
