@@ -50,16 +50,34 @@ class BackendManager:
         self.last_used: dict[str, float] = {}
         self.active_configs: dict[str, dict] = {}
         self.starting: dict[str, asyncio.Lock] = {k: asyncio.Lock() for k in backends}
+        self._registry_lock: asyncio.Lock | None = None
 
-    def update_registry(self, new_backends: dict):
+    async def update_registry(self, new_backends: dict):
         """
         Swap in a new backend registry (called by /rescan).
         Adds locks for newly discovered backends; preserves running processes.
+        Acquires _registry_lock to prevent races with in-flight requests
+        that snapshot self.backends.
         """
-        self.backends = new_backends
-        for k in new_backends:
-            if k not in self.starting:
-                self.starting[k] = asyncio.Lock()
+        if self._registry_lock is None:
+            self._registry_lock = asyncio.Lock()
+        async with self._registry_lock:
+            self.backends = new_backends
+            for k in new_backends:
+                if k not in self.starting:
+                    self.starting[k] = asyncio.Lock()
+
+    def snapshot_backends(self) -> dict:
+        """Return a reference to the current backends dict.
+
+        Call once at the start of a request handler and use the returned
+        dict for all routing/lookup within that request.  Because Python
+        dict assignment is atomic (single STORE_ATTR bytecode),
+        this is safe without the lock — the caller simply gets a
+        consistent view that won't change mid-request even if /rescan
+        swaps ``self.backends`` concurrently.
+        """
+        return self.backends
 
     def is_running(self, key: str) -> bool:
         proc = self.processes.get(key)
@@ -83,8 +101,19 @@ class BackendManager:
                 await asyncio.sleep(1)
         return False
 
+    def _close_log(self, key: str):
+        """Close the log file handle for *key* if one is open."""
+        handle = self.log_handles.pop(key, None)
+        if handle:
+            try:
+                handle.close()
+            except Exception:
+                pass
+
     def _open_log(self, key: str):
         """Open (or reopen) the log file for a backend in append mode."""
+        # Close any existing handle first (prevents leak on retry)
+        self._close_log(key)
         cfg = self.backends[key]
         log_path = cfg["log"]
         # Ensure log directory exists
@@ -201,6 +230,7 @@ class BackendManager:
             except Exception:
                 pass
             self.processes.pop(key, None)
+            self._close_log(key)
             return False
 
         logger.info(f"[{key}] Ready on port {cfg['port']} (PID {proc.pid})")
@@ -229,6 +259,7 @@ class BackendManager:
                 f"[{key}] Docker launcher exited with code {result.returncode}"
             )
             self._append_docker_logs(key, docker_cfg["container_name"])
+            self._close_log(key)
             return False
 
         self.processes[key] = _DockerSentinel(docker_cfg["container_name"])
@@ -244,6 +275,7 @@ class BackendManager:
             self._remove_docker_container(docker_cfg["container_name"])
             self.processes.pop(key, None)
             self.last_used.pop(key, None)
+            self._close_log(key)
             return False
 
         logger.info(
@@ -515,12 +547,7 @@ class BackendManager:
         self.processes.pop(key, None)
         self.last_used.pop(key, None)
         self.active_configs.pop(key, None)
-        if key in self.log_handles:
-            try:
-                self.log_handles[key].close()
-            except Exception:
-                pass
-            self.log_handles.pop(key, None)
+        self._close_log(key)
 
     def _unload_ollama(self, key: str):
         """Tell Ollama to unload a model to free memory."""

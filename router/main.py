@@ -544,7 +544,7 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
         clear_engine_cache()
         running_before = {k for k in manager.backends if manager.is_running(k)}
         new_backends = build_backend_registry(cfg)
-        manager.update_registry(new_backends)
+        await manager.update_registry(new_backends)
         # Refresh benchmark data so new/renamed backends get correct routing weights
         from router.benchmark import load_all_results
         from router.routing import set_benchmark_results

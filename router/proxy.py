@@ -206,6 +206,9 @@ async def handle_proxy(
     request_id = uuid.uuid4().hex[:8]
     start_time = time.time()
     api_key_name = getattr(request.state, "api_key_name", "")
+    # Snapshot backends once so routing + lookup use a consistent view
+    # even if /rescan swaps manager.backends concurrently.
+    backends = manager.snapshot_backends()
 
     # ── Parse body ────────────────────────────────────────────
     try:
@@ -222,19 +225,19 @@ async def handle_proxy(
         request.query_params.get("backend")
         or resolve_requested_model(
             payload.get("model", ""),
-            manager.backends,
+            backends,
             config.model_aliases,
             manager,
         )
-        or classify(payload, manager.backends, config)
+        or classify(payload, backends, config)
     )
 
-    if backend_key not in manager.backends:
+    if backend_key not in backends:
         return JSONResponse(
             status_code=400,
             content={
                 "error": f"Unknown backend '{backend_key}'",
-                "valid_backends": list(manager.backends.keys()),
+                "valid_backends": list(backends.keys()),
                 "request_id": request_id,
             },
         )
@@ -265,7 +268,7 @@ async def handle_proxy(
         try:
             await manager.ensure_running(backend_key)
         except RuntimeError as e:
-            cfg = manager.backends[backend_key]
+            cfg = backends[backend_key]
             return JSONResponse(
                 status_code=503,
                 content={
@@ -277,7 +280,7 @@ async def handle_proxy(
             )
 
         manager.last_used[backend_key] = time.time()
-        cfg = manager.backends[backend_key]
+        cfg = backends[backend_key]
         target_url = f"http://localhost:{cfg['port']}/v1/{path}"
         is_stream = payload.get("stream", False)
 
@@ -540,6 +543,7 @@ async def handle_anthropic_proxy(
     request_id = uuid.uuid4().hex[:8]
     start_time = time.time()
     api_key_name = getattr(request.state, "api_key_name", "")
+    backends = manager.snapshot_backends()
 
     # ── Parse body ────────────────────────────────────────────
     try:
@@ -559,7 +563,7 @@ async def handle_anthropic_proxy(
     if not backend_key:
         backend_key = resolve_requested_model(
             original_model,
-            manager.backends,
+            backends,
             config.model_aliases,
             manager,
         )
@@ -567,18 +571,18 @@ async def handle_anthropic_proxy(
         # Try model name → tier mapping
         backend_key = model_to_backend(original_model)
         # Fall back to keyword classifier on the translated messages
-        if not backend_key or backend_key not in manager.backends:
+        if not backend_key or backend_key not in backends:
             oai_for_classify = anthropic_to_openai(payload)
             from router.routing import classify
-            backend_key = classify(oai_for_classify, manager.backends, config)
+            backend_key = classify(oai_for_classify, backends, config)
 
-    if backend_key not in manager.backends:
+    if backend_key not in backends:
         return JSONResponse(
             status_code=400,
             content={"type": "error", "error": {
                 "type": "invalid_request_error",
                 "message": f"No backend available for model '{original_model}'. "
-                           f"Valid backends: {list(manager.backends.keys())}",
+                           f"Valid backends: {list(backends.keys())}",
             }},
         )
 
@@ -607,7 +611,7 @@ async def handle_anthropic_proxy(
         try:
             await manager.ensure_running(backend_key)
         except RuntimeError as e:
-            cfg = manager.backends[backend_key]
+            cfg = backends[backend_key]
             return JSONResponse(
                 status_code=503,
                 content={"type": "error", "error": {
@@ -617,7 +621,7 @@ async def handle_anthropic_proxy(
             )
 
         manager.last_used[backend_key] = time.time()
-        cfg        = manager.backends[backend_key]
+        cfg        = backends[backend_key]
         oai_payload = anthropic_to_openai(payload)
         target_url  = f"http://localhost:{cfg['port']}/v1/chat/completions"
 
@@ -773,6 +777,7 @@ async def handle_gemini_proxy(
 
     request_id = uuid.uuid4().hex[:8]
     start_time = time.time()
+    backends = manager.snapshot_backends()
 
     try:
         payload = await request.json()
@@ -782,14 +787,14 @@ async def handle_gemini_proxy(
     # Determine backend
     backend_key = (
         request.query_params.get("backend")
-        or resolve_requested_model(model, manager.backends, config.model_aliases, manager)
+        or resolve_requested_model(model, backends, config.model_aliases, manager)
         or gemini_model_to_backend(model)
     )
-    if not backend_key or backend_key not in manager.backends:
+    if not backend_key or backend_key not in backends:
         oai_temp = gemini_to_openai(payload)
-        backend_key = classify(oai_temp, manager.backends, config)
+        backend_key = classify(oai_temp, backends, config)
 
-    if backend_key not in manager.backends:
+    if backend_key not in backends:
         return JSONResponse(status_code=400, content={
             "error": {"message": f"No backend for model '{model}'"}
         })
@@ -809,7 +814,7 @@ async def handle_gemini_proxy(
             return JSONResponse(status_code=503, content={"error": {"message": str(e)}})
 
         manager.last_used[backend_key] = time.time()
-        cfg = manager.backends[backend_key]
+        cfg = backends[backend_key]
         oai_payload = gemini_to_openai(payload, is_stream=is_stream)
         target_url = f"http://localhost:{cfg['port']}/v1/chat/completions"
 
