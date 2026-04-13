@@ -70,9 +70,15 @@ def _docker_available() -> bool:
 
 
 def is_engine_available(engine: str, config: "AppConfig") -> bool:
-    """Check whether an engine's binary or Python module is installed."""
+    """Check whether an engine is enabled and its binary/module is installed."""
     if engine in _engine_available_cache:
         return _engine_available_cache[engine]
+
+    # Config-based allowlist — if set, engines not listed are disabled
+    allowed = getattr(config, "engines_enabled", None)
+    if allowed and engine not in allowed:
+        _engine_available_cache[engine] = False
+        return False
 
     checks = {
         ENGINE_LLAMA:  lambda: os.path.isfile(str(config.llama_bin)),

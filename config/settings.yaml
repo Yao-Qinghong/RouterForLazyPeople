@@ -16,6 +16,15 @@ logging:
   log_backup_count: 5        # number of rotated files to keep
   json_format: false         # true → structured JSON logs (for ELK/Loki/Datadog)
 
+# ── Enabled engines ──────────────────────────────────────────
+# Only engines listed here will be used. All others are disabled
+# regardless of whether their binaries are installed.
+# Available: llama.cpp, vllm, sglang, trt-llm, trt-llm-docker,
+#            huggingface, ollama, openai
+engines_enabled:
+  - "llama.cpp"
+  # - "vllm"         # uncomment when needed
+
 # Path to the llama-server binary built from llama.cpp
 llama_bin: "~/llama.cpp/build/bin/llama-server"
 

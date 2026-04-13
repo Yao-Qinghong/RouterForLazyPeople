@@ -249,6 +249,7 @@ class AppConfig:
     data_dir: Path
     settings_file: Path
     backends_file: Path
+    engines_enabled: list[str] = field(default_factory=lambda: ["llama.cpp"])
     model_aliases: dict[str, str] = field(default_factory=dict)
     preload: list[str] = field(default_factory=list)
 
@@ -443,6 +444,9 @@ def load_config(
         })),
     )
 
+    # ── Engines ───────────────────────────────────────────────
+    engines_enabled = raw.get("engines_enabled", ["llama.cpp"])
+
     # ── Model aliases ─────────────────────────────────────────
     model_aliases = raw.get("model_aliases", {})
 
@@ -470,6 +474,7 @@ def load_config(
         data_dir=data_dir,
         settings_file=sf,
         backends_file=bf,
+        engines_enabled=engines_enabled,
         model_aliases=model_aliases,
         preload=preload,
     )

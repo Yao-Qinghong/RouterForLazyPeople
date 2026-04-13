@@ -17,6 +17,13 @@ from router.discovery import (
     discover_hf_models,
     discover_trtllm_engines,
 )
+from router.engines import (
+    ALL_ENGINES,
+    ENGINE_LLAMA,
+    ENGINE_HF,
+    ENGINE_TRTLLM,
+    ENGINE_TRTLLM_DOCKER,
+)
 
 if TYPE_CHECKING:
     from router.config import AppConfig
@@ -69,20 +76,21 @@ def build_backend_registry(config: "AppConfig") -> dict:
     manual_count = len(registry)
 
     # ── Detect already-running servers (LM Studio, Ollama, …) ─
+    enabled = set(getattr(config, "engines_enabled", []) or ALL_ENGINES)
     running = detect_running_servers(config)
     for slug, cfg in running.items():
-        if slug not in registry:
+        if slug not in registry and cfg.get("engine", "") in enabled:
             registry[slug] = cfg
 
     # ── Auto-discovery (GGUF / HF / TRT-LLM on disk) ─────────
     port_counter = [config.discovery.port_start]
 
-    gguf = discover_gguf_models(config, port_counter)
-    hf   = discover_hf_models(config, port_counter)
+    gguf = discover_gguf_models(config, port_counter) if ENGINE_LLAMA in enabled else {}
+    hf   = discover_hf_models(config, port_counter)   if ENGINE_HF in enabled else {}
 
     # TRT-LLM gets a separate range starting 200 above GGUF/HF
     trt_port_counter = [config.discovery.port_start + 200]
-    trt  = discover_trtllm_engines(config, trt_port_counter)
+    trt  = discover_trtllm_engines(config, trt_port_counter) if ENGINE_TRTLLM in enabled or ENGINE_TRTLLM_DOCKER in enabled else {}
 
     # ── Merge: manual wins on slug or path collision ──────────
     manual_paths = {v.get("model", "")     for v in registry.values()}
