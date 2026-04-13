@@ -283,14 +283,22 @@ async def _run_tg(base: str, thinking_mode: str = "no_think", timeout: int = 300
                         continue
                     try:
                         chunk = json.loads(line[5:])
-                        delta = chunk["choices"][0]["delta"].get("content", "")
-                        if delta:
+                        delta = chunk["choices"][0]["delta"]
+                        # Count ANY generated token — content, reasoning_content,
+                        # or thinking.  For benchmarking we only care about speed,
+                        # not which field the model writes to.
+                        text = (
+                            delta.get("content", "")
+                            or delta.get("reasoning_content", "")
+                        )
+                        if text:
                             if ttft_s is None:
                                 ttft_s = time.perf_counter() - t0
                             token_count += 1
                             if token_count >= _TG_ENOUGH_TOKENS:
                                 break
-                    except Exception:
+                    except Exception as exc:
+                        logger.debug("TG chunk parse error: %s — line: %s", exc, line[:120])
                         continue
     except (httpx.TimeoutException, httpx.ReadTimeout):
         if token_count >= _TG_MIN_TOKENS:
