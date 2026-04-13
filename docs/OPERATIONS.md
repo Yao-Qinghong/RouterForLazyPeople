@@ -44,13 +44,25 @@ DGX Spark safety: `python cli.py bench` measures currently running backends by d
 
 - Supported platforms: Linux and macOS
 - Windows: not currently supported or tested
-- Supported backend engines:
-  - llama.cpp
+- Default engine: **llama.cpp** (the only engine enabled out of the box)
+- Additional engines (require `engines_enabled` in `settings.yaml`):
   - vLLM
   - SGLang
   - TensorRT-LLM
   - HuggingFace TGI / transformers wrapper
   - Ollama
+
+### Enabling Additional Engines
+
+Add the engine name to `engines_enabled` in `config/settings.yaml`:
+
+```yaml
+engines_enabled:
+  - "llama.cpp"
+  - "vllm"
+```
+
+Then call `/rescan` or restart the router. Engines not listed are ignored — their binaries are not probed, their models are not discovered, and they cannot be started.
 
 ## Startup And Shutdown
 

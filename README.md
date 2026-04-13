@@ -23,7 +23,7 @@ Your App (OpenAI / Anthropic SDK / OpenClaw / Open WebUI)
 
 - **Lazy loading** — models start on first request, stop automatically after idle
 - **Smart routing** — keyword + token-count classifier picks fast / mid / deep tier
-- **Multi-engine** — llama.cpp, vLLM, SGLang, TensorRT-LLM, managed Docker TensorRT-LLM fallback, HuggingFace TGI
+- **Multi-engine** — llama.cpp by default; vLLM, SGLang, TensorRT-LLM, HuggingFace TGI available via `engines_enabled` in `settings.yaml`
 - **Auto-discovery** — scans your model directories and registers GGUF / HF / TRT-LLM models automatically
 - **OpenAI-compatible** — drop-in for any OpenAI SDK client, Open WebUI, OpenClaw, Cursor, Continue, Jan
 - **Anthropic-compatible** — drop-in for Anthropic SDK, Claude Code, `@anthropic-ai/sdk`
@@ -132,10 +132,18 @@ Commented examples for vLLM, SGLang, HuggingFace TGI, local TensorRT-LLM, and ma
 
 ### `config/settings.yaml` — router behaviour
 
-Ports, log rotation, model scan directories, routing keywords, tier thresholds, proxy concurrency, and managed Docker TRT-LLM defaults are all editable without touching Python code.
+Controls which engines are active (`engines_enabled`, defaults to `llama.cpp` only), ports, log rotation, model scan directories, routing keywords, tier thresholds, proxy concurrency, and managed Docker TRT-LLM defaults — all editable without touching Python code.
 
 It also contains optional auth, CORS, audit logging, model aliases, and preload settings.
 The `rate_limit` section is reserved for future use and is not enforced by the router yet.
+
+To enable additional engines, add them to `engines_enabled` and `/rescan`:
+
+```yaml
+engines_enabled:
+  - "llama.cpp"
+  - "vllm"       # uncomment to enable vLLM
+```
 
 ---
 
@@ -351,17 +359,18 @@ If you need throttling today, put the router behind a reverse proxy or API gatew
 
 ## Supported Engines
 
-| Engine | Format | Notes |
-|---|---|---|
-| **llama.cpp** | GGUF | Best for single-GPU, recommended for most users |
-| **vLLM** | HuggingFace | High throughput, needs CUDA 12.1+ |
-| **SGLang** | HuggingFace | Fast structured generation, needs CUDA 12.1+ |
-| **TensorRT-LLM** | TRT engines | Maximum speed on NVIDIA hardware, needs CUDA 12.2+ |
-| **TensorRT-LLM (Docker fallback)** | HuggingFace / NVFP4 | Router-managed Docker fallback for NVIDIA NVFP4 checkpoints when local `tensorrt_llm` is not installed |
-| **HuggingFace TGI** | HuggingFace | Broad model support |
+By default, only **llama.cpp** is enabled. Other engines can be activated by adding them to `engines_enabled` in `config/settings.yaml`.
 
-TensorRT-LLM backends include an **auto-tuner** that searches for the largest context window that fits in GPU memory — no manual config needed.
-For HF NVFP4 checkpoints, the router now prefers local `trt-llm` first, then a managed Docker TRT-LLM fallback, before falling back to generic HF engines.
+| Engine | Format | Default | Notes |
+|---|---|---|---|
+| **llama.cpp** | GGUF | **enabled** | Best for single-GPU, recommended for most users |
+| **vLLM** | HuggingFace | disabled | High throughput, needs CUDA 12.1+ |
+| **SGLang** | HuggingFace | disabled | Fast structured generation, needs CUDA 12.1+ |
+| **TensorRT-LLM** | TRT engines | disabled | Maximum speed on NVIDIA hardware, needs CUDA 12.2+ |
+| **TensorRT-LLM (Docker)** | HuggingFace / NVFP4 | disabled | Managed Docker fallback for NVFP4 checkpoints |
+| **HuggingFace TGI** | HuggingFace | disabled | Broad model support |
+
+Disabled engines are not detected, their models are not discovered, and they cannot be started — even if their binaries are installed. This keeps the router focused and avoids accidental resource use.
 
 ---
 
@@ -406,7 +415,7 @@ The router scans these directories at startup (configurable in `settings.yaml`):
 - `~/.cache/huggingface/hub`
 - `~/trt-engines`
 
-Any `.gguf` file, HuggingFace checkpoint, or TRT-LLM engine directory found is registered automatically with size-based tier assignment.
+Any `.gguf` file found is registered automatically with size-based tier assignment. HuggingFace and TRT-LLM discovery only runs when those engines are listed in `engines_enabled`.
 
 To add a new model without restarting:
 ```bash
@@ -449,22 +458,26 @@ Python dependencies are **pinned** in `requirements.txt` for stability. Update t
 ```
 RouterForLazyPeople/
 ├── config/
-│   ├── settings.yaml       # all tunable settings
+│   ├── settings.yaml       # all tunable settings (engines_enabled, routing, etc.)
 │   └── backends.yaml       # your model definitions
 ├── router/
 │   ├── main.py             # FastAPI app, all routes
-│   ├── config.py           # YAML loader
-│   ├── registry.py         # backend registry builder
+│   ├── config.py           # YAML loader + AppConfig dataclasses
+│   ├── registry.py         # backend registry builder (respects engines_enabled)
 │   ├── discovery.py        # auto-discovery (GGUF, HF, TRT)
-│   ├── engines.py          # engine detection + command builders
+│   ├── engines.py          # engine detection + command builders + allowlist gate
 │   ├── routing.py          # request classifier
 │   ├── lifecycle.py        # BackendManager (start/stop/watchdog)
-│   ├── proxy.py            # OpenAI + Anthropic proxy handlers
+│   ├── proxy.py            # request proxy (OpenAI, Anthropic, Gemini)
 │   ├── anthropic_compat.py # Anthropic ↔ OpenAI translation
-│   ├── metrics.py          # benchmarking (TTFT, latency, tok/s)
+│   ├── gemini_compat.py    # Gemini ↔ OpenAI translation
+│   ├── benchmark.py        # active PP/TG speed measurement
+│   ├── metrics.py          # request metrics (TTFT, latency, tok/s)
+│   ├── auth.py             # API key middleware
 │   ├── sysinfo.py          # hardware + engine detection
 │   └── trt_tuner.py        # TRT-LLM memory auto-tuner
 ├── cli.py                  # command-line interface
+├── router-start            # shell launcher (venv-aware)
 └── requirements.txt        # pinned dependencies
 ```
 

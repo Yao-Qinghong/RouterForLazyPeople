@@ -84,7 +84,7 @@ Benchmark data is injected at startup via `set_benchmark_results(load_all_result
 
 ### Configuration (no Python editing for operators)
 
-- **`config/settings.yaml`** — all tunable knobs: host/port, logging, llama_bin, scan_dirs, routing thresholds, keywords, timeouts, proxy settings, metrics, model_aliases, preload list, auth, CORS, rate limiting.
+- **`config/settings.yaml`** — all tunable knobs: `engines_enabled` (default: `["llama.cpp"]`), host/port, logging, llama_bin, scan_dirs, routing thresholds, keywords, timeouts, proxy settings, metrics, model_aliases, preload list, auth, CORS, rate limiting.
 - **`config/backends.yaml`** — manual backend definitions (slug → port, model path, engine, tier, idle_timeout, etc.). Empty by default; auto-discovery handles fresh installs.
 
 `router/config.py` loads both files into `AppConfig` dataclasses. Search order for settings.yaml: CLI arg → `$LLM_ROUTER_CONFIG` → `./config/settings.yaml` → `~/.llm-router/settings.yaml`.
@@ -98,6 +98,9 @@ All modules accept `config: AppConfig` as a parameter — no globals. The config
 `BackendManager` manages subprocesses for inference servers:
 - **Lazy start**: `ensure_running(key)` is called on every request; if the process isn't running, it spawns it and polls `/health` until ready or `startup_wait` expires.
 - **Per-backend asyncio.Lock** prevents duplicate starts from concurrent requests.
+- **Registry lock**: `update_registry()` is async and acquires `_registry_lock` so `/rescan` doesn't race with in-flight requests.
+- **Backend snapshotting**: `snapshot_backends()` returns the current dict reference. Proxy handlers call it once at request start for a consistent view across `await` points.
+- **Log handle safety**: `_close_log(key)` is called on every failure path and inside `_open_log()` before reopening, preventing file descriptor leaks during retries.
 - **Idle eviction**: `idle_watchdog()` runs every 30s and calls `stop(key)` for backends silent longer than `idle_timeout`.
 - **External servers** (LM Studio, custom OpenAI-compatible): uses `_ExternalSentinel` instead of `Popen`; `poll()` pings `/v1/models` to test liveness; `kill()`/`terminate()` are no-ops (we don't own them).
 - **Ollama**: uses `_OllamaSentinel`; `poll()` pings the Ollama HTTP API.

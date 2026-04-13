@@ -8,9 +8,9 @@ It describes module responsibilities, startup flow, routing flow, and configurat
 - `router/main.py`: FastAPI app factory, lifespan wiring, middleware registration, route registration, and global error handling
 - `router/config.py`: typed config loading, path expansion, and config-file resolution
 - `router/registry.py`: merges manual backends with auto-discovered backends and user overrides
-- `router/discovery.py`: scans GGUF, HuggingFace, and TRT-LLM sources and assigns inferred metadata
-- `router/lifecycle.py`: backend process lifecycle, health checks, preload, restart, idle eviction
-- `router/proxy.py`: OpenAI proxying, retries, backpressure, audit logging, and metrics recording
+- `router/discovery.py`: scans GGUF, HuggingFace, and TRT-LLM sources and assigns inferred metadata (gated by `engines_enabled`)
+- `router/lifecycle.py`: backend process lifecycle, health checks, preload, restart, idle eviction, and registry-safe snapshotting
+- `router/proxy.py`: OpenAI proxying, retries, backpressure, audit logging, and metrics recording (snapshots backends at request start for race safety)
 - `router/anthropic_compat.py`: Anthropic-to-OpenAI translation and reverse response adaptation
 - `router/gemini_compat.py`: Gemini-to-OpenAI translation and reverse response adaptation
 - `router/metrics.py`: in-memory request ring buffer plus persisted metrics history
@@ -40,6 +40,13 @@ It describes module responsibilities, startup flow, routing flow, and configurat
 8. Metrics and optional audit events are recorded.
 9. Response adaptation runs for Anthropic and Gemini surfaces.
 
+## Engine Allowlist
+
+- `engines_enabled` in `settings.yaml` controls which engines are active (default: `["llama.cpp"]`).
+- `is_engine_available()` checks the allowlist before probing for binaries/modules.
+- Discovery functions in `registry.py` skip model scanning for disabled engines.
+- Disabled engines cannot be started even if their binaries are installed.
+
 ## Backend Lifecycle
 
 - Backends are started lazily on first use unless listed in `preload`.
@@ -48,6 +55,12 @@ It describes module responsibilities, startup flow, routing flow, and configurat
 - `restart()` performs stop, wait, and start through the same lifecycle path.
 - TRT-LLM start is special-cased through the tuner and can persist a working memory configuration.
 - Ollama backends are treated as an external managed server rather than a normal subprocess.
+
+## Concurrency Safety
+
+- `update_registry()` is async and acquires `_registry_lock` to prevent races during `/rescan`.
+- Proxy handlers call `snapshot_backends()` once at request start and use the returned dict reference for all routing and config lookups within that request. This ensures a consistent view even if `/rescan` swaps the registry concurrently.
+- Log file handles are closed via `_close_log()` on every failure path in `_start_process` and `_start_trtllm_docker_backend`, and in `_open_log()` before reopening (preventing leaks during TRT-LLM tuning retries).
 
 ## Config Precedence
 

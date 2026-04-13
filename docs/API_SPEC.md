@@ -100,6 +100,7 @@ Thinking / reasoning behavior:
 - `POST /reload-config` reloads mutable runtime settings only. It does not rebuild middleware or mutate already-running backend process flags in place.
 - `POST /rescan` preserves already-running processes while updating the backend registry.
 - `POST /rescan` also refreshes the cached benchmark data used by automatic routing.
+- `GET /engines` reports availability gated by `engines_enabled` in `settings.yaml`. An installed engine that is not listed in `engines_enabled` will show as unavailable.
 - `GET /benchmarks` returns cached active speed-test results. Request-traffic metrics stay under `/metrics`.
 - `POST /v1/{path}` is the generic catch-all for OpenAI-compatible inference paths not exposed as dedicated route helpers.
 - `GET /v1/models` includes configured aliases when they resolve to a registered backend.
