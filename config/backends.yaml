@@ -145,7 +145,7 @@ backends:
   nvidia-nemotron-3-super-120b-a12b-q4-k-m:
     engine: llama.cpp
     port: 8101
-    model: "~/.lmstudio/models/bartowski/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF/NVIDIA-Nemotron-3-Super-120B-A12B-Q4_K_M-00001-of-00003.gguf"
+    model: "~/.lmstudio/models/lmstudio-community/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF/NVIDIA-Nemotron-3-Super-120B-A12B-Q4_K_M-00001-of-00003.gguf"
     ctx_size: 131072
     gpu_layers: 999
     flash_attn: true
