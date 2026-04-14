@@ -146,7 +146,7 @@ backends:
     engine: llama.cpp
     port: 8101
     model: "~/.lmstudio/models/lmstudio-community/NVIDIA-Nemotron-3-Super-120B-A12B-GGUF/NVIDIA-Nemotron-3-Super-120B-A12B-Q4_K_M-00001-of-00003.gguf"
-    ctx_size: 131072
+    ctx_size: 32768           # 131072 OOMs — model is 80 GiB on 121 GiB GPU
     gpu_layers: 999
     flash_attn: true
     reasoning: true
