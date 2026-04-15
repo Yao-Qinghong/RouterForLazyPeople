@@ -283,8 +283,19 @@ def update_llama():
         shutil.copy2(llama_bin, binary_backup)
 
     try:
-        print("Pulling latest changes...")
-        subprocess.run(["git", "pull", "--ff-only", "--quiet"], cwd=llama_dir, check=True)
+        # Pin to latest tagged release instead of HEAD (avoids broken mid-release builds)
+        try:
+            subprocess.run(["git", "fetch", "--tags", "--quiet"], cwd=llama_dir, check=True)
+            latest_tag = subprocess.check_output(
+                ["git", "describe", "--tags", "--abbrev=0", "origin/master"],
+                cwd=llama_dir, text=True,
+            ).strip()
+            print(f"Checking out tagged release: {latest_tag}")
+            subprocess.run(["git", "checkout", "--quiet", latest_tag], cwd=llama_dir, check=True)
+        except subprocess.CalledProcessError:
+            # Fallback: if no tags or origin/master missing, pull normally
+            print("No tagged release found — pulling latest changes...")
+            subprocess.run(["git", "pull", "--ff-only", "--quiet"], cwd=llama_dir, check=True)
 
         print(f"Rebuilding for {build_mode} (using {nproc} cores — this may take a few minutes)...")
         subprocess.run(

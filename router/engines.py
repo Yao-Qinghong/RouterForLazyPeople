@@ -116,6 +116,49 @@ def clear_engine_cache():
     _engine_available_cache.clear()
 
 
+# ─────────────────────────────────────────────────────────────
+# llama-server flag detection
+# ─────────────────────────────────────────────────────────────
+_llama_supported_flags: "set[str] | None" = None
+
+
+def _detect_llama_flags(llama_bin: str) -> set[str]:
+    """Detect supported flags by parsing ``llama-server --help`` output.  Cached."""
+    global _llama_supported_flags
+    if _llama_supported_flags is not None:
+        return _llama_supported_flags
+    try:
+        result = subprocess.run(
+            [str(llama_bin), "--help"],
+            capture_output=True, text=True, timeout=10,
+        )
+        help_text = result.stdout + result.stderr
+        flags: set[str] = set()
+        for line in help_text.splitlines():
+            line = line.strip()
+            if line.startswith("--"):
+                flag = line.split()[0].split("=")[0].split(",")[0]
+                flags.add(flag)
+            elif line.startswith("-") and " --" in line:
+                # Handle "-f, --flag" format
+                for part in line.split(","):
+                    part = part.strip()
+                    if part.startswith("--"):
+                        flag = part.split()[0].split("=")[0]
+                        flags.add(flag)
+        _llama_supported_flags = flags
+        return flags
+    except Exception:
+        _llama_supported_flags = set()
+        return set()
+
+
+def clear_llama_flag_cache():
+    """Clear the cached flag set (called from /rescan)."""
+    global _llama_supported_flags
+    _llama_supported_flags = None
+
+
 def _python_bin() -> str:
     """
     Use the same interpreter that launched the router so managed Python
@@ -171,17 +214,20 @@ def _append_cli_arg(parts: list[str], flag: str, value) -> None:
 # ─────────────────────────────────────────────────────────────
 
 def build_llama_cmd(cfg: dict, config: "AppConfig") -> list[str]:
+    supported = _detect_llama_flags(str(config.llama_bin))
     cmd = [
         str(config.llama_bin),
         "--model",        cfg["model"],
         "--ctx-size",     str(cfg.get("ctx_size", 32768)),
         "--n-gpu-layers", str(cfg.get("gpu_layers", 999)),
-        "--flash-attn",   "on" if cfg.get("flash_attn", True) else "off",
-        "--reasoning",    "on" if cfg.get("reasoning", False) else "off",
         "--host",         "0.0.0.0",
         "--port",         str(cfg["port"]),
     ]
-    if cfg.get("reasoning_budget"):
+    if "--flash-attn" in supported:
+        cmd += ["--flash-attn", "on" if cfg.get("flash_attn", True) else "off"]
+    if "--reasoning" in supported:
+        cmd += ["--reasoning", "on" if cfg.get("reasoning", False) else "off"]
+    if "--reasoning-budget" in supported and cfg.get("reasoning_budget"):
         cmd += ["--reasoning-budget", str(cfg["reasoning_budget"])]
     return cmd
 
@@ -367,12 +413,16 @@ def build_ollama_cmd(cfg: dict, config: "AppConfig" = None) -> list[str]:
 
 
 def health_url(cfg: dict) -> str:
-    """Return the health-check URL for a backend config."""
+    """Return the health-check URL for a backend config.
+
+    Delegates to the provider registry when available, falls back
+    to the default /health endpoint.
+    """
+    from router.provider import get_provider
     engine = cfg.get("engine", ENGINE_LLAMA)
-    if engine == ENGINE_OLLAMA:
-        return f"http://localhost:{cfg['port']}/api/tags"
-    if engine in (ENGINE_OPENAI, ENGINE_TRTLLM_DOCKER):
-        return f"http://localhost:{cfg['port']}/v1/models"
+    provider = get_provider(engine)
+    if provider:
+        return provider.health_url(cfg)
     return f"http://localhost:{cfg['port']}/health"
 
 

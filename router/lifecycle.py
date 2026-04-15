@@ -14,6 +14,7 @@ import signal
 import socket
 import subprocess
 import time
+from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING
 
 import httpx
@@ -48,9 +49,36 @@ class BackendManager:
         self.processes: dict[str, subprocess.Popen] = {}
         self.log_handles: dict[str, object] = {}
         self.last_used: dict[str, float] = {}
+        self.active_requests: dict[str, int] = {}
         self.active_configs: dict[str, dict] = {}
+        self._unhealthy_until: dict[str, float] = {}
         self.starting: dict[str, asyncio.Lock] = {k: asyncio.Lock() for k in backends}
         self._registry_lock: asyncio.Lock | None = None
+
+    @asynccontextmanager
+    async def request_lease(self, key: str):
+        """Hold a lease on a backend for the duration of a request.
+
+        While at least one lease is held, idle_watchdog and _evict_for_vram
+        will skip the backend.  ``last_used`` is refreshed on both entry and
+        exit so that streaming requests keep the backend alive.
+        """
+        self.active_requests[key] = self.active_requests.get(key, 0) + 1
+        self.last_used[key] = time.time()
+        try:
+            yield
+        finally:
+            self.active_requests[key] = max(0, self.active_requests.get(key, 1) - 1)
+            self.last_used[key] = time.time()
+
+    def mark_unhealthy(self, key: str, duration_sec: float = 60):
+        """Mark a backend as transiently unhealthy for *duration_sec* seconds."""
+        self._unhealthy_until[key] = time.time() + duration_sec
+
+    def is_healthy(self, key: str) -> bool:
+        """Return False if the backend was recently marked unhealthy."""
+        deadline = self._unhealthy_until.get(key)
+        return deadline is None or time.time() > deadline
 
     async def update_registry(self, new_backends: dict):
         """
@@ -66,6 +94,8 @@ class BackendManager:
             for k in new_backends:
                 if k not in self.starting:
                     self.starting[k] = asyncio.Lock()
+                if k not in self.active_requests:
+                    self.active_requests[k] = 0
 
     def snapshot_backends(self) -> dict:
         """Return a reference to the current backends dict.
@@ -123,29 +153,14 @@ class BackendManager:
         return handle
 
     def _build_cmd(self, key: str, trt_config: dict | None = None) -> list[str]:
-        """Build the subprocess command for a backend."""
+        """Build the subprocess command for a backend via the provider registry."""
+        from router.provider import get_provider
         cfg = self.backends[key]
         engine = cfg.get("engine", ENGINE_LLAMA)
-
-        if engine == ENGINE_OPENAI:
-            raise ValueError(f"Engine 'openai' uses an external server — no command to build")
-
-        if engine == ENGINE_LLAMA:
-            return build_llama_cmd(cfg, self.config)
-        elif engine == "vllm":
-            return build_vllm_cmd(cfg)
-        elif engine == "sglang":
-            return build_sglang_cmd(cfg)
-        elif engine == ENGINE_TRTLLM:
-            return build_trtllm_cmd(cfg, trt_config or {})
-        elif engine == ENGINE_TRTLLM_DOCKER:
-            return build_trtllm_docker_cmd(key, cfg, self.config)
-        elif engine == "huggingface":
-            return build_hf_cmd(cfg)
-        elif engine == ENGINE_OLLAMA:
-            return build_ollama_cmd(cfg)
-        else:
+        provider = get_provider(engine)
+        if provider is None:
             raise ValueError(f"Unknown engine '{engine}' for backend '{key}'")
+        return provider.build_cmd(cfg, self.config, key=key, trt_config=trt_config or {})
 
     def _docker_config(self, key: str) -> dict:
         return resolve_trtllm_docker_config(key, self.backends[key], self.config)
@@ -460,6 +475,9 @@ class BackendManager:
         for _, k in running:
             if free_gb >= needed_gb:
                 return True
+            if self.active_requests.get(k, 0) > 0:
+                logger.debug(f"[{k}] Skipping eviction — {self.active_requests[k]} active request(s)")
+                continue
             proc = self.processes.get(k)
             if isinstance(proc, _ExternalSentinel):
                 logger.warning(
@@ -548,6 +566,11 @@ class BackendManager:
         self.last_used.pop(key, None)
         self.active_configs.pop(key, None)
         self._close_log(key)
+        # Evict pooled httpx client so next request gets a fresh connection
+        port = self.backends.get(key, {}).get("port")
+        if port:
+            from router.proxy import evict_client
+            evict_client(int(port))
 
     def _unload_ollama(self, key: str):
         """Tell Ollama to unload a model to free memory."""
@@ -606,6 +629,8 @@ class BackendManager:
             for key, cfg in list(self.backends.items()):
                 if not self.is_running(key):
                     continue
+                if self.active_requests.get(key, 0) > 0:
+                    continue
                 idle_for = now - self.last_used.get(key, now)
                 if idle_for > cfg["idle_timeout"]:
                     logger.info(f"[{key}] Idle for {idle_for:.0f}s — auto-stopping")
@@ -621,6 +646,8 @@ class BackendManager:
                     oldest_time = float('inf')
                     for key in self.backends:
                         if not self.is_running(key):
+                            continue
+                        if self.active_requests.get(key, 0) > 0:
                             continue
                         lu = self.last_used.get(key, 0)
                         if lu < oldest_time:
@@ -646,6 +673,7 @@ class BackendManager:
                 "port":            cfg["port"],
                 "idle_seconds":    idle,
                 "idle_timeout":    cfg["idle_timeout"],
+                "active_requests":  self.active_requests.get(key, 0),
                 "description":     cfg.get("description", key),
                 "auto_discovered": cfg.get("auto_discovered", False),
                 "tier":            cfg.get("tier"),

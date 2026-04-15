@@ -28,9 +28,14 @@ Anthropic model → backend mapping (override via ?backend= or [route:key]):
 """
 
 import json
+import logging
 import time
 import uuid
 from typing import AsyncIterator, Optional
+
+from router.sse import sse_events
+
+logger = logging.getLogger("llm-router.anthropic")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -381,102 +386,98 @@ def stream_openai_to_anthropic(original_model: str):
         # Accumulate tool call data for building complete blocks
         tool_calls_acc: dict[int, dict] = {}  # oai tool index → accumulated data
 
-        async for raw_chunk in openai_stream:
-            for line in raw_chunk.decode("utf-8", errors="replace").splitlines():
-                line = line.strip()
-                if not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    data = json.loads(data_str)
-                except Exception:
-                    continue
+        async for data_str in sse_events(openai_stream):
+            if data_str == "[DONE]":
+                break
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError as e:
+                logger.debug("Malformed SSE: %s: %s", data_str[:100], e)
+                continue
 
-                choices = data.get("choices", [])
-                if not choices:
-                    # Capture usage if provided outside choices
-                    if "usage" in data:
-                        u = data["usage"]
-                        input_tokens = u.get("prompt_tokens", input_tokens)
-                        output_tokens = u.get("completion_tokens", output_tokens)
-                    continue
-
-                delta = choices[0].get("delta", {})
-                finish = choices[0].get("finish_reason")
-
-                # Text content delta
-                text = delta.get("content", "")
-                if text:
-                    if not text_block_started:
-                        yield _sse({"type": "content_block_start", "index": next_block_index,
-                                    "content_block": {"type": "text", "text": ""}})
-                        yield _sse({"type": "ping"})
-                        text_block_started = True
-                        next_block_index += 1
-
-                    yield _sse({
-                        "type":  "content_block_delta",
-                        "index": 0,
-                        "delta": {"type": "text_delta", "text": text},
-                    })
-
-                # Tool calls delta
-                tool_calls = delta.get("tool_calls", [])
-                for tc in tool_calls:
-                    tc_index = tc.get("index", 0)
-                    func = tc.get("function", {})
-
-                    if tc_index not in tool_call_index_map:
-                        # Close text block if it was open and this is the first tool
-                        if text_block_started and not tool_call_index_map:
-                            yield _sse({"type": "content_block_stop", "index": 0})
-
-                        # Start a new tool_use content block
-                        block_idx = next_block_index
-                        tool_call_index_map[tc_index] = block_idx
-                        next_block_index += 1
-
-                        tool_id = tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}")
-                        tool_name = func.get("name", "")
-                        tool_calls_acc[tc_index] = {
-                            "id": tool_id, "name": tool_name, "arguments": ""
-                        }
-
-                        yield _sse({
-                            "type": "content_block_start",
-                            "index": block_idx,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": tool_id,
-                                "name": tool_name,
-                                "input": {},
-                            },
-                        })
-
-                    # Accumulate argument fragments
-                    arg_chunk = func.get("arguments", "")
-                    if arg_chunk:
-                        tool_calls_acc[tc_index]["arguments"] += arg_chunk
-                        block_idx = tool_call_index_map[tc_index]
-                        yield _sse({
-                            "type": "content_block_delta",
-                            "index": block_idx,
-                            "delta": {
-                                "type": "input_json_delta",
-                                "partial_json": arg_chunk,
-                            },
-                        })
-
-                if finish:
-                    stop_reason = _finish_to_stop_reason(finish)
-
-                # Capture usage if provided mid-stream
+            choices = data.get("choices", [])
+            if not choices:
+                # Capture usage if provided outside choices
                 if "usage" in data:
                     u = data["usage"]
-                    input_tokens  = u.get("prompt_tokens", input_tokens)
+                    input_tokens = u.get("prompt_tokens", input_tokens)
                     output_tokens = u.get("completion_tokens", output_tokens)
+                continue
+
+            delta = choices[0].get("delta", {})
+            finish = choices[0].get("finish_reason")
+
+            # Text content delta
+            text = delta.get("content", "")
+            if text:
+                if not text_block_started:
+                    yield _sse({"type": "content_block_start", "index": next_block_index,
+                                "content_block": {"type": "text", "text": ""}})
+                    yield _sse({"type": "ping"})
+                    text_block_started = True
+                    next_block_index += 1
+
+                yield _sse({
+                    "type":  "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": text},
+                })
+
+            # Tool calls delta
+            tool_calls = delta.get("tool_calls", [])
+            for tc in tool_calls:
+                tc_index = tc.get("index", 0)
+                func = tc.get("function", {})
+
+                if tc_index not in tool_call_index_map:
+                    # Close text block if it was open and this is the first tool
+                    if text_block_started and not tool_call_index_map:
+                        yield _sse({"type": "content_block_stop", "index": 0})
+
+                    # Start a new tool_use content block
+                    block_idx = next_block_index
+                    tool_call_index_map[tc_index] = block_idx
+                    next_block_index += 1
+
+                    tool_id = tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}")
+                    tool_name = func.get("name", "")
+                    tool_calls_acc[tc_index] = {
+                        "id": tool_id, "name": tool_name, "arguments": ""
+                    }
+
+                    yield _sse({
+                        "type": "content_block_start",
+                        "index": block_idx,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": tool_name,
+                            "input": {},
+                        },
+                    })
+
+                # Accumulate argument fragments
+                arg_chunk = func.get("arguments", "")
+                if arg_chunk:
+                    tool_calls_acc[tc_index]["arguments"] += arg_chunk
+                    block_idx = tool_call_index_map[tc_index]
+                    yield _sse({
+                        "type": "content_block_delta",
+                        "index": block_idx,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": arg_chunk,
+                        },
+                    })
+
+            if finish:
+                stop_reason = _finish_to_stop_reason(finish)
+
+            # Capture usage if provided mid-stream
+            if "usage" in data:
+                u = data["usage"]
+                input_tokens  = u.get("prompt_tokens", input_tokens)
+                output_tokens = u.get("completion_tokens", output_tokens)
 
         # Close any open content blocks
         if text_block_started and not tool_call_index_map:

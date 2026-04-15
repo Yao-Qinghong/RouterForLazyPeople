@@ -15,6 +15,7 @@ Forwards inference requests to the appropriate backend with:
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -28,7 +29,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from router.metrics import RequestRecord, MetricsStore, extract_token_counts
-from router.routing import classify
+from router.routing import classify_candidates
 
 if TYPE_CHECKING:
     from router.config import AppConfig
@@ -39,6 +40,44 @@ audit_logger = logging.getLogger("llm-router.audit")
 
 # Module-level semaphore — initialized by init_semaphore() at app startup
 _semaphore: asyncio.Semaphore | None = None
+
+# ─────────────────────────────────────────────────────────────
+# Shared httpx client pool — avoids per-request connection setup
+# ─────────────────────────────────────────────────────────────
+_clients: dict[int, httpx.AsyncClient] = {}
+
+
+def get_client(port: int, timeout: float) -> httpx.AsyncClient:
+    """Return a shared AsyncClient for a backend port, creating one if needed."""
+    client = _clients.get(port)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(timeout=timeout)
+        _clients[port] = client
+    return client
+
+
+def evict_client(port: int):
+    """Remove a client from the pool (sync-safe, for use in lifecycle.stop()).
+
+    The underlying connection is not explicitly closed — Python/httpx will
+    clean it up via GC.  The next get_client() call creates a fresh one.
+    """
+    _clients.pop(port, None)
+
+
+async def close_client(port: int):
+    """Close and remove the client for a specific port."""
+    client = _clients.pop(port, None)
+    if client and not client.is_closed:
+        await client.aclose()
+
+
+async def close_all_clients():
+    """Close all pooled clients (called at shutdown)."""
+    for client in _clients.values():
+        if hasattr(client, "is_closed") and not client.is_closed:
+            await client.aclose()
+    _clients.clear()
 
 _MODEL_MATCH_ENGINE_PRIORITY = {
     # Prefer already-running passthrough servers for exact model IDs so clients
@@ -220,8 +259,8 @@ async def handle_proxy(
         )
 
     # ── Determine backend ─────────────────────────────────────
-    # Priority: ?backend= param → model alias → model name IS a backend key → content classifier
-    backend_key = (
+    # Priority: ?backend= param → model alias → classifier candidates with fallback
+    explicit_key = (
         request.query_params.get("backend")
         or resolve_requested_model(
             payload.get("model", ""),
@@ -229,20 +268,28 @@ async def handle_proxy(
             config.model_aliases,
             manager,
         )
-        or classify(payload, backends, config)
     )
 
-    if backend_key not in backends:
+    if explicit_key:
+        candidates = [explicit_key]
+    else:
+        candidates = classify_candidates(
+            payload, backends, config, limit=3,
+            healthy_fn=manager.is_healthy,
+        )
+
+    # Validate at least first candidate exists
+    if not candidates or (len(candidates) == 1 and candidates[0] not in backends):
         return JSONResponse(
             status_code=400,
             content={
-                "error": f"Unknown backend '{backend_key}'",
+                "error": f"Unknown backend '{candidates[0] if candidates else ''}'",
                 "valid_backends": list(backends.keys()),
                 "request_id": request_id,
             },
         )
 
-    _audit_request(request_id, backend_key, path, payload, config, api_key_name)
+    _audit_request(request_id, candidates[0], path, payload, config, api_key_name)
 
     # ── Backpressure ──────────────────────────────────────────
     if _semaphore is None:
@@ -264,22 +311,36 @@ async def handle_proxy(
         )
 
     try:
-        # ── Start backend if needed ───────────────────────────
-        try:
-            await manager.ensure_running(backend_key)
-        except RuntimeError as e:
-            cfg = backends[backend_key]
+        # ── Try candidates with fallback ──────────────────────
+        last_error = None
+        backend_key = candidates[0]
+
+        for candidate in candidates:
+            if candidate not in backends:
+                continue
+            try:
+                await manager.ensure_running(candidate)
+                backend_key = candidate
+                last_error = None
+                break
+            except RuntimeError as e:
+                last_error = e
+                manager.mark_unhealthy(candidate)
+                logger.warning(f"[{candidate}] failed to start, trying next candidate: {e}")
+                continue
+
+        if last_error:
+            cfg = backends.get(backend_key, {})
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": str(e),
+                    "error": str(last_error),
                     "backend": backend_key,
                     "log": cfg.get("log", ""),
                     "request_id": request_id,
                 },
             )
 
-        manager.last_used[backend_key] = time.time()
         cfg = backends[backend_key]
         target_url = f"http://localhost:{cfg['port']}/v1/{path}"
         is_stream = payload.get("stream", False)
@@ -287,13 +348,14 @@ async def handle_proxy(
         if is_stream:
             return await _proxy_stream(
                 target_url, payload, path, backend_key, cfg,
-                start_time, request_id, metrics_store, config,
+                start_time, request_id, metrics_store, config, manager,
             )
         else:
-            return await _proxy_nonstream(
-                target_url, payload, path, backend_key, cfg,
-                start_time, request_id, metrics_store, config,
-            )
+            async with manager.request_lease(backend_key):
+                return await _proxy_nonstream(
+                    target_url, payload, path, backend_key, cfg,
+                    start_time, request_id, metrics_store, config,
+                )
 
     finally:
         _semaphore.release()
@@ -315,8 +377,8 @@ async def _proxy_nonstream(
 
     for attempt in range(max_retries + 1):
         try:
-            async with httpx.AsyncClient(timeout=config.proxy.timeout_sec) as client:
-                resp = await client.post(target_url, json=payload)
+            client = get_client(cfg["port"], config.proxy.timeout_sec)
+            resp = await client.post(target_url, json=payload)
 
             total_ms = (time.time() - start_time) * 1000
             status = resp.status_code
@@ -425,6 +487,7 @@ async def _proxy_stream(
     request_id: str,
     metrics_store: MetricsStore,
     config: "AppConfig",
+    manager: "BackendManager" = None,
 ) -> StreamingResponse:
     """Stream the response, capturing TTFT on the first chunk with improved token counting."""
 
@@ -432,73 +495,107 @@ async def _proxy_stream(
         ttft_ms = None
         completion_tokens = 0
         prompt_tokens = 0
+        actual_status = 200
+        _lease = manager.request_lease(backend_key) if manager else contextlib.nullcontext()
 
         try:
-            async with httpx.AsyncClient(timeout=config.proxy.timeout_sec) as client:
+            async with _lease:
+                client = get_client(cfg["port"], config.proxy.timeout_sec)
                 async with client.stream("POST", target_url, json=payload) as resp:
-                    async for chunk in resp.aiter_bytes():
-                        if chunk:
-                            if ttft_ms is None:
-                                ttft_ms = (time.time() - start_time) * 1000
+                        actual_status = resp.status_code
 
-                            # Parse SSE chunks for accurate token counting
-                            for line in chunk.decode("utf-8", errors="replace").splitlines():
-                                line = line.strip()
-                                if not line.startswith("data:"):
-                                    continue
-                                data_str = line[5:].strip()
-                                if data_str == "[DONE]":
-                                    continue
-                                try:
-                                    data = json.loads(data_str)
-                                    # Extract token counts from usage field if available
-                                    if "usage" in data:
-                                        u = data["usage"]
-                                        prompt_tokens = u.get("prompt_tokens", prompt_tokens)
-                                        completion_tokens = u.get("completion_tokens", completion_tokens)
-                                    # Count content delta tokens
-                                    choices = data.get("choices", [])
-                                    if choices:
-                                        delta = choices[0].get("delta", {})
-                                        text = delta.get("content", "")
-                                        if text:
-                                            # Rough: ~4 chars per token
-                                            completion_tokens += max(1, len(text) // 4)
-                                except Exception:
-                                    pass
+                        # Backend returned an error — emit SSE error event
+                        if actual_status >= 400:
+                            error_body = (await resp.aread()).decode("utf-8", errors="replace")[:500]
+                            logger.warning(f"[{backend_key}] backend returned {actual_status}: {error_body[:200]}")
+                            error_event = {"error": {
+                                "message": f"Backend '{backend_key}' returned {actual_status}",
+                                "type": "backend_error",
+                                "code": actual_status,
+                            }}
+                            yield f"data: {json.dumps(error_event)}\n\ndata: [DONE]\n\n".encode()
+                            total_ms = (time.time() - start_time) * 1000
+                            metrics_store.record(RequestRecord(
+                                request_id=request_id,
+                                timestamp_utc=datetime.now(timezone.utc).isoformat(),
+                                backend_key=backend_key,
+                                engine=cfg.get("engine", ""),
+                                model_path=cfg.get("model", cfg.get("model_dir", "")),
+                                endpoint=path,
+                                prompt_tokens=0, completion_tokens=0,
+                                ttft_ms=total_ms, total_latency_ms=total_ms,
+                                tokens_per_sec=0.0,
+                                status_code=actual_status,
+                                error=error_body[:200],
+                            ))
+                            return
 
-                            yield chunk
+                        _metrics_buf = ""
+                        async for chunk in resp.aiter_bytes():
+                            if chunk:
+                                if ttft_ms is None:
+                                    ttft_ms = (time.time() - start_time) * 1000
 
-            total_ms = (time.time() - start_time) * 1000
-            tps = (completion_tokens / (total_ms / 1000)) if total_ms > 0 and completion_tokens > 0 else 0.0
+                                # Buffer decoded text for line-safe SSE metrics parsing
+                                _metrics_buf += chunk.decode("utf-8", errors="replace")
+                                while "\n" in _metrics_buf:
+                                    line, _metrics_buf = _metrics_buf.split("\n", 1)
+                                    line = line.strip()
+                                    if not line.startswith("data:"):
+                                        continue
+                                    data_str = line[5:].strip()
+                                    if not data_str or data_str == "[DONE]":
+                                        continue
+                                    try:
+                                        data = json.loads(data_str)
+                                        if "usage" in data:
+                                            u = data["usage"]
+                                            prompt_tokens = u.get("prompt_tokens", prompt_tokens)
+                                            completion_tokens = u.get("completion_tokens", completion_tokens)
+                                        choices = data.get("choices", [])
+                                        if choices:
+                                            delta = choices[0].get("delta", {})
+                                            text = delta.get("content", "")
+                                            if text:
+                                                completion_tokens += max(1, len(text) // 4)
+                                    except json.JSONDecodeError:
+                                        pass
 
-            metrics_store.record(RequestRecord(
-                request_id=request_id,
-                timestamp_utc=datetime.now(timezone.utc).isoformat(),
-                backend_key=backend_key,
-                engine=cfg.get("engine", ""),
-                model_path=cfg.get("model", cfg.get("model_dir", "")),
-                endpoint=path,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                ttft_ms=ttft_ms or total_ms,
-                total_latency_ms=total_ms,
-                tokens_per_sec=round(tps, 2),
-                status_code=200,
-                error=None,
-            ))
+                                yield chunk
 
-            _audit_response(request_id, 200, total_ms,
-                           {"prompt": prompt_tokens, "completion": completion_tokens}, config)
+                total_ms = (time.time() - start_time) * 1000
+                tps = (completion_tokens / (total_ms / 1000)) if total_ms > 0 and completion_tokens > 0 else 0.0
 
-            logger.info(
-                f"[{backend_key}] streaming /{path} done "
-                f"(TTFT={ttft_ms:.0f}ms, total={total_ms:.0f}ms, ~{completion_tokens} tokens)"
-            )
+                metrics_store.record(RequestRecord(
+                    request_id=request_id,
+                    timestamp_utc=datetime.now(timezone.utc).isoformat(),
+                    backend_key=backend_key,
+                    engine=cfg.get("engine", ""),
+                    model_path=cfg.get("model", cfg.get("model_dir", "")),
+                    endpoint=path,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    ttft_ms=ttft_ms or total_ms,
+                    total_latency_ms=total_ms,
+                    tokens_per_sec=round(tps, 2),
+                    status_code=actual_status,
+                    error=None,
+                ))
+
+                _audit_response(request_id, actual_status, total_ms,
+                               {"prompt": prompt_tokens, "completion": completion_tokens}, config)
+
+                logger.info(
+                    f"[{backend_key}] streaming /{path} done "
+                    f"(TTFT={ttft_ms:.0f}ms, total={total_ms:.0f}ms, ~{completion_tokens} tokens)"
+                )
 
         except Exception as e:
             logger.warning(f"[{backend_key}] stream error: {e}")
             total_ms = (time.time() - start_time) * 1000
+            # Emit SSE error event so clients see the failure
+            error_event = {"error": {"message": str(e), "type": "stream_error"}}
+            yield f"data: {json.dumps(error_event)}\n\ndata: [DONE]\n\n".encode()
             metrics_store.record(RequestRecord(
                 request_id=request_id,
                 timestamp_utc=datetime.now(timezone.utc).isoformat(),
@@ -558,25 +655,28 @@ async def handle_anthropic_proxy(
     original_model = payload.get("model", "claude-3-5-sonnet-20241022")
     is_stream      = payload.get("stream", False)
 
-    # ── Determine backend ─────────────────────────────────────
-    backend_key = request.query_params.get("backend")
-    if not backend_key:
-        backend_key = resolve_requested_model(
+    # ── Determine backend candidates ─────────────────────────
+    explicit_key = request.query_params.get("backend")
+    if not explicit_key:
+        explicit_key = resolve_requested_model(
             original_model,
             backends,
             config.model_aliases,
             manager,
         )
-    if not backend_key:
-        # Try model name → tier mapping
-        backend_key = model_to_backend(original_model)
-        # Fall back to keyword classifier on the translated messages
-        if not backend_key or backend_key not in backends:
-            oai_for_classify = anthropic_to_openai(payload)
-            from router.routing import classify
-            backend_key = classify(oai_for_classify, backends, config)
+    if not explicit_key:
+        explicit_key = model_to_backend(original_model)
 
-    if backend_key not in backends:
+    if explicit_key and explicit_key in backends:
+        candidates = [explicit_key]
+    else:
+        oai_for_classify = anthropic_to_openai(payload)
+        candidates = classify_candidates(
+            oai_for_classify, backends, config, limit=3,
+            healthy_fn=manager.is_healthy,
+        )
+
+    if not candidates or not any(c in backends for c in candidates):
         return JSONResponse(
             status_code=400,
             content={"type": "error", "error": {
@@ -585,8 +685,6 @@ async def handle_anthropic_proxy(
                            f"Valid backends: {list(backends.keys())}",
             }},
         )
-
-    _audit_request(request_id, backend_key, "anthropic/messages", payload, config, api_key_name)
 
     # ── Backpressure ──────────────────────────────────────────
     if _semaphore is None:
@@ -607,20 +705,33 @@ async def handle_anthropic_proxy(
         )
 
     try:
-        # ── Start backend ─────────────────────────────────────
-        try:
-            await manager.ensure_running(backend_key)
-        except RuntimeError as e:
-            cfg = backends[backend_key]
+        # ── Start backend with fallback ───────────────────────
+        backend_key = None
+        last_error = None
+        for candidate in candidates:
+            if candidate not in backends:
+                continue
+            try:
+                await manager.ensure_running(candidate)
+                backend_key = candidate
+                last_error = None
+                break
+            except RuntimeError as e:
+                last_error = e
+                manager.mark_unhealthy(candidate)
+                logger.warning(f"[{candidate}] anthropic startup failed, trying next: {e}")
+                continue
+
+        if backend_key is None:
             return JSONResponse(
                 status_code=503,
                 content={"type": "error", "error": {
                     "type": "api_error",
-                    "message": str(e),
-                }, "log": cfg.get("log", "")},
+                    "message": str(last_error) if last_error else "All backends failed to start",
+                }},
             )
 
-        manager.last_used[backend_key] = time.time()
+        _audit_request(request_id, backend_key, "anthropic/messages", payload, config, api_key_name)
         cfg        = backends[backend_key]
         oai_payload = anthropic_to_openai(payload)
         target_url  = f"http://localhost:{cfg['port']}/v1/chat/completions"
@@ -631,48 +742,73 @@ async def handle_anthropic_proxy(
             async def anthropic_stream() -> AsyncIterator[bytes]:
                 ttft_ms = None
                 completion_tokens = 0
+                actual_status = 200
                 try:
-                    async with httpx.AsyncClient(timeout=config.proxy.timeout_sec) as client:
+                    async with manager.request_lease(backend_key):
+                        client = get_client(cfg["port"], config.proxy.timeout_sec)
                         async with client.stream("POST", target_url, json=oai_payload) as resp:
-                            raw_stream = resp.aiter_bytes()
-                            async for chunk in converter(raw_stream):
-                                if ttft_ms is None and chunk:
-                                    ttft_ms = (time.time() - start_time) * 1000
-                                # Count tokens from the Anthropic SSE chunks
-                                try:
-                                    for line in chunk.decode("utf-8", errors="replace").splitlines():
-                                        if not line.startswith("data:"):
-                                            continue
-                                        data = json.loads(line[5:].strip())
-                                        if data.get("type") == "content_block_delta":
-                                            delta = data.get("delta", {})
-                                            text = delta.get("text", "")
-                                            if text:
-                                                completion_tokens += max(1, len(text) // 4)
-                                        elif data.get("type") == "message_delta":
-                                            u = data.get("usage", {})
-                                            if u.get("output_tokens"):
-                                                completion_tokens = u["output_tokens"]
-                                except Exception:
-                                    pass
-                                yield chunk
-                    total_ms = (time.time() - start_time) * 1000
-                    tps = (completion_tokens / (total_ms / 1000)) if total_ms > 0 and completion_tokens > 0 else 0.0
-                    metrics_store.record(RequestRecord(
-                        request_id=request_id,
-                        timestamp_utc=datetime.now(timezone.utc).isoformat(),
-                        backend_key=backend_key, engine=cfg.get("engine", ""),
-                        model_path=cfg.get("model", cfg.get("model_dir", "")),
-                        endpoint="anthropic/messages",
-                        prompt_tokens=0, completion_tokens=completion_tokens,
-                        ttft_ms=ttft_ms or total_ms, total_latency_ms=total_ms,
-                        tokens_per_sec=round(tps, 2), status_code=200, error=None,
-                    ))
-                    _audit_response(request_id, 200, total_ms,
-                                   {"prompt": 0, "completion": completion_tokens}, config)
-                    logger.info(f"[{backend_key}] anthropic stream done ({total_ms:.0f}ms, ~{completion_tokens} tokens)")
+                                actual_status = resp.status_code
+                                if actual_status >= 400:
+                                    error_body = (await resp.aread()).decode("utf-8", errors="replace")[:500]
+                                    logger.warning(f"[{backend_key}] anthropic backend returned {actual_status}")
+                                    err = {"type": "error", "error": {
+                                        "type": "api_error",
+                                        "message": f"Backend returned {actual_status}: {error_body[:200]}",
+                                    }}
+                                    yield f"event: error\ndata: {json.dumps(err)}\n\n".encode()
+                                    total_ms = (time.time() - start_time) * 1000
+                                    metrics_store.record(RequestRecord(
+                                        request_id=request_id,
+                                        timestamp_utc=datetime.now(timezone.utc).isoformat(),
+                                        backend_key=backend_key, engine=cfg.get("engine", ""),
+                                        model_path=cfg.get("model", cfg.get("model_dir", "")),
+                                        endpoint="anthropic/messages",
+                                        prompt_tokens=0, completion_tokens=0,
+                                        ttft_ms=total_ms, total_latency_ms=total_ms,
+                                        tokens_per_sec=0.0, status_code=actual_status,
+                                        error=error_body[:200],
+                                    ))
+                                    return
+                                raw_stream = resp.aiter_bytes()
+                                async for chunk in converter(raw_stream):
+                                    if ttft_ms is None and chunk:
+                                        ttft_ms = (time.time() - start_time) * 1000
+                                    try:
+                                        for line in chunk.decode("utf-8", errors="replace").splitlines():
+                                            if not line.startswith("data:"):
+                                                continue
+                                            data = json.loads(line[5:].strip())
+                                            if data.get("type") == "content_block_delta":
+                                                delta = data.get("delta", {})
+                                                text = delta.get("text", "")
+                                                if text:
+                                                    completion_tokens += max(1, len(text) // 4)
+                                            elif data.get("type") == "message_delta":
+                                                u = data.get("usage", {})
+                                                if u.get("output_tokens"):
+                                                    completion_tokens = u["output_tokens"]
+                                    except Exception:
+                                        pass
+                                    yield chunk
+                        total_ms = (time.time() - start_time) * 1000
+                        tps = (completion_tokens / (total_ms / 1000)) if total_ms > 0 and completion_tokens > 0 else 0.0
+                        metrics_store.record(RequestRecord(
+                            request_id=request_id,
+                            timestamp_utc=datetime.now(timezone.utc).isoformat(),
+                            backend_key=backend_key, engine=cfg.get("engine", ""),
+                            model_path=cfg.get("model", cfg.get("model_dir", "")),
+                            endpoint="anthropic/messages",
+                            prompt_tokens=0, completion_tokens=completion_tokens,
+                            ttft_ms=ttft_ms or total_ms, total_latency_ms=total_ms,
+                            tokens_per_sec=round(tps, 2), status_code=actual_status, error=None,
+                        ))
+                        _audit_response(request_id, actual_status, total_ms,
+                                       {"prompt": 0, "completion": completion_tokens}, config)
+                        logger.info(f"[{backend_key}] anthropic stream done ({total_ms:.0f}ms, ~{completion_tokens} tokens)")
                 except Exception as e:
                     logger.warning(f"[{backend_key}] anthropic stream error: {e}")
+                    err = {"type": "error", "error": {"type": "stream_error", "message": str(e)}}
+                    yield f"event: error\ndata: {json.dumps(err)}\n\n".encode()
 
             return StreamingResponse(
                 anthropic_stream(),
@@ -681,74 +817,75 @@ async def handle_anthropic_proxy(
             )
 
         else:
-            # Non-streaming with retry support
-            max_retries = config.proxy.retry_attempts
-            oai_body = {}
-            resp_status = 500
+            async with manager.request_lease(backend_key):
+                # Non-streaming with retry support
+                max_retries = config.proxy.retry_attempts
+                oai_body = {}
+                resp_status = 500
 
-            for attempt in range(max_retries + 1):
-                try:
-                    async with httpx.AsyncClient(timeout=config.proxy.timeout_sec) as client:
-                        resp = await client.post(target_url, json=oai_payload)
-                    resp_status = resp.status_code
-
-                    if resp_status in config.proxy.retry_on_status and attempt < max_retries:
-                        logger.warning(
-                            f"[{backend_key}] anthropic → {resp_status} (attempt {attempt + 1}), retrying"
-                        )
-                        await asyncio.sleep(config.proxy.retry_backoff_sec * (attempt + 1))
-                        continue
-
+                for attempt in range(max_retries + 1):
                     try:
-                        oai_body = resp.json()
-                    except Exception:
-                        oai_body = {}
-                    break
+                        client = get_client(cfg["port"], config.proxy.timeout_sec)
+                        resp = await client.post(target_url, json=oai_payload)
+                        resp_status = resp.status_code
 
-                except httpx.ConnectError as e:
-                    if attempt < max_retries:
-                        await asyncio.sleep(config.proxy.retry_backoff_sec * (attempt + 1))
-                        continue
-                    raise
-                except httpx.TimeoutException:
-                    total_ms = (time.time() - start_time) * 1000
-                    return JSONResponse(
-                        status_code=504,
-                        content={"type": "error", "error": {
-                            "type": "timeout_error",
-                            "message": f"Backend timed out after {config.proxy.timeout_sec}s",
-                        }},
-                        headers={"anthropic-version": "2023-06-01"},
-                    )
+                        if resp_status in config.proxy.retry_on_status and attempt < max_retries:
+                            logger.warning(
+                                f"[{backend_key}] anthropic → {resp_status} (attempt {attempt + 1}), retrying"
+                            )
+                            await asyncio.sleep(config.proxy.retry_backoff_sec * (attempt + 1))
+                            continue
 
-            total_ms = (time.time() - start_time) * 1000
+                        try:
+                            oai_body = resp.json()
+                        except Exception:
+                            oai_body = {}
+                        break
 
-            anthropic_body = openai_to_anthropic(oai_body, original_model)
-            prompt_tokens  = anthropic_body["usage"]["input_tokens"]
-            comp_tokens    = anthropic_body["usage"]["output_tokens"]
-            tps = (comp_tokens / (total_ms / 1000)) if total_ms > 0 else 0.0
+                    except httpx.ConnectError as e:
+                        if attempt < max_retries:
+                            await asyncio.sleep(config.proxy.retry_backoff_sec * (attempt + 1))
+                            continue
+                        raise
+                    except httpx.TimeoutException:
+                        total_ms = (time.time() - start_time) * 1000
+                        return JSONResponse(
+                            status_code=504,
+                            content={"type": "error", "error": {
+                                "type": "timeout_error",
+                                "message": f"Backend timed out after {config.proxy.timeout_sec}s",
+                            }},
+                            headers={"anthropic-version": "2023-06-01"},
+                        )
 
-            metrics_store.record(RequestRecord(
-                request_id=request_id,
-                timestamp_utc=datetime.now(timezone.utc).isoformat(),
-                backend_key=backend_key, engine=cfg.get("engine", ""),
-                model_path=cfg.get("model", cfg.get("model_dir", "")),
-                endpoint="anthropic/messages",
-                prompt_tokens=prompt_tokens, completion_tokens=comp_tokens,
-                ttft_ms=total_ms, total_latency_ms=total_ms,
-                tokens_per_sec=round(tps, 2),
-                status_code=resp_status, error=None,
-            ))
+                total_ms = (time.time() - start_time) * 1000
 
-            _audit_response(request_id, 200, total_ms,
-                           {"prompt": prompt_tokens, "completion": comp_tokens}, config)
+                anthropic_body = openai_to_anthropic(oai_body, original_model)
+                prompt_tokens  = anthropic_body["usage"]["input_tokens"]
+                comp_tokens    = anthropic_body["usage"]["output_tokens"]
+                tps = (comp_tokens / (total_ms / 1000)) if total_ms > 0 else 0.0
 
-            logger.info(f"[{backend_key}] anthropic /messages → {resp_status} ({total_ms:.0f}ms)")
-            return JSONResponse(
-                content=anthropic_body,
-                status_code=200,
-                headers={"anthropic-version": "2023-06-01"},
-            )
+                metrics_store.record(RequestRecord(
+                    request_id=request_id,
+                    timestamp_utc=datetime.now(timezone.utc).isoformat(),
+                    backend_key=backend_key, engine=cfg.get("engine", ""),
+                    model_path=cfg.get("model", cfg.get("model_dir", "")),
+                    endpoint="anthropic/messages",
+                    prompt_tokens=prompt_tokens, completion_tokens=comp_tokens,
+                    ttft_ms=total_ms, total_latency_ms=total_ms,
+                    tokens_per_sec=round(tps, 2),
+                    status_code=resp_status, error=None,
+                ))
+
+                _audit_response(request_id, resp_status, total_ms,
+                               {"prompt": prompt_tokens, "completion": comp_tokens}, config)
+
+                logger.info(f"[{backend_key}] anthropic /messages → {resp_status} ({total_ms:.0f}ms)")
+                return JSONResponse(
+                    content=anthropic_body,
+                    status_code=resp_status,
+                    headers={"anthropic-version": "2023-06-01"},
+                )
 
     finally:
         _semaphore.release()
@@ -784,17 +921,22 @@ async def handle_gemini_proxy(
     except Exception:
         return JSONResponse(status_code=400, content={"error": {"message": "Invalid JSON body"}})
 
-    # Determine backend
-    backend_key = (
+    # Determine backend candidates
+    explicit_key = (
         request.query_params.get("backend")
         or resolve_requested_model(model, backends, config.model_aliases, manager)
         or gemini_model_to_backend(model)
     )
-    if not backend_key or backend_key not in backends:
+    if explicit_key and explicit_key in backends:
+        candidates = [explicit_key]
+    else:
         oai_temp = gemini_to_openai(payload)
-        backend_key = classify(oai_temp, backends, config)
+        candidates = classify_candidates(
+            oai_temp, backends, config, limit=3,
+            healthy_fn=manager.is_healthy,
+        )
 
-    if backend_key not in backends:
+    if not candidates or not any(c in backends for c in candidates):
         return JSONResponse(status_code=400, content={
             "error": {"message": f"No backend for model '{model}'"}
         })
@@ -808,12 +950,27 @@ async def handle_gemini_proxy(
         return JSONResponse(status_code=503, content={"error": {"message": "Overloaded"}})
 
     try:
-        try:
-            await manager.ensure_running(backend_key)
-        except RuntimeError as e:
-            return JSONResponse(status_code=503, content={"error": {"message": str(e)}})
+        backend_key = None
+        last_error = None
+        for candidate in candidates:
+            if candidate not in backends:
+                continue
+            try:
+                await manager.ensure_running(candidate)
+                backend_key = candidate
+                last_error = None
+                break
+            except RuntimeError as e:
+                last_error = e
+                manager.mark_unhealthy(candidate)
+                logger.warning(f"[{candidate}] gemini startup failed, trying next: {e}")
+                continue
 
-        manager.last_used[backend_key] = time.time()
+        if backend_key is None:
+            return JSONResponse(status_code=503, content={
+                "error": {"message": str(last_error) if last_error else "All backends failed"}
+            })
+
         cfg = backends[backend_key]
         oai_payload = gemini_to_openai(payload, is_stream=is_stream)
         target_url = f"http://localhost:{cfg['port']}/v1/chat/completions"
@@ -823,25 +980,70 @@ async def handle_gemini_proxy(
 
             async def gemini_stream() -> AsyncIterator[bytes]:
                 try:
-                    async with httpx.AsyncClient(timeout=config.proxy.timeout_sec) as client:
+                    async with manager.request_lease(backend_key):
+                        client = get_client(cfg["port"], config.proxy.timeout_sec)
                         async with client.stream("POST", target_url, json=oai_payload) as resp:
-                            async for chunk in converter(resp.aiter_bytes()):
-                                yield chunk
+                                if resp.status_code >= 400:
+                                    error_body = (await resp.aread()).decode("utf-8", errors="replace")[:500]
+                                    logger.warning(f"[{backend_key}] gemini backend returned {resp.status_code}")
+                                    total_ms = (time.time() - start_time) * 1000
+                                    metrics_store.record(RequestRecord(
+                                        request_id=request_id,
+                                        timestamp_utc=datetime.now(timezone.utc).isoformat(),
+                                        backend_key=backend_key, engine=cfg.get("engine", ""),
+                                        model_path=cfg.get("model", cfg.get("model_dir", "")),
+                                        endpoint=f"gemini/{model}",
+                                        prompt_tokens=0, completion_tokens=0,
+                                        ttft_ms=total_ms, total_latency_ms=total_ms,
+                                        tokens_per_sec=0.0, status_code=resp.status_code,
+                                        error=error_body[:200],
+                                    ))
+                                    error_event = {"error": {
+                                        "code": resp.status_code,
+                                        "message": f"Backend '{backend_key}' returned {resp.status_code}",
+                                    }}
+                                    yield f"data: {json.dumps(error_event)}\n\n".encode()
+                                    return
+                                async for chunk in converter(resp.aiter_bytes()):
+                                    yield chunk
+                        total_ms = (time.time() - start_time) * 1000
+                        metrics_store.record(RequestRecord(
+                            request_id=request_id,
+                            timestamp_utc=datetime.now(timezone.utc).isoformat(),
+                            backend_key=backend_key, engine=cfg.get("engine", ""),
+                            model_path=cfg.get("model", cfg.get("model_dir", "")),
+                            endpoint=f"gemini/{model}",
+                            prompt_tokens=0, completion_tokens=0,
+                            ttft_ms=total_ms, total_latency_ms=total_ms,
+                            tokens_per_sec=0.0, status_code=200, error=None,
+                        ))
                 except Exception as e:
                     logger.warning(f"[{backend_key}] gemini stream error: {e}")
 
             return StreamingResponse(gemini_stream(), media_type="text/event-stream")
         else:
-            async with httpx.AsyncClient(timeout=config.proxy.timeout_sec) as client:
+            async with manager.request_lease(backend_key):
+                client = get_client(cfg["port"], config.proxy.timeout_sec)
                 resp = await client.post(target_url, json=oai_payload)
-            try:
-                oai_body = resp.json()
-            except Exception:
-                oai_body = {}
-            total_ms = (time.time() - start_time) * 1000
-            gemini_body = openai_to_gemini(oai_body, model)
-            logger.info(f"[{backend_key}] gemini /{model} → {resp.status_code} ({total_ms:.0f}ms)")
-            return JSONResponse(content=gemini_body)
+                resp_status = resp.status_code
+                try:
+                    oai_body = resp.json()
+                except Exception:
+                    oai_body = {}
+                total_ms = (time.time() - start_time) * 1000
+                gemini_body = openai_to_gemini(oai_body, model)
+                metrics_store.record(RequestRecord(
+                    request_id=request_id,
+                    timestamp_utc=datetime.now(timezone.utc).isoformat(),
+                    backend_key=backend_key, engine=cfg.get("engine", ""),
+                    model_path=cfg.get("model", cfg.get("model_dir", "")),
+                    endpoint=f"gemini/{model}",
+                    prompt_tokens=0, completion_tokens=0,
+                    ttft_ms=total_ms, total_latency_ms=total_ms,
+                    tokens_per_sec=0.0, status_code=resp_status, error=None,
+                ))
+                logger.info(f"[{backend_key}] gemini /{model} → {resp_status} ({total_ms:.0f}ms)")
+                return JSONResponse(content=gemini_body, status_code=resp_status)
 
     finally:
         _semaphore.release()

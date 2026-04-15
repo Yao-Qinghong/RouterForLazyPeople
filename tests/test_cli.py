@@ -341,6 +341,8 @@ class TestUpdateAndSysinfo:
                 return "oldsha\n"
             if cmd == ["git", "rev-parse", "@{u}"]:
                 return "newsha\n"
+            if cmd[:3] == ["git", "describe", "--tags"]:
+                return "b4567\n"
             raise AssertionError(f"unexpected check_output command: {cmd}")
 
         def fake_run(cmd, **kwargs):
@@ -364,7 +366,7 @@ class TestUpdateAndSysinfo:
         else:
             raise AssertionError("build failure should propagate")
 
-        assert ["git", "pull", "--ff-only", "--quiet"] in run_calls
+        assert ["git", "checkout", "--quiet", "b4567"] in run_calls
         assert ["git", "checkout", "--quiet", "oldsha"] in run_calls
         assert llama_bin.read_text() == "old-binary"
 
