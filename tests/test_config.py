@@ -1,5 +1,6 @@
 """Tests for router/config.py — configuration loading."""
 
+import logging
 import pytest
 import tempfile
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 from router.config import (
     load_config, load_backends, AppConfig, BackendConfig,
     BackendCapabilities, ConfigError, _infer_capabilities,
+    VALID_ENGINES,
 )
 
 
@@ -217,3 +219,176 @@ backends:
                 assert backend.vram_estimate_gb == 11.5
             finally:
                 backends_path.unlink(missing_ok=True)
+
+
+# ─────────────────────────────────────────────────────────────
+# Phase 5: Config validation and hardening
+# ─────────────────────────────────────────────────────────────
+
+class TestConfigValidation:
+    """Validation checks added in Phase 5 (unknown keys, ports, engines, paths)."""
+
+    def _make_config(self, tmp_path, settings_yaml="router:\n  port: 9001\n",
+                     backends_yaml="backends: {}\n"):
+        """Helper: write settings + backends YAML files and return AppConfig."""
+        sf = tmp_path / "settings.yaml"
+        bf = tmp_path / "backends.yaml"
+        sf.write_text(settings_yaml)
+        bf.write_text(backends_yaml)
+        return load_config(sf, bf)
+
+    # ── Unknown backend fields ────────────────────────────────
+
+    def test_unknown_backend_key_raises(self, tmp_path):
+        """Unknown fields in backends.yaml should raise ConfigError."""
+        with pytest.raises(ConfigError, match="unknown fields.*typo_field"):
+            config = self._make_config(tmp_path, backends_yaml="""
+backends:
+  my-model:
+    engine: llama.cpp
+    port: 8080
+    typo_field: oops
+""")
+            load_backends(config)
+
+    def test_unknown_backend_key_lists_valid(self, tmp_path):
+        """The error message should list valid fields."""
+        with pytest.raises(ConfigError, match="Valid fields"):
+            config = self._make_config(tmp_path, backends_yaml="""
+backends:
+  my-model:
+    engine: llama.cpp
+    port: 8080
+    bad_key: 1
+""")
+            load_backends(config)
+
+    # ── Duplicate ports ───────────────────────────────────────
+
+    def test_duplicate_ports_raises(self, tmp_path):
+        """Two backends with the same port should raise ConfigError."""
+        with pytest.raises(ConfigError, match="Port conflicts"):
+            config = self._make_config(tmp_path, backends_yaml="""
+backends:
+  model-a:
+    engine: llama.cpp
+    port: 8080
+  model-b:
+    engine: llama.cpp
+    port: 8080
+""")
+            load_backends(config)
+
+    def test_distinct_ports_ok(self, tmp_path):
+        """Backends with different ports should load without error."""
+        config = self._make_config(tmp_path, backends_yaml="""
+backends:
+  model-a:
+    engine: llama.cpp
+    port: 8080
+  model-b:
+    engine: llama.cpp
+    port: 8081
+""")
+        result = load_backends(config)
+        assert "model-a" in result
+        assert "model-b" in result
+
+    # ── Invalid engine ────────────────────────────────────────
+
+    def test_invalid_engine_raises(self, tmp_path):
+        """Unknown engine name should raise ConfigError."""
+        with pytest.raises(ConfigError, match="unknown engine 'pytorch'"):
+            config = self._make_config(tmp_path, backends_yaml="""
+backends:
+  my-model:
+    engine: pytorch
+    port: 8080
+""")
+            load_backends(config)
+
+    def test_all_valid_engines_accepted(self, tmp_path):
+        """Every engine in VALID_ENGINES should be accepted."""
+        for i, eng in enumerate(sorted(VALID_ENGINES)):
+            config = self._make_config(tmp_path, backends_yaml=f"""
+backends:
+  model-{i}:
+    engine: {eng}
+    port: {8080 + i}
+""")
+            result = load_backends(config)
+            assert f"model-{i}" in result
+
+    # ── Missing model path warning ────────────────────────────
+
+    def test_missing_model_warns(self, tmp_path, caplog):
+        """Non-existent model path should log a warning."""
+        config = self._make_config(tmp_path, backends_yaml="""
+backends:
+  my-model:
+    engine: llama.cpp
+    port: 8080
+    model: /nonexistent/path/model.gguf
+""")
+        with caplog.at_level(logging.WARNING, logger="router.config"):
+            load_backends(config)
+        assert "model path does not exist" in caplog.text
+        assert "/nonexistent/path/model.gguf" in caplog.text
+
+    def test_openai_engine_no_model_warning(self, tmp_path, caplog):
+        """openai engine should NOT warn about missing model path."""
+        config = self._make_config(tmp_path, backends_yaml="""
+backends:
+  lmstudio:
+    engine: openai
+    port: 1234
+    model: some-model-id
+""")
+        with caplog.at_level(logging.WARNING, logger="router.config"):
+            load_backends(config)
+        assert "model path does not exist" not in caplog.text
+
+    # ── Unknown settings.yaml keys ────────────────────────────
+
+    def test_unknown_settings_key_raises(self, tmp_path):
+        """Unknown top-level keys in settings.yaml should raise ConfigError."""
+        bf = tmp_path / "backends.yaml"
+        bf.write_text("backends: {}\n")
+        sf = tmp_path / "settings.yaml"
+        sf.write_text("""
+router:
+  port: 9001
+bogus_key: true
+""")
+        with pytest.raises(ConfigError, match="unknown top-level keys.*bogus_key"):
+            load_config(sf, bf)
+
+    def test_valid_settings_keys_accepted(self, tmp_path):
+        """All documented settings keys should be accepted without error."""
+        config = self._make_config(tmp_path, settings_yaml="""
+router:
+  port: 9001
+logging:
+  log_dir: /tmp/logs
+engines_enabled:
+  - llama.cpp
+routing:
+  token_threshold_deep: 4000
+proxy:
+  timeout_sec: 300
+metrics:
+  enabled: true
+auth:
+  enabled: false
+cors:
+  enabled: true
+audit:
+  enabled: false
+rate_limit:
+  enabled: false
+model_aliases: {}
+preload: []
+benchmark:
+  pp_timeout_sec: 90
+""")
+        assert isinstance(config, AppConfig)

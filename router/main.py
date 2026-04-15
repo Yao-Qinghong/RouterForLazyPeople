@@ -24,11 +24,12 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 
 from router.config import load_config, AppConfig
-from router.engines import available_engines, clear_engine_cache, ALL_ENGINES, is_engine_available
+from router.engines import available_engines, clear_engine_cache, clear_llama_flag_cache, ALL_ENGINES, is_engine_available
 from router.lifecycle import BackendManager
 from router.metrics import MetricsStore
 from router.proxy import (
     build_model_aliases,
+    close_all_clients,
     handle_proxy,
     handle_anthropic_proxy,
     handle_gemini_proxy,
@@ -90,8 +91,9 @@ def setup_logging(config: AppConfig):
 
     root = logging.getLogger()
     root.setLevel(getattr(logging, config.router.log_level, logging.INFO))
-    root.addHandler(file_handler)
-    root.addHandler(console_handler)
+    if not root.handlers:
+        root.addHandler(file_handler)
+        root.addHandler(console_handler)
 
     # Setup audit logger (separate file)
     if config.audit.enabled:
@@ -317,6 +319,7 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
         watchdog_task.cancel()
         flush_task.cancel()
         await metrics_store.flush()   # flush any remaining metrics
+        await close_all_clients()
         manager.stop_all()
         logger.info("LLM Router stopped")
 
@@ -544,6 +547,7 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
         cfg = request.app.state.config
         manager = request.app.state.manager
         clear_engine_cache()
+        clear_llama_flag_cache()
         running_before = {k for k in manager.backends if manager.is_running(k)}
         new_backends = build_backend_registry(cfg)
         await manager.update_registry(new_backends)

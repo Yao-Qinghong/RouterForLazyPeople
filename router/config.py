@@ -12,11 +12,14 @@ Search order for settings.yaml:
 """
 from __future__ import annotations
 
+import logging
 import os
 import yaml
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(Exception):
@@ -318,6 +321,20 @@ def load_config(
     with open(sf) as f:
         raw = yaml.safe_load(f) or {}
 
+    # ── Validate top-level keys ──────────────────────────────
+    KNOWN_SETTINGS_KEYS = {
+        "router", "logging", "engines_enabled", "llama_bin", "data_dir",
+        "scan_dirs", "discovery", "trtllm_docker", "tier_thresholds_gb",
+        "idle_timeouts_sec", "routing", "proxy", "metrics", "benchmark",
+        "model_aliases", "preload", "auth", "cors", "audit", "rate_limit",
+    }
+    unknown = set(raw.keys()) - KNOWN_SETTINGS_KEYS
+    if unknown:
+        raise ConfigError(
+            f"settings.yaml: unknown top-level keys: {sorted(unknown)}. "
+            f"Valid: {sorted(KNOWN_SETTINGS_KEYS)}"
+        )
+
     # ── Router ────────────────────────────────────────────────
     r = raw.get("router", {})
     router = RouterSettings(
@@ -495,6 +512,28 @@ def load_config(
     )
 
 
+from router.engines import ALL_ENGINES
+VALID_ENGINES = set(ALL_ENGINES)
+
+
+def _validate_port_uniqueness(backends: dict[str, dict]) -> None:
+    """Raise ConfigError if two backends share a port."""
+    ports: dict[int, list[str]] = {}
+    for slug, cfg in backends.items():
+        port = cfg.get("port")
+        if port is not None:
+            ports.setdefault(int(port), []).append(slug)
+    conflicts = {p: slugs for p, slugs in ports.items() if len(slugs) > 1}
+    if conflicts:
+        details = "; ".join(
+            f"port {p}: {slugs}" for p, slugs in sorted(conflicts.items())
+        )
+        raise ConfigError(
+            f"Port conflicts in backends.yaml: {details}. "
+            f"Each backend must have a unique port."
+        )
+
+
 def load_backends(config: AppConfig) -> dict[str, BackendConfig]:
     """
     Parse backends.yaml into a dict of typed backend configs.
@@ -549,7 +588,33 @@ def load_backends(config: AppConfig) -> dict[str, BackendConfig]:
         if "log" not in cfg:
             cfg["log"] = str(config.data_dir / "logs" / f"backend-{slug}.log")
 
-        # Construct typed BackendConfig, dropping unknown YAML keys
+        # Reject unknown fields (catches typos early)
+        unknown_keys = set(cfg.keys()) - known_fields - {"capabilities"}
+        if unknown_keys:
+            raise ConfigError(
+                f"backends.yaml: '{slug}' has unknown fields: {sorted(unknown_keys)}. "
+                f"Valid fields: {sorted(known_fields)}"
+            )
+
+        # Validate engine value
+        engine = cfg.get("engine", "llama.cpp")
+        if engine not in VALID_ENGINES:
+            raise ConfigError(
+                f"backends.yaml: '{slug}' has unknown engine '{engine}'. "
+                f"Valid: {sorted(VALID_ENGINES)}"
+            )
+
+        # Warn if model file does not exist for local engines
+        model_path = cfg.get("model", "")
+        if (model_path
+                and engine in ("llama.cpp", "vllm", "sglang")
+                and not os.path.exists(model_path)):
+            logger.warning(
+                "backends.yaml: '%s' model path does not exist: %s",
+                slug, model_path,
+            )
+
+        # Construct typed BackendConfig
         filtered = {k: v for k, v in cfg.items() if k in known_fields and k != "capabilities"}
         backend = BackendConfig(**filtered)
 
@@ -568,5 +633,8 @@ def load_backends(config: AppConfig) -> dict[str, BackendConfig]:
 
         backend.vram_estimate_gb = _estimate_vram(backend.engine, backend.size_gb)
         result[slug] = backend
+
+    # Cross-entry validation
+    _validate_port_uniqueness(entries)
 
     return result

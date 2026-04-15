@@ -1,5 +1,6 @@
 """Tests for VRAM-aware lifecycle management in router/lifecycle.py."""
 
+import asyncio
 import subprocess
 import time
 from pathlib import Path
@@ -353,3 +354,152 @@ class TestManagedTRTLLMDocker:
         assert ok is False
         assert "docker logs tail" in log_path.read_text()
         assert "container stacktrace" in log_path.read_text()
+
+
+# ── Request lease & in-flight tracking ──────────────────────
+
+
+class TestRequestLease:
+    @pytest.mark.asyncio
+    async def test_lease_increments_and_decrements(self):
+        """active_requests counter goes up on enter, down on exit."""
+        backends = {
+            "a": BackendConfig(tier="fast", port=8080),
+        }
+        mgr = _make_manager(backends)
+        assert mgr.active_requests.get("a", 0) == 0
+
+        async with mgr.request_lease("a"):
+            assert mgr.active_requests["a"] == 1
+        assert mgr.active_requests["a"] == 0
+
+    @pytest.mark.asyncio
+    async def test_lease_updates_last_used(self):
+        """last_used is refreshed on both entry and exit."""
+        backends = {
+            "a": BackendConfig(tier="fast", port=8080),
+        }
+        mgr = _make_manager(backends)
+        mgr.last_used["a"] = 0.0
+
+        async with mgr.request_lease("a"):
+            entry_time = mgr.last_used["a"]
+            assert entry_time > 0
+
+        exit_time = mgr.last_used["a"]
+        assert exit_time >= entry_time
+
+    @pytest.mark.asyncio
+    async def test_lease_decrements_on_exception(self):
+        """Counter is decremented even if the body raises."""
+        backends = {
+            "a": BackendConfig(tier="fast", port=8080),
+        }
+        mgr = _make_manager(backends)
+
+        with pytest.raises(ValueError):
+            async with mgr.request_lease("a"):
+                assert mgr.active_requests["a"] == 1
+                raise ValueError("boom")
+        assert mgr.active_requests["a"] == 0
+
+    @pytest.mark.asyncio
+    async def test_concurrent_leases_stack(self):
+        """Multiple concurrent leases on the same backend add up."""
+        backends = {
+            "a": BackendConfig(tier="fast", port=8080),
+        }
+        mgr = _make_manager(backends)
+
+        async with mgr.request_lease("a"):
+            assert mgr.active_requests["a"] == 1
+            async with mgr.request_lease("a"):
+                assert mgr.active_requests["a"] == 2
+            assert mgr.active_requests["a"] == 1
+        assert mgr.active_requests["a"] == 0
+
+
+class TestIdleWatchdogSkipsActive:
+    @pytest.mark.asyncio
+    async def test_watchdog_skips_backend_with_active_requests(self):
+        """idle_watchdog must not stop a backend that has active leases."""
+        backends = {
+            "busy": BackendConfig(tier="fast", port=8080, idle_timeout=1),
+        }
+        mgr = _make_manager(backends)
+        _fake_running(mgr, "busy", last_used=0)  # ancient last_used
+        mgr.active_requests["busy"] = 1  # one active request
+
+        # Run one watchdog cycle — use asyncio.CancelledError to break the loop
+        cycle_count = 0
+
+        async def one_cycle(sec):
+            nonlocal cycle_count
+            cycle_count += 1
+            if cycle_count > 1:
+                raise asyncio.CancelledError
+
+        with patch("router.lifecycle.asyncio.sleep", side_effect=one_cycle):
+            with patch("router.sysinfo.query_free_vram", return_value=None):
+                with pytest.raises(asyncio.CancelledError):
+                    await mgr.idle_watchdog()
+
+        assert mgr.is_running("busy")  # NOT evicted
+
+    @pytest.mark.asyncio
+    async def test_watchdog_stops_idle_backend_without_active_requests(self):
+        """idle_watchdog stops backends that are idle AND have no active requests."""
+        backends = {
+            "idle": BackendConfig(tier="fast", port=8080, idle_timeout=1),
+        }
+        mgr = _make_manager(backends)
+        _fake_running(mgr, "idle", last_used=0)
+        mgr.active_requests["idle"] = 0
+
+        cycle_count = 0
+
+        async def one_cycle(sec):
+            nonlocal cycle_count
+            cycle_count += 1
+            if cycle_count > 1:
+                raise asyncio.CancelledError
+
+        with patch("router.lifecycle.asyncio.sleep", side_effect=one_cycle):
+            with patch("router.sysinfo.query_free_vram", return_value=None):
+                with pytest.raises(asyncio.CancelledError):
+                    await mgr.idle_watchdog()
+
+        assert not mgr.is_running("idle")  # evicted
+
+
+class TestEvictSkipsActive:
+    def test_evict_for_vram_skips_backend_with_active_requests(self):
+        """_evict_for_vram must skip backends that have active leases."""
+        backends = {
+            "busy": BackendConfig(tier="fast", port=8080, vram_estimate_gb=8.0),
+        }
+        mgr = _make_manager(backends)
+        _fake_running(mgr, "busy", last_used=0)
+        mgr.active_requests["busy"] = 1
+
+        with patch("router.sysinfo.query_free_vram", return_value=(2.0, 48.0)):
+            result = mgr._evict_for_vram(10.0)
+
+        assert result is False  # can't free enough
+        assert mgr.is_running("busy")  # not evicted — has active requests
+
+    def test_evict_for_vram_evicts_idle_backend(self):
+        """_evict_for_vram evicts backends with zero active requests."""
+        backends = {
+            "idle": BackendConfig(tier="fast", port=8080, vram_estimate_gb=8.0),
+        }
+        mgr = _make_manager(backends)
+        _fake_running(mgr, "idle", last_used=0)
+        mgr.active_requests["idle"] = 0
+
+        vram_calls = iter([(2.0, 48.0), (10.0, 48.0)])
+        with patch("router.sysinfo.query_free_vram", side_effect=lambda: next(vram_calls)):
+            result = mgr._evict_for_vram(8.0)
+
+        assert result is True
+        assert not mgr.is_running("idle")

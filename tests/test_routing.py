@@ -5,6 +5,8 @@ from unittest.mock import MagicMock
 from router.config import BackendConfig
 from router.routing import (
     classify,
+    classify_candidates,
+    select_candidates,
     set_benchmark_results,
     _backends_for_tier,
     _extract_content,
@@ -296,3 +298,76 @@ class TestCapabilityAwarePick:
         signals = RequestSignals(has_tools=True)
         result = _pick(backends, "deep", signals)
         assert result in ("a", "b")
+
+
+# ── Candidate selection & fallback ──────────────────────────
+
+
+class TestSelectCandidates:
+    def test_returns_ordered_list(self):
+        """select_candidates returns a list sorted by engine score."""
+        backends = {
+            "a": BackendConfig(tier="fast", port=8080, engine="ollama"),
+            "b": BackendConfig(tier="fast", port=8081, engine="llama.cpp"),
+        }
+        result = select_candidates(backends, "fast")
+        assert isinstance(result, list)
+        assert len(result) == 2
+        # llama.cpp (priority 5) beats ollama (priority 8)
+        assert result[0] == "b"
+        assert result[1] == "a"
+
+    def test_limit_caps_results(self):
+        """Only up to limit backends are returned."""
+        backends = {
+            "a": BackendConfig(tier="fast", port=8080),
+            "b": BackendConfig(tier="fast", port=8081),
+            "c": BackendConfig(tier="fast", port=8082),
+        }
+        result = select_candidates(backends, "fast", limit=2)
+        assert len(result) == 2
+
+    def test_unhealthy_sorted_last(self):
+        """Unhealthy backends are deprioritized to end of list."""
+        backends = {
+            "a": BackendConfig(tier="fast", port=8080, engine="llama.cpp"),
+            "b": BackendConfig(tier="fast", port=8081, engine="llama.cpp"),
+        }
+        healthy_fn = lambda k: k != "a"
+        result = select_candidates(backends, "fast", healthy_fn=healthy_fn)
+        assert result[0] == "b"  # healthy first
+        assert result[-1] == "a"  # unhealthy last
+
+    def test_fallback_to_any_tier(self):
+        """When preferred tier has no backends, fall back to available ones."""
+        backends = {
+            "only": BackendConfig(tier="mid", port=8080),
+        }
+        result = select_candidates(backends, "fast")
+        # No "fast" tier backends, so falls back to any available
+        assert "only" in result
+
+
+class TestClassifyCandidates:
+    def test_returns_list(self):
+        """classify_candidates returns a list, not a string."""
+        config = _make_config()
+        payload = {"messages": [{"role": "user", "content": "hello"}]}
+        result = classify_candidates(payload, BACKENDS_BASIC, config)
+        assert isinstance(result, list)
+        assert len(result) >= 1
+
+    def test_explicit_route_returns_single(self):
+        """[route:key] prefix returns exactly that backend."""
+        config = _make_config()
+        payload = {"messages": [{"role": "user", "content": "[route:deep] hello"}]}
+        result = classify_candidates(payload, BACKENDS_BASIC, config)
+        assert result == ["deep"]
+
+    def test_classify_backward_compat(self):
+        """classify() still returns a single string."""
+        config = _make_config()
+        payload = {"messages": [{"role": "user", "content": "hello"}]}
+        result = classify(payload, BACKENDS_BASIC, config)
+        assert isinstance(result, str)
+        assert result in BACKENDS_BASIC

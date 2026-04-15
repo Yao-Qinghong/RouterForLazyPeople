@@ -218,35 +218,70 @@ def _pick(backends: dict, preferred: str, signals: RequestSignals = None) -> str
     return next(_tier_cycles[key][1])
 
 
+def select_candidates(
+    backends: dict,
+    preferred: str,
+    signals: RequestSignals = None,
+    limit: int = 3,
+    healthy_fn=None,
+) -> list[str]:
+    """Return up to *limit* backends ordered by preference for *preferred* tier.
+
+    *healthy_fn*, when provided, is called with a backend key and should
+    return False for recently-failed backends.  Unhealthy backends are
+    sorted to the end so they are only tried as a last resort.
+    """
+    tier_backends = _backends_for_tier(backends, preferred)
+
+    if not tier_backends:
+        if preferred in backends:
+            return [preferred]
+        if backends:
+            return list(backends.keys())[:limit]
+        return [preferred]
+
+    # Capability-aware filtering
+    if signals and len(tier_backends) > 1:
+        if signals.has_tools:
+            capable = [k for k in tier_backends
+                       if getattr(backends[k].get("capabilities"), "supports_tools", False)]
+            if capable:
+                tier_backends = capable
+        elif signals.needs_json_schema:
+            capable = [k for k in tier_backends
+                       if getattr(backends[k].get("capabilities"), "supports_json_schema", False)]
+            if capable:
+                tier_backends = capable
+
+    ranked = sorted(tier_backends, key=lambda k: _engine_score(k, backends))
+
+    # Push unhealthy backends to the end
+    if healthy_fn:
+        healthy = [k for k in ranked if healthy_fn(k)]
+        unhealthy = [k for k in ranked if not healthy_fn(k)]
+        ranked = healthy + unhealthy
+
+    return ranked[:limit]
+
+
 # ─────────────────────────────────────────────────────────────
 # Main classifier
 # ─────────────────────────────────────────────────────────────
 
-def classify(payload: dict, backends: dict, config: "AppConfig") -> str:
-    """
-    Classify a request payload and return the backend key to use.
-
-    Priority order:
-      1. [route:key] explicit prefix (highest priority)
-      2. Structural signals (tools, response_format, system prompt, message count)
-      3. Token count thresholds
-      4. Keywords (soft tiebreaker — can push fast→mid, never force deep alone)
-      5. Default → fast
-    """
+def _classify_tier(payload: dict, backends: dict, config: "AppConfig"):
+    """Determine tier and signals, returning (tier, signals, explicit_key_or_None)."""
     messages = payload.get("messages", [])
 
-    # 1. Explicit routing prefix: [route:backend-key] in any message
     for m in messages:
         c = m.get("content", "")
         if isinstance(c, str) and c.startswith("[route:"):
             key = c.split("]")[0].replace("[route:", "").strip()
             if key in backends:
-                return key
+                return None, None, key
 
     signals = _extract_signals(payload, config)
     tier = "fast"
 
-    # 2. Structural signals → determine minimum tier
     if signals.has_tools:
         tier = "deep"
     elif signals.needs_json_schema:
@@ -260,12 +295,35 @@ def classify(payload: dict, backends: dict, config: "AppConfig") -> str:
     elif signals.token_count > config.routing.token_threshold_mid:
         tier = _max_tier(tier, "mid")
 
-    # 3. Keywords as soft signal: can push fast→mid, NOT force deep alone
     if tier == "fast" and signals.keyword_tier in ("mid", "deep"):
         tier = "mid"
     elif tier == "mid" and signals.keyword_tier == "deep":
-        # Keyword can confirm mid→deep only combined with structural signal
         if signals.token_count > config.routing.token_threshold_mid:
             tier = "deep"
 
-    return _pick(backends, tier, signals)
+    return tier, signals, None
+
+
+def classify_candidates(
+    payload: dict,
+    backends: dict,
+    config: "AppConfig",
+    limit: int = 3,
+    healthy_fn=None,
+) -> list[str]:
+    """Classify a request and return an ordered list of candidate backends."""
+    tier, signals, explicit_key = _classify_tier(payload, backends, config)
+    if explicit_key:
+        return [explicit_key]
+    return select_candidates(backends, tier, signals, limit, healthy_fn)
+
+
+def classify(payload: dict, backends: dict, config: "AppConfig") -> str:
+    """
+    Classify a request payload and return the single best backend key.
+
+    This is the original single-winner API.  For fallback support, use
+    ``classify_candidates()`` which returns an ordered list.
+    """
+    candidates = classify_candidates(payload, backends, config, limit=1)
+    return candidates[0] if candidates else next(iter(backends), "")

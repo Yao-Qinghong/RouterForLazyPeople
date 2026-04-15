@@ -176,36 +176,32 @@ class MetricsStore:
         lines.append(f"llm_router_tokens_total {self._total_tokens}")
 
         # Per-backend gauges from ring buffer
+        # HELP/TYPE lines appear once per metric (Prometheus spec requirement)
         summary = self.summary()
+        if summary:
+            lines.append("# HELP llm_router_backend_requests Backend request count (ring buffer)")
+            lines.append("# TYPE llm_router_backend_requests gauge")
+            lines.append("# HELP llm_router_backend_errors Backend error count (ring buffer)")
+            lines.append("# TYPE llm_router_backend_errors gauge")
+            lines.append("# HELP llm_router_ttft_avg_ms Average time to first token (ms)")
+            lines.append("# TYPE llm_router_ttft_avg_ms gauge")
+            lines.append("# HELP llm_router_ttft_p95_ms P95 time to first token (ms)")
+            lines.append("# TYPE llm_router_ttft_p95_ms gauge")
+            lines.append("# HELP llm_router_latency_avg_ms Average total latency (ms)")
+            lines.append("# TYPE llm_router_latency_avg_ms gauge")
+            lines.append("# HELP llm_router_tokens_per_sec Average tokens per second")
+            lines.append("# TYPE llm_router_tokens_per_sec gauge")
         for backend, stats in summary.items():
             labels = f'backend="{backend}"'
-
-            lines.append(f"# HELP llm_router_backend_requests Backend request count (ring buffer)")
-            lines.append(f"# TYPE llm_router_backend_requests gauge")
             lines.append(f'llm_router_backend_requests{{{labels}}} {stats["request_count"]}')
-
-            lines.append(f"# HELP llm_router_backend_errors Backend error count (ring buffer)")
-            lines.append(f"# TYPE llm_router_backend_errors gauge")
             lines.append(f'llm_router_backend_errors{{{labels}}} {stats["error_count"]}')
-
             if stats["avg_ttft_ms"] is not None:
-                lines.append(f"# HELP llm_router_ttft_avg_ms Average time to first token (ms)")
-                lines.append(f"# TYPE llm_router_ttft_avg_ms gauge")
                 lines.append(f'llm_router_ttft_avg_ms{{{labels}}} {stats["avg_ttft_ms"]}')
-
             if stats["p95_ttft_ms"] is not None:
-                lines.append(f"# HELP llm_router_ttft_p95_ms P95 time to first token (ms)")
-                lines.append(f"# TYPE llm_router_ttft_p95_ms gauge")
                 lines.append(f'llm_router_ttft_p95_ms{{{labels}}} {stats["p95_ttft_ms"]}')
-
             if stats["avg_total_latency_ms"] is not None:
-                lines.append(f"# HELP llm_router_latency_avg_ms Average total latency (ms)")
-                lines.append(f"# TYPE llm_router_latency_avg_ms gauge")
                 lines.append(f'llm_router_latency_avg_ms{{{labels}}} {stats["avg_total_latency_ms"]}')
-
             if stats["avg_tokens_per_sec"] is not None:
-                lines.append(f"# HELP llm_router_tokens_per_sec Average tokens per second")
-                lines.append(f"# TYPE llm_router_tokens_per_sec gauge")
                 lines.append(f'llm_router_tokens_per_sec{{{labels}}} {stats["avg_tokens_per_sec"]}')
 
         return "\n".join(lines) + "\n"

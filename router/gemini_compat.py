@@ -19,9 +19,14 @@ Gemini model → backend mapping:
 """
 
 import json
+import logging
 import uuid
 import time
 from typing import AsyncIterator, Optional
+
+from router.sse import sse_events
+
+logger = logging.getLogger("llm-router.gemini")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -245,58 +250,54 @@ def stream_openai_to_gemini(original_model: str):
     """
 
     async def convert(openai_stream: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
-        async for raw_chunk in openai_stream:
-            for line in raw_chunk.decode("utf-8", errors="replace").splitlines():
-                line = line.strip()
-                if not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    break
-                try:
-                    data = json.loads(data_str)
-                except Exception:
-                    continue
+        async for data_str in sse_events(openai_stream):
+            if data_str == "[DONE]":
+                break
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError as e:
+                logger.debug("Malformed SSE: %s: %s", data_str[:100], e)
+                continue
 
-                choices = data.get("choices", [])
-                if not choices:
-                    continue
+            choices = data.get("choices", [])
+            if not choices:
+                continue
 
-                delta = choices[0].get("delta", {})
-                finish = choices[0].get("finish_reason")
+            delta = choices[0].get("delta", {})
+            finish = choices[0].get("finish_reason")
 
-                parts = []
-                text = delta.get("content", "")
-                if text:
-                    parts.append({"text": text})
+            parts = []
+            text = delta.get("content", "")
+            if text:
+                parts.append({"text": text})
 
-                tool_calls = delta.get("tool_calls", [])
-                for tc in tool_calls:
-                    func = tc.get("function", {})
-                    if func.get("name"):
-                        args_str = func.get("arguments", "")
-                        try:
-                            args = json.loads(args_str) if args_str else {}
-                        except Exception:
-                            args = {}
-                        parts.append({
-                            "functionCall": {
-                                "name": func["name"],
-                                "args": args,
-                            },
-                        })
+            tool_calls = delta.get("tool_calls", [])
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                if func.get("name"):
+                    args_str = func.get("arguments", "")
+                    try:
+                        args = json.loads(args_str) if args_str else {}
+                    except json.JSONDecodeError:
+                        args = {}
+                    parts.append({
+                        "functionCall": {
+                            "name": func["name"],
+                            "args": args,
+                        },
+                    })
 
-                if parts:
-                    gemini_chunk = {
-                        "candidates": [{
-                            "content": {
-                                "parts": parts,
-                                "role": "model",
-                            },
-                            "finishReason": _finish_to_gemini_reason(finish) if finish else None,
-                            "index": 0,
-                        }],
-                    }
-                    yield f"data: {json.dumps(gemini_chunk)}\n\n".encode()
+            if parts:
+                gemini_chunk = {
+                    "candidates": [{
+                        "content": {
+                            "parts": parts,
+                            "role": "model",
+                        },
+                        "finishReason": _finish_to_gemini_reason(finish) if finish else None,
+                        "index": 0,
+                    }],
+                }
+                yield f"data: {json.dumps(gemini_chunk)}\n\n".encode()
 
     return convert
