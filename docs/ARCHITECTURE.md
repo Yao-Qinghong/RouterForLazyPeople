@@ -33,7 +33,7 @@ Deferred (not phase-1 targets):
 ## Assumptions
 
 - **Trusted LAN only.** Auth is optional. No edge security.
-- **Single node, no HA.** One router process. One active backend at a time is the designed operating point.
+- **Single node, no HA.** One router process. The designed operating point on DGX Spark is one active backend at a time, but the router does not enforce a hard limit — multiple backends can be running concurrently if VRAM permits.
 - **No automatic cloud fallback.** The router never selects a remote provider automatically. Remote/external backends require explicit `?backend=` or `[route:key]` routing.
 - **DGX Spark / CUDA Linux is the primary target.** macOS with Metal is a development convenience.
 - **Operator-managed hardware.** The router does not manage GPU allocation across processes.
@@ -44,7 +44,8 @@ Deferred (not phase-1 targets):
 
 - Concurrent in-flight requests are capped by a semaphore (`proxy.max_concurrent_requests`, default: 20). When full the request queues for up to `proxy.queue_timeout_sec` (default: 30s), then returns 503 on OpenAI/Gemini routes or 529 on Anthropic routes.
 - Backend start budget: `startup_wait` seconds from subprocess spawn to `/health` passing (default: 30s, per-backend field). This is separate from per-request inference timeout.
-- One backend active at a time is the DGX Spark operating point. Multiple backends can be registered, but concurrent VRAM usage is the operator's responsibility.
+- **Backend handoff (VRAM eviction):** When `ensure_running(key)` is called and the new backend has a `vram_estimate_gb`, the router calls `_evict_for_vram()` which stops idle backends oldest-first (by `last_used` timestamp) until enough VRAM is free. Backends with active in-flight requests (`active_requests > 0`) are never evicted. If eviction cannot free enough VRAM, the request fails with 503. When `vram_estimate_gb` is not set (e.g. auto-discovered models without size data), no eviction occurs and concurrent starts are allowed — VRAM management is the operator's responsibility.
+- **No drain on handoff.** There is no request-drain period. Eviction calls `stop(key)` immediately (SIGTERM → SIGKILL after 10s). In-flight requests to the evicted backend will fail with a broken connection. This is acceptable for the single-operator DGX Spark use case but would need a drain period for shared use.
 - Stale or missing benchmark data silently falls back to engine-rank ordering. It does not block routing.
 
 ---
@@ -139,6 +140,8 @@ External backends (`is_external=True`) skip `starting` and enter a `ready/unheal
 **Unhealthy penalty:** `mark_unhealthy(key)` imposes a transient 60-second penalty. Unhealthy backends are not excluded — they are sorted to the end of the candidate list and only tried as a last resort. The penalty expires automatically after 60 seconds; no explicit `restart()` is required.
 
 **Crash mid-request:** If the backend process exits while a request is in flight, the proxy detects the broken connection, returns 502 `stream_error`, and transitions the backend to `unhealthy`. The request is not retried.
+
+**VRAM eviction:** `_evict_for_vram(needed_gb)` is called inside `ensure_running()` before spawning a new backend. It stops idle backends (no active requests, oldest first) until `query_free_vram()` reports enough free VRAM. Backends with `active_requests > 0` are skipped. If GPU info is unavailable (`query_free_vram()` returns None), eviction is skipped entirely.
 
 ---
 
