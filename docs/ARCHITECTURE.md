@@ -85,28 +85,23 @@ class Capabilities:
 llama.cpp defaults:
 `streaming=True, tools=True, structured_output=True, embeddings=False, context_limit=ctx_size, local=True`
 
-### NormalizedError
+### Error Responses
 
-All backend errors returned to clients must use this shape:
+Error shapes vary by route. There is no single normalized envelope today.
 
-```json
-{
-  "error": {
-    "message": "<human-readable>",
-    "type": "<error_type>",
-    "code": <http_status>
-  }
-}
-```
+**OpenAI routes** (`/v1/chat/completions`): flat `{"error": "<message>", ...}` for router-level errors (overload, no backend). Backend 4xx/5xx on non-streaming requests are forwarded as-is. On streaming requests, backend errors are emitted as SSE error events (`data: {"error": {...}}`) inside a 200 response.
 
-| Condition | HTTP | type |
-|---|---|---|
-| No backend available | 503 | `backend_unavailable` |
-| Backend start timeout | 504 | `backend_start_timeout` |
-| Semaphore queue timeout | 503 (OpenAI/Gemini) or 529 (Anthropic) | `overloaded_error` (Anthropic) / plain error (OpenAI) |
-| Backend 4xx (bad request) | forward 4xx | `backend_error` |
-| Backend 5xx | 502 | `backend_error` |
-| Partial stream failure | 502 | `stream_error` |
+**Anthropic routes** (`/anthropic/v1/messages`, `/v1/messages`): Anthropic-style `{"type": "error", "error": {"type": "...", "message": "..."}}` envelope. Overload returns 529 with `overloaded_error`.
+
+**Gemini routes** (`/gemini/...`): `{"error": {"message": "..."}}` envelope. Overload returns 503.
+
+| Condition | OpenAI | Anthropic | Gemini |
+|---|---|---|---|
+| No backend available | 503 | 503 | 400 |
+| Backend start timeout | 504 | 504 | 504 |
+| Semaphore queue timeout | 503 | 529 | 503 |
+| Backend 4xx (non-streaming) | forward as-is | forward as-is | forward as-is |
+| Backend error (streaming) | SSE error event in 200 | SSE error event in 200 | SSE error event in 200 |
 
 ---
 
@@ -124,7 +119,7 @@ starting
     │  /health passes
     ▼
 ready ◄── restart() completes
-    ├── /health fails after 3 consecutive probes ──► unhealthy
+    ├── mark_unhealthy() called (60s penalty) ─────► unhealthy (deprioritized)
     ├── process exits / crash detected ──────────────► unhealthy
     │  idle_timeout exceeded
     ▼
@@ -138,7 +133,7 @@ stopped
 
 External backends (`is_external=True`) skip `starting` and enter a `ready/unhealthy` polling cycle via `poll()` against their `/v1/models` or `/health` endpoint.
 
-**Unhealthy quarantine:** A backend in `unhealthy` is excluded from routing. It stays quarantined until `restart()` is called explicitly. The router does not auto-restart unhealthy backends during normal operation.
+**Unhealthy penalty:** `mark_unhealthy(key)` imposes a transient 60-second penalty. Unhealthy backends are not excluded — they are sorted to the end of the candidate list and only tried as a last resort. The penalty expires automatically after 60 seconds; no explicit `restart()` is required.
 
 **Crash mid-request:** If the backend process exits while a request is in flight, the proxy detects the broken connection, returns 502 `stream_error`, and transitions the backend to `unhealthy`. The request is not retried.
 
@@ -148,16 +143,16 @@ External backends (`is_external=True`) skip `starting` and enter a `ready/unheal
 
 Selection runs in strict priority order. The first matching rule wins.
 
-1. `?backend=<key>` — must resolve to a `ready` backend; 503 if not.
+1. `?backend=<key>` — resolves to the named backend. The backend is lazily started via `ensure_running()` if not already running. Returns 503 if start fails.
 2. `model_aliases` entry — alias resolves to a backend key, then treated as rule 1.
 3. `[route:key]` prefix in first message content — same rules as rule 1.
 4. Automatic classification:
    - a. Classify tier from payload (see Tier Classification below).
-   - b. Filter candidates: `state == ready AND tier == classified_tier AND has_required_capabilities(payload)`.
+   - b. Select candidates: backends matching the classified tier, sorted by benchmark score then engine rank. Unhealthy backends are pushed to the end (not excluded). Capability filtering applies when multiple candidates exist.
    - c. **If no candidates in the classified tier:** current code falls back to the first registered backend (any tier, no ranking). This is a known limitation — a future version should either return 503 or apply the full ranking logic across all tiers.
-   - d. Among candidates: rank by measured TG tok/s (bench cache), then engine rank, then round-robin for ties.
+   - d. For each candidate in order: call `ensure_running()` (lazy start). The first backend that starts successfully handles the request.
 
-**Capability filter (step b):** Payloads with `tools` require `capabilities.tools == True`. Payloads with `response_format.type == "json_schema"` require `capabilities.structured_output == True`.
+**Capability filter (step b):** When multiple candidates exist, payloads with `tools` prefer backends with `capabilities.supports_tools == True`, and payloads with `response_format.type == "json_schema"` prefer `capabilities.supports_json_schema == True`. If no capable backend is found, the filter is skipped (all tier backends remain candidates).
 
 **Local-first:** `local=True` backends are ranked ahead of `local=False` regardless of benchmark scores.
 
@@ -187,10 +182,10 @@ llama.cpp is the phase-1 backend. These are hard rules.
 
 ### Startup
 
-- Command: `llama-server --host 127.0.0.1 --port <port> --model <path> --ctx-size <ctx_size> --parallel <n_parallel>` plus any `extra_args` from config.
-- Readiness probe: `GET http://127.0.0.1:<port>/health` polled every 2s.
-  - Pass: HTTP 200 with `{"status": "ok"}`.
-  - After 3 consecutive failures once previously ready → transition to `unhealthy`.
+- Command: `llama-server --host 0.0.0.0 --port <port> --model <path> --ctx-size <ctx_size>` plus optional flags (`--flash-attn`, `--reasoning`) detected from the binary. `--parallel` is **not** currently set by the router.
+- Readiness probe: `GET http://<host>:<port>/health` polled every 1s.
+  - Pass: any HTTP 200 response (body content is not checked).
+  - No consecutive-failure counter exists today — a single failed probe does not transition state.
 - If `startup_wait` expires without readiness: log stderr tail, set state `unhealthy`, close log handle.
 - No pre-warming prompt is sent. Backend is ready as soon as `/health` passes.
 
@@ -297,12 +292,19 @@ These are phase-1 acceptance requirements, not aspirational claims.
 
 `startup_wait` (default: 30s) is a per-backend field in `backends.yaml`, not a top-level setting.
 
-### Startup Validation (abort on error, not warning)
+### Startup Validation
 
-- `port` is already in use.
-- `engines_enabled` contains an unknown engine name.
-- `backends.yaml` references an engine not in `engines_enabled`.
-- `backends.yaml` backend has a `model_path` that does not exist on disk.
+Abort (`ConfigError`):
+- `backends.yaml` references an unknown engine (not in `ALL_ENGINES`).
+- `backends.yaml` backend for a local engine (`llama.cpp`, `vllm`, `sglang`, `huggingface`) has no `model` or `model_dir` field at all.
+- Two backends in `backends.yaml` share the same port.
+
+Warn only (does not abort):
+- `backends.yaml` backend has a `model_path` that does not exist on disk (logged as warning, backend still registered).
+
+Not validated:
+- `engines_enabled` values are not checked against a known engine list.
+- Router port already in use (detected at bind time by uvicorn, not at config load).
 
 ### Hot-Reload Boundaries
 
@@ -320,7 +322,7 @@ Middleware changes (auth enable/disable, CORS origins) always require restart.
 
 | Failure | Detection | Router Action | Client Response |
 |---|---|---|---|
-| Backend crash before request | `poll()` returns None | State → `unhealthy`; excluded from routing | 503 `backend_unavailable` |
+| Backend crash before request | `poll()` returns None | State → `unhealthy`; deprioritized (sorted to end) | 503 `backend_unavailable` |
 | Backend crash mid-request | Broken connection | Close stream; state → `unhealthy` | 502 `stream_error` |
 | Startup timeout | `startup_wait` expires | State → `unhealthy`; log stderr tail | 504 `backend_start_timeout` |
 | Semaphore full | Queue timeout after `queue_timeout_sec` | Queues, then rejects | 503 (OpenAI/Gemini) or 529 (Anthropic) |
