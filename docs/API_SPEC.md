@@ -5,11 +5,19 @@ It describes the externally visible behavior that clients and integrators can re
 
 ## Scope
 
-- OpenAI-compatible request proxying
+**Phase 1 (tested, supported):**
+- OpenAI-compatible chat completions (`/v1/chat/completions`)
+- OpenAI-compatible model list (`/v1/models`)
+- Backend discovery and control endpoints
+- Engine: llama.cpp only
+
+**Phase 2+ (code exists, untested):**
 - Anthropic Messages API compatibility
 - Gemini API compatibility
-- Backend discovery and control endpoints
-- Auth expectations and routing semantics
+- Additional engines (vLLM, SGLang, TRT-LLM, HuggingFace, Ollama)
+- Embeddings, legacy completions, WebSocket bridge, catch-all inference proxy
+
+Clients should only depend on phase-1 endpoints for production use. Phase-2+ endpoints are available for experimentation but may have bugs or incomplete behavior.
 
 ## Client Compatibility
 
@@ -67,34 +75,34 @@ Thinking / reasoning behavior:
 
 ## Public Endpoints
 
-| Method | Path | Contract |
-|---|---|---|
-| `GET` | `/health` | Liveness check, returns router health |
-| `GET` | `/status` | Runtime state of registered backends |
-| `GET` | `/backends` | Backend registry summary |
-| `GET` | `/v1/models` | OpenAI-style model list from registered backends and aliases |
-| `GET` | `/v1/models/{model_id}` | OpenAI-style single-model lookup |
-| `GET` | `/engines` | Installed engine availability |
-| `GET` | `/sysinfo` | System diagnostics, engine versions, and recommendations |
-| `GET` | `/metrics` | Aggregated request metrics |
-| `GET` | `/metrics/export` | CSV export of metrics history |
-| `GET` | `/metrics/prometheus` | Prometheus exposition format |
-| `GET` | `/benchmarks` | Cached PP/TG speed benchmark results written by `python cli.py bench` |
-| `POST` | `/start/{key}` | Start a backend |
-| `POST` | `/stop/{key}` | Stop a backend |
-| `POST` | `/restart/{key}` | Restart a backend |
-| `POST` | `/rescan` | Rebuild registry from config plus auto-discovery |
-| `POST` | `/reload-config` | Reload mutable router settings from the active `settings.yaml` |
-| `POST` | `/retune/{key}` | Clear TRT-LLM tuning cache and re-tune on start |
-| `POST` | `/v1/chat/completions` | OpenAI-compatible chat completions |
-| `POST` | `/v1/completions` | OpenAI-compatible legacy completions |
-| `POST` | `/v1/embeddings` | OpenAI-compatible embeddings |
-| `POST` | `/v1/{path}` | Catch-all OpenAI-compatible inference proxy |
-| `POST` | `/anthropic/v1/messages` | Anthropic Messages API compatibility |
-| `POST` | `/v1/messages` | Anthropic Messages alias |
-| `POST` | `/gemini/v1beta/models/{model}:generateContent` | Gemini-compatible non-streaming generation |
-| `POST` | `/gemini/v1beta/models/{model}:streamGenerateContent` | Gemini-compatible streaming generation |
-| `WS` | `/v1/chat/completions/ws` | WebSocket bridge for chat streaming |
+| Method | Path | Phase | Contract |
+|---|---|---|---|
+| `GET` | `/health` | 1 | Liveness check, returns router health |
+| `GET` | `/status` | 1 | Runtime state of registered backends |
+| `GET` | `/backends` | 1 | Backend registry summary |
+| `GET` | `/v1/models` | 1 | OpenAI-style model list from registered backends and aliases |
+| `GET` | `/v1/models/{model_id}` | 1 | OpenAI-style single-model lookup |
+| `GET` | `/engines` | 1 | Installed engine availability |
+| `GET` | `/sysinfo` | 1 | System diagnostics, engine versions, and recommendations |
+| `GET` | `/metrics` | 1 | Aggregated request metrics |
+| `GET` | `/metrics/export` | 1 | CSV export of metrics history |
+| `GET` | `/metrics/prometheus` | 1 | Prometheus exposition format |
+| `GET` | `/benchmarks` | 1 | Cached PP/TG speed benchmark results written by `python cli.py bench` |
+| `POST` | `/start/{key}` | 1 | Start a backend |
+| `POST` | `/stop/{key}` | 1 | Stop a backend |
+| `POST` | `/restart/{key}` | 1 | Restart a backend |
+| `POST` | `/rescan` | 1 | Rebuild registry from config plus auto-discovery |
+| `POST` | `/reload-config` | 1 | Reload mutable router settings from the active `settings.yaml` |
+| `POST` | `/retune/{key}` | 2+ | Clear TRT-LLM tuning cache and re-tune on start |
+| `POST` | `/v1/chat/completions` | 1 | OpenAI-compatible chat completions |
+| `POST` | `/v1/completions` | 2+ | OpenAI-compatible legacy completions |
+| `POST` | `/v1/embeddings` | 2+ | OpenAI-compatible embeddings |
+| `POST` | `/v1/{path}` | 2+ | Catch-all OpenAI-compatible inference proxy |
+| `POST` | `/anthropic/v1/messages` | 2+ | Anthropic Messages API compatibility |
+| `POST` | `/v1/messages` | 2+ | Anthropic Messages alias |
+| `POST` | `/gemini/v1beta/models/{model}:generateContent` | 2+ | Gemini-compatible non-streaming generation |
+| `POST` | `/gemini/v1beta/models/{model}:streamGenerateContent` | 2+ | Gemini-compatible streaming generation |
+| `WS` | `/v1/chat/completions/ws` | 2+ | WebSocket bridge for chat streaming |
 
 ## Route-Specific Notes
 

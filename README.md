@@ -23,17 +23,21 @@ Your App (OpenAI / Anthropic SDK / OpenClaw / Open WebUI)
 
 ## Features
 
+**Phase 1 (tested, supported):**
 - **Lazy loading** — models start on first request, stop automatically after idle
 - **Smart routing** — keyword + token-count classifier picks fast / mid / deep tier
-- **Multi-engine** — llama.cpp by default; vLLM, SGLang, TensorRT-LLM, HuggingFace TGI available via `engines_enabled` in `settings.yaml`
-- **Auto-discovery** — scans your model directories and registers GGUF / HF / TRT-LLM models automatically
 - **OpenAI-compatible** — drop-in for any OpenAI SDK client, Open WebUI, OpenClaw, Cursor, Continue, Jan
-- **Anthropic-compatible** — drop-in for Anthropic SDK, Claude Code, `@anthropic-ai/sdk`
-- **Gemini-compatible** — supports Google Gemini `generateContent` and `streamGenerateContent` payloads
+- **Auto-discovery** — scans your model directories and registers GGUF models automatically
 - **Benchmarking** — tracks TTFT, latency, tokens/sec per backend; export as CSV
 - **System diagnostics** — detects GPU, CUDA, CPU architecture, engine versions, install recommendations
-- **Auto-update** — one command updates llama.cpp and Python deps
 - **Beginner-friendly** — all config in two YAML files, no Python knowledge required to operate
+
+**Phase 2+ (code exists, untested — use at your own risk):**
+- **Multi-engine** — vLLM, SGLang, TensorRT-LLM, HuggingFace TGI available via `engines_enabled`
+- **Anthropic-compatible** — drop-in for Anthropic SDK, Claude Code
+- **Gemini-compatible** — supports Google Gemini `generateContent` and `streamGenerateContent` payloads
+- **HF / TRT-LLM auto-discovery** — scans HuggingFace and TRT-LLM model directories (gated by `engines_enabled`)
+- **Auto-update** — one command updates llama.cpp and Python deps
 
 ---
 
