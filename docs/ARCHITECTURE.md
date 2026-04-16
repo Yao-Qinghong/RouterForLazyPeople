@@ -294,6 +294,42 @@ These are phase-1 acceptance requirements, not aspirational claims.
 | `response_format: json_schema` | Required | Required |
 | Auth header accepted when auth disabled | Required | Required |
 
+### Supported OpenAI Parameters
+
+Parameters the router passes through to the backend. The router does not validate or transform these — support depends on the backend engine.
+
+| Parameter | Passed through | Notes |
+|---|---|---|
+| `model` | Yes | Resolved to backend key, then rewritten to backend's model name |
+| `messages` | Yes | Array of `{role, content}` objects |
+| `stream` | Yes | Controls SSE vs buffered response |
+| `temperature` | Yes | |
+| `top_p` | Yes | |
+| `max_tokens` | Yes | |
+| `stop` | Yes | |
+| `tools` / `functions` | Yes | Used by routing classifier to select `deep` tier |
+| `tool_choice` | Yes | Passed through; no router-level validation |
+| `response_format` | Yes | `json_schema` type used by routing classifier |
+| `n` | Yes | Multiple completions; backend support varies |
+| `presence_penalty` | Yes | |
+| `frequency_penalty` | Yes | |
+| `logprobs` | Yes | |
+| `seed` | Yes | |
+| `user` | Yes | |
+
+**Not supported / not validated:**
+- `parallel_tool_calls`: passed through but not validated. Backend may ignore it.
+- `usage` in responses: present only if the backend includes it. The router does not synthesize usage data.
+- `finish_reason`: forwarded as-is from the backend. The router does not validate or normalize it.
+- `tool_choice: "required"` or `tool_choice: {"type": "function", "function": {"name": "..."}}`: passed through. Whether the backend honors it depends on the model and engine.
+
+### Compatibility Gaps
+
+- **Tool-call streaming:** Tool calls in SSE streams follow whatever format the backend emits. The router does not validate that streamed tool calls accumulate into valid OpenAI schema.
+- **`developer` role:** Not rewritten to `system`. Agentic clients (OpenClaw) that send `developer` role messages may get unexpected behavior from backends that don't recognize it.
+- **Long-prompt handling:** No preflight rejection. Oversized prompts are forwarded and may produce backend-specific errors rather than a clean 400.
+- **Stable `usage` field:** Not guaranteed. Some backends omit `prompt_tokens` or `completion_tokens`. Clients that rely on `usage` for billing or context tracking should not depend on it.
+
 ### SSE Streaming Contract
 
 - Each chunk: `data: <json>\n\n` with a valid `choices[0].delta` object.
