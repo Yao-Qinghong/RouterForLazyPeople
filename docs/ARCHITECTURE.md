@@ -406,6 +406,27 @@ All must pass on a fresh DGX Spark install.
 
 ---
 
+## Open Questions and Known Limitations
+
+Tracked here so they are not buried in normative text. Each item is a decision that needs to be made before the behavior can be considered stable.
+
+| # | Area | Question | Current behavior | Risk |
+|---|---|---|---|---|
+| 1 | Routing | Should no-tier fallback return 503 instead of routing to the first registered backend? | Falls back to first backend regardless of tier/capability/health | Silent misrouting to wrong-size or incapable model |
+| 2 | Routing | Should capability filter be fail-closed (503) when no capable backend exists? | Filter is skipped; request routes to incapable backend | Malformed tool/schema output instead of clean error |
+| 3 | Lifecycle | Should backend eviction drain in-flight requests before SIGTERM? | No drain; immediate SIGTERM | In-flight requests fail on backend swap |
+| 4 | Lifecycle | Should `mark_unhealthy()` exclude backends entirely instead of deprioritizing? | 60s deprioritization, still tried as last resort | Unhealthy backend serves requests during penalty window |
+| 5 | llama.cpp | Should the router set `--parallel` to match semaphore size? | Not set; llama-server defaults to 1 slot | Concurrent requests queue inside llama-server even when semaphore allows them |
+| 6 | llama.cpp | Should there be a stream-idle timeout after first token? | No timeout after first token arrives | Hung streams hold semaphore slot and connection indefinitely |
+| 7 | llama.cpp | Should client disconnect cancel the backend request? | No cancellation; backend continues generating | Wasted GPU compute on abandoned requests |
+| 8 | llama.cpp | Should repeated startup failures trigger backoff or circuit-breaker? | No backoff; each request retries `ensure_running()` from scratch | Rapid retry storm on a persistently-failing backend |
+| 9 | Compatibility | Should `developer` role be rewritten to `system` for phase 1? | Forwarded unchanged | Some agentic clients may depend on it |
+| 10 | Compatibility | Should context overflow be rejected preflight (400) or forwarded? | Forwarded to backend | Backend may return unhelpful error or OOM |
+| 11 | Config | Should `engines_enabled` unknown values be validated at startup? | Not validated | Typo in config silently disables an engine |
+| 12 | Identity | Should auto-discovered model keys include a version/quant suffix for disambiguation? | Slug is derived from filename which usually includes quant | Different quants of same model at different paths get different slugs, but renaming a file changes the key |
+
+---
+
 ## Appendix: Adding a Future Engine
 
 Minimum steps to add a new engine:
