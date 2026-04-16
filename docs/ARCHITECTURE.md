@@ -328,6 +328,36 @@ These are phase-1 acceptance requirements, not aspirational claims.
 
 `startup_wait` (default: 30s) is a per-backend field in `backends.yaml`, not a top-level setting.
 
+### backends.yaml
+
+Each key under `backends:` defines a backend. Manual backends take priority over auto-discovered ones on key collision.
+
+| Field | Type | Default | Required | Notes |
+|---|---|---|---|---|
+| `engine` | str | `"llama.cpp"` | No | Must be in `ALL_ENGINES` |
+| `port` | int | `8080` | No | Must be unique across all backends |
+| `model` | str | `""` | Yes* | Path to GGUF file or HF checkpoint. *Required for `llama.cpp`, `vllm`, `sglang`, `huggingface` |
+| `model_dir` | str | `""` | No | Alternative to `model` for directory-based models |
+| `tier` | str | `""` | No | `"fast"` / `"mid"` / `"deep"`. Auto-assigned from file size if empty |
+| `ctx_size` | int | `32768` | No | Context window passed to engine as `--ctx-size` |
+| `gpu_layers` | int | `999` | No | GPU layers for llama.cpp (`--n-gpu-layers`) |
+| `flash_attn` | bool | `True` | No | Enable flash attention (llama.cpp, if binary supports it) |
+| `reasoning` | bool | `False` | No | Enable reasoning tag parsing (llama.cpp `--reasoning`) |
+| `reasoning_budget` | int | `null` | No | Reasoning token budget (llama.cpp `--reasoning-budget`) |
+| `idle_timeout` | int | `300` | No | Seconds before idle eviction. `0` = never evict |
+| `startup_wait` | int | `30` | No | Seconds to wait for `/health` pass after spawn |
+| `extra_args` | list | `[]` | No | Additional CLI args passed to the engine command |
+| `description` | str | `""` | No | Human-readable label shown in `/status` |
+| `capabilities` | object | inferred | No | Override `supports_tools`, `supports_json_schema`, `max_context`, `code_quality` |
+| `size_gb` | float | `null` | No | Model size in GB. Used for tier assignment and VRAM estimation |
+| `vram_estimate_gb` | float | `null` | No | Estimated VRAM needed. Triggers eviction logic in `ensure_running()` |
+| `dtype` | str | `"auto"` | No | Data type for vLLM/SGLang/HF engines |
+| `tensor_parallel_size` | int | `1` | No | Tensor parallelism for vLLM |
+| `quantization` | str | `null` | No | Quantization method for vLLM |
+| `tokenizer` | str | `""` | No | Custom tokenizer path |
+
+Fields not listed here (`gpu_memory_fraction`, `trust_remote_code`, `enforce_eager`, `enable_prefix_caching`, `wrapper_script`, `model_type`, `trt_config`, `docker_config`) are engine-specific and rarely needed for phase-1 llama.cpp use.
+
 ### Startup Validation
 
 Abort (`ConfigError`):
