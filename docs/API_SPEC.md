@@ -81,7 +81,7 @@ Thinking / reasoning behavior:
 | `GET` | `/status` | 1 | Runtime state of registered backends |
 | `GET` | `/backends` | 1 | Backend registry summary |
 | `GET` | `/v1/models` | 1 | OpenAI-style model list from registered backends and aliases |
-| `GET` | `/v1/models/{model_id}` | 1 | OpenAI-style single-model lookup |
+| `GET` | `/v1/models/{model_id:path}` | 1 | OpenAI-style single-model lookup |
 | `GET` | `/engines` | 1 | Installed engine availability |
 | `GET` | `/sysinfo` | 1 | System diagnostics, engine versions, and recommendations |
 | `GET` | `/metrics` | 1 | Aggregated request metrics |

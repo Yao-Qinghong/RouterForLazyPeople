@@ -169,7 +169,7 @@ External backends (`is_external=True`) skip `starting` and enter a `ready/unheal
 
 ---
 
-## Routing Algorithm
+## Routing Algorithm (Request Routing)
 
 Selection runs in strict priority order. The first matching rule wins.
 
@@ -339,7 +339,7 @@ Parameters the router passes through to the backend. The router does not validat
 
 ### OpenClaw-Specific
 
-- `model` field in responses must match what OpenClaw registered as the model identifier. Use the backend key or configured alias as the `id` in `/v1/models` and in response `model` fields — stable across restarts.
+- `model` field in responses: **not yet implemented** — the proxy forwards backend JSON/SSE output unchanged, so llama.cpp or external servers can emit their own model IDs. OpenClaw should be configured with a backend key as the model name, but response `model` fields may differ.
 - Tool calls must follow OpenAI schema exactly: `tool_calls[].function.name`, `tool_calls[].function.arguments` (JSON string), `tool_calls[].id`.
 - `developer` role rewrite to `system`: **not yet implemented** — currently forwarded unchanged. Deferred to a future phase.
 - OpenClaw setup: `baseURL = http://localhost:9001/v1`, model name = a registered backend key.
@@ -353,7 +353,7 @@ Parameters the router passes through to the backend. The router does not validat
 
 ---
 
-## Config Schema
+## Config Schema (Config Precedence)
 
 ### settings.yaml
 
@@ -380,8 +380,8 @@ Each key under `backends:` defines a backend. Manual backends take priority over
 
 | Field | Type | Default | Required | Notes |
 |---|---|---|---|---|
-| `engine` | str | `"llama.cpp"` | No | Must be in `ALL_ENGINES` |
-| `port` | int | `8080` | No | Must be unique across all backends |
+| `engine` | str | `"llama.cpp"` | **Yes** | Must be in `ALL_ENGINES` |
+| `port` | int | `8080` | **Yes** | Must be unique across all backends |
 | `model` | str | `""` | Yes* | Path to GGUF file or HF checkpoint. *Required for `llama.cpp`, `vllm`, `sglang`, `huggingface` |
 | `model_dir` | str | `""` | No | Alternative to `model` for directory-based models |
 | `tier` | str | `""` | No | `"fast"` / `"mid"` / `"deep"`. Auto-assigned from file size if empty |
@@ -396,7 +396,7 @@ Each key under `backends:` defines a backend. Manual backends take priority over
 | `description` | str | `""` | No | Human-readable label shown in `/status` |
 | `capabilities` | object | inferred | No | Override `supports_tools`, `supports_json_schema`, `max_context`, `code_quality` |
 | `size_gb` | float | `null` | No | Model size in GB. Used for tier assignment and VRAM estimation |
-| `vram_estimate_gb` | float | `null` | No | Estimated VRAM needed. Triggers eviction logic in `ensure_running()` |
+| `vram_estimate_gb` | float | auto-computed | No | Auto-computed from `size_gb` via `_estimate_vram()`. Manual values are overwritten. |
 | `dtype` | str | `"auto"` | No | Data type for vLLM/SGLang/HF engines |
 | `tensor_parallel_size` | int | `1` | No | Tensor parallelism for vLLM |
 | `quantization` | str | `null` | No | Quantization method for vLLM |
@@ -472,7 +472,7 @@ All must pass on a fresh DGX Spark install.
 
 ---
 
-## Architecture Boundaries (Non-Goals)
+## Architecture Boundaries (Runtime Boundaries, Non-Goals)
 
 - Not a production API gateway. No TLS, no edge auth, no enforced rate limiting.
 - Not an HA system. Single process, single node, no replication.
@@ -505,15 +505,20 @@ Tracked here so they are not buried in normative text. Each item is a decision t
 
 ## Appendix: Adding a Future Engine
 
-Minimum steps to add a new engine (based on existing engine implementations):
+Minimum steps to add a new engine (based on the provider-based architecture):
 
-1. **`router/engines.py`:** Add the engine constant (e.g. `ENGINE_NEWENGINE = "newengine"`), add it to `ALL_ENGINES`, implement `is_engine_available()` check, and implement `build_<engine>_cmd(cfg, config)` returning the subprocess command list.
-2. **`router/lifecycle.py`:** Add an `elif engine == "newengine"` branch in `_start_process()` (or a dedicated `_start_<engine>_backend()` method if the engine needs special lifecycle handling like Docker or Ollama).
+1. **`router/provider.py`:** Create a provider class implementing `EngineProvider` protocol with:
+   - `engine: str` class attribute
+   - `build_cmd(cfg, config, **kwargs) -> list[str]` — subprocess command to start the server
+   - `health_url(cfg) -> str` — health-check endpoint URL
+   - `rewrite_model_name(cfg, original_model) -> str` — model name transformation for the backend API
+2. **`router/provider.py`:** Register your provider by calling `register_provider(your_provider_instance)` at module load time.
 3. **`router/config.py`:** Add default `BackendCapabilities` for the engine in `_infer_capabilities()`.
-4. **`router/engines.py`:** Define the health endpoint URL pattern (most engines use `/health` or `/v1/models`; add to `health_url()` if non-standard).
-5. **`router/sysinfo.py`:** Add version detection in `_detect_engine_versions()`.
-6. **Gate behind `engines_enabled`.** The engine must not activate unless explicitly listed. Default remains `["llama.cpp"]`.
-7. **Write an acceptance matrix** for the new engine (similar to the phase-1 acceptance criteria). The engine is not supported until its matrix passes.
+4. **`router/sysinfo.py`:** Add version detection in `_detect_engine_versions()`.
+5. **Gate behind `engines_enabled`.** The engine must not activate unless explicitly listed. Default remains `["llama.cpp"]`.
+6. **Write an acceptance matrix** for the new engine (similar to the phase-1 acceptance criteria). The engine is not supported until its matrix passes.
+
+The provider registry (`get_provider(engine)`) is used by `lifecycle.py` for command building and health URLs, and by `proxy.py` for model name rewriting. No changes to those files are needed.
 
 An engine is not supported until it has its own acceptance matrix and passes it.
 
