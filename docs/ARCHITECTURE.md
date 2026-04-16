@@ -505,14 +505,15 @@ Tracked here so they are not buried in normative text. Each item is a decision t
 
 ## Appendix: Adding a Future Engine
 
-Minimum steps to add a new engine:
+Minimum steps to add a new engine (based on existing engine implementations):
 
-1. Add engine name to the known engine list in `engines.py`.
-2. Implement `build_<engine>_cmd()` returning a process invocation list.
-3. Define `Capabilities` defaults for the engine.
-4. Implement `GET /health` probe or equivalent.
-5. Add the engine to `OPERATIONS.md` under "Additional Engines".
-6. Gate behind `engines_enabled`. Default remains `["llama.cpp"]` until the engine passes its own acceptance criteria.
+1. **`router/engines.py`:** Add the engine constant (e.g. `ENGINE_NEWENGINE = "newengine"`), add it to `ALL_ENGINES`, implement `is_engine_available()` check, and implement `build_<engine>_cmd(cfg, config)` returning the subprocess command list.
+2. **`router/lifecycle.py`:** Add an `elif engine == "newengine"` branch in `_start_process()` (or a dedicated `_start_<engine>_backend()` method if the engine needs special lifecycle handling like Docker or Ollama).
+3. **`router/config.py`:** Add default `BackendCapabilities` for the engine in `_infer_capabilities()`.
+4. **`router/engines.py`:** Define the health endpoint URL pattern (most engines use `/health` or `/v1/models`; add to `health_url()` if non-standard).
+5. **`router/sysinfo.py`:** Add version detection in `_detect_engine_versions()`.
+6. **Gate behind `engines_enabled`.** The engine must not activate unless explicitly listed. Default remains `["llama.cpp"]`.
+7. **Write an acceptance matrix** for the new engine (similar to the phase-1 acceptance criteria). The engine is not supported until its matrix passes.
 
 An engine is not supported until it has its own acceptance matrix and passes it.
 
