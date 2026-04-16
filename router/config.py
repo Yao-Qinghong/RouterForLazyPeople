@@ -604,10 +604,16 @@ def load_backends(config: AppConfig) -> dict[str, BackendConfig]:
                 f"Valid: {sorted(VALID_ENGINES)}"
             )
 
-        # Warn if model file does not exist for local engines
-        model_path = cfg.get("model", "")
+        # Require model path for local engines that need it
+        _LOCAL_ENGINES_NEED_MODEL = {"llama.cpp", "vllm", "sglang", "huggingface"}
+        model_path = cfg.get("model", "") or cfg.get("model_dir", "")
+        if engine in _LOCAL_ENGINES_NEED_MODEL and not model_path:
+            raise ConfigError(
+                f"backends.yaml: '{slug}' (engine={engine}) requires 'model' or 'model_dir' "
+                f"pointing to the model file/directory"
+            )
         if (model_path
-                and engine in ("llama.cpp", "vllm", "sglang")
+                and engine in _LOCAL_ENGINES_NEED_MODEL
                 and not os.path.exists(model_path)):
             logger.warning(
                 "backends.yaml: '%s' model path does not exist: %s",

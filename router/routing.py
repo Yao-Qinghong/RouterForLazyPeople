@@ -277,6 +277,9 @@ def _classify_tier(payload: dict, backends: dict, config: "AppConfig"):
         if isinstance(c, str) and c.startswith("[route:"):
             key = c.split("]")[0].replace("[route:", "").strip()
             if key in backends:
+                # Strip the route prefix so it doesn't leak to the backend
+                prefix_end = c.index("]") + 1
+                m["content"] = c[prefix_end:].lstrip()
                 return None, None, key
 
     signals = _extract_signals(payload, config)

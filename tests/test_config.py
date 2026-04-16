@@ -273,9 +273,11 @@ backends:
   model-a:
     engine: llama.cpp
     port: 8080
+    model: /tmp/model-a.gguf
   model-b:
     engine: llama.cpp
     port: 8080
+    model: /tmp/model-b.gguf
 """)
             load_backends(config)
 
@@ -286,9 +288,11 @@ backends:
   model-a:
     engine: llama.cpp
     port: 8080
+    model: /tmp/model-a.gguf
   model-b:
     engine: llama.cpp
     port: 8081
+    model: /tmp/model-b.gguf
 """)
         result = load_backends(config)
         assert "model-a" in result
@@ -309,12 +313,14 @@ backends:
 
     def test_all_valid_engines_accepted(self, tmp_path):
         """Every engine in VALID_ENGINES should be accepted."""
+        _needs_model = {"llama.cpp", "vllm", "sglang", "huggingface"}
         for i, eng in enumerate(sorted(VALID_ENGINES)):
+            model_line = f"\n    model: /tmp/fake-model-{i}" if eng in _needs_model else ""
             config = self._make_config(tmp_path, backends_yaml=f"""
 backends:
   model-{i}:
     engine: {eng}
-    port: {8080 + i}
+    port: {8080 + i}{model_line}
 """)
             result = load_backends(config)
             assert f"model-{i}" in result
@@ -334,6 +340,18 @@ backends:
             load_backends(config)
         assert "model path does not exist" in caplog.text
         assert "/nonexistent/path/model.gguf" in caplog.text
+
+    def test_local_engine_requires_model(self, tmp_path):
+        """Local engines (llama.cpp, vllm, etc.) must have model or model_dir."""
+        for engine in ("llama.cpp", "vllm", "sglang", "huggingface"):
+            with pytest.raises(ConfigError, match="requires 'model' or 'model_dir'"):
+                config = self._make_config(tmp_path, backends_yaml=f"""
+backends:
+  no-model:
+    engine: {engine}
+    port: 8080
+""")
+                load_backends(config)
 
     def test_openai_engine_no_model_warning(self, tmp_path, caplog):
         """openai engine should NOT warn about missing model path."""
