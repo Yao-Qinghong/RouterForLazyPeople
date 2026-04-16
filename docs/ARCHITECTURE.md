@@ -14,16 +14,17 @@ In scope:
 - `GET /v1/models` — model list
 - Tool/function calling
 - Structured output / JSON schema mode (`response_format.type == "json_schema"`)
-- `developer` role rewrite to `system` before forwarding
 - Lazy single-backend start on DGX Spark
 - Benchmark-informed within-tier backend selection
 
 Deferred (not phase-1 targets):
+- `developer` role rewrite to `system` before forwarding (not yet implemented)
 - Anthropic and Gemini proxy surfaces
 - WebSocket chat bridge
 - vLLM, SGLang, TRT-LLM, HuggingFace engines
 - Embeddings endpoint
 - Rate limiting enforcement
+- Preflight context-overflow rejection (prompt token count vs `ctx_size`)
 
 `engines_enabled` must remain `["llama.cpp"]` during phase-1 development and testing.
 
@@ -41,8 +42,8 @@ Deferred (not phase-1 targets):
 
 ## Constraints
 
-- Concurrent in-flight requests are capped by a semaphore (`max_concurrent_requests`, default: 10). When full: 429, no queuing.
-- Backend start budget: `startup_wait` seconds from subprocess spawn to `/health` passing (default: 120s). This is separate from per-request inference timeout.
+- Concurrent in-flight requests are capped by a semaphore (`proxy.max_concurrent_requests`, default: 20). When full the request queues for up to `proxy.queue_timeout_sec` (default: 30s), then returns 503 on OpenAI/Gemini routes or 529 on Anthropic routes.
+- Backend start budget: `startup_wait` seconds from subprocess spawn to `/health` passing (default: 30s, per-backend field). This is separate from per-request inference timeout.
 - One backend active at a time is the DGX Spark operating point. Multiple backends can be registered, but concurrent VRAM usage is the operator's responsibility.
 - Stale or missing benchmark data silently falls back to engine-rank ordering. It does not block routing.
 
@@ -102,10 +103,9 @@ All backend errors returned to clients must use this shape:
 |---|---|---|
 | No backend available | 503 | `backend_unavailable` |
 | Backend start timeout | 504 | `backend_start_timeout` |
-| Semaphore queue full | 429 | `rate_limit_exceeded` |
+| Semaphore queue timeout | 503 (OpenAI/Gemini) or 529 (Anthropic) | `overloaded_error` (Anthropic) / plain error (OpenAI) |
 | Backend 4xx (bad request) | forward 4xx | `backend_error` |
 | Backend 5xx | 502 | `backend_error` |
-| Context limit exceeded | 400 | `context_length_exceeded` |
 | Partial stream failure | 502 | `stream_error` |
 
 ---
@@ -198,21 +198,20 @@ llama.cpp is the phase-1 backend. These are hard rules.
 
 | Timeout | What it covers | Default | Configurable |
 |---|---|---|---|
-| `startup_wait` | Spawn to first `/health` pass | 120s | Per-backend |
-| `request_timeout` | Request forwarded to final byte | 300s | Per-backend |
+| `startup_wait` | Spawn to first `/health` pass | 30s | Per-backend (`backends.yaml`) |
+| `proxy.timeout_sec` | Request forwarded to final byte | 300s | `settings.yaml` |
 
-For SSE streaming: `request_timeout` covers time to first token. After first token arrives, chunks are forwarded without an additional per-chunk timeout.
+For SSE streaming: `proxy.timeout_sec` covers time to first token. After first token arrives, chunks are forwarded without an additional per-chunk timeout.
 
 ### Concurrency and Slot Policy
 
 - `n_parallel` in backend config sets `--parallel` on llama-server (parallel completion slots).
-- When semaphore is exhausted: return 429. Do not queue.
+- When semaphore is exhausted: request queues for up to `queue_timeout_sec` (default 30s), then returns 503 (OpenAI/Gemini) or 529 (Anthropic).
 - When llama-server slots are exhausted (backend returns 503): proxy returns 503. Do not retry.
 
 ### Context Overflow
 
-- If estimated token count > `ctx_size`: reject with 400 `context_length_exceeded` before forwarding.
-- The token estimator is approximate. If exact overflow occurs at the backend, the backend 400 is forwarded as-is.
+- **Not yet implemented.** There is no preflight token-count vs `ctx_size` check. Prompts are forwarded to the backend as-is; if the backend rejects with a 4xx, the behavior depends on the request mode: non-streaming requests pass the 4xx through directly, while streaming requests emit the error as an SSE error event inside a 200 response.
 
 ### Retry Policy
 
@@ -252,8 +251,6 @@ These are phase-1 acceptance requirements, not aspirational claims.
 | `POST /v1/chat/completions` SSE streaming | Required | Required |
 | Tool/function calling (OpenAI schema) | Required | Optional |
 | `response_format: json_schema` | Required | Required |
-| Long prompt graceful rejection (400) | Required | Required |
-| `developer` role → `system` rewrite | Required | N/A |
 | Auth header accepted when auth disabled | Required | Required |
 
 ### SSE Streaming Contract
@@ -267,7 +264,7 @@ These are phase-1 acceptance requirements, not aspirational claims.
 
 - `model` field in responses must match what OpenClaw registered as the model identifier. Use the backend key or configured alias as the `id` in `/v1/models` and in response `model` fields — stable across restarts.
 - Tool calls must follow OpenAI schema exactly: `tool_calls[].function.name`, `tool_calls[].function.arguments` (JSON string), `tool_calls[].id`.
-- `developer` role messages must be rewritten to `system` before forwarding to llama.cpp. Do not drop or error.
+- `developer` role rewrite to `system`: **not yet implemented** — currently forwarded unchanged. Deferred to a future phase.
 - OpenClaw setup: `baseURL = http://localhost:9001/v1`, model name = a registered backend key.
 
 ### OpenCode-Specific
@@ -285,18 +282,20 @@ These are phase-1 acceptance requirements, not aspirational claims.
 
 | Field | Type | Default | Requires restart? |
 |---|---|---|---|
-| `host` | str | `"0.0.0.0"` | Yes |
-| `port` | int | `9001` | Yes |
+| `router.host` | str | `"0.0.0.0"` | Yes |
+| `router.port` | int | `9001` | Yes |
 | `engines_enabled` | list[str] | `["llama.cpp"]` | Rescan |
-| `max_concurrent_requests` | int | `10` | Yes |
-| `startup_wait` | int (s) | `120` | `/reload-config` |
-| `request_timeout` | int (s) | `300` | `/reload-config` |
+| `proxy.max_concurrent_requests` | int | `20` | Yes |
+| `proxy.timeout_sec` | int (s) | `300` | `/reload-config` |
+| `proxy.queue_timeout_sec` | int (s) | `30` | `/reload-config` |
 | `routing.token_threshold_deep` | int | `4000` | `/reload-config` |
 | `routing.token_threshold_mid` | int | `500` | `/reload-config` |
 | `routing.deep_keywords` | list[str] | `[]` | `/reload-config` |
 | `routing.mid_keywords` | list[str] | `[]` | `/reload-config` |
 | `scan_dirs` | list[str] | platform defaults | Rescan |
 | `data_dir` | str | `~/.llm-router` | Yes |
+
+`startup_wait` (default: 30s) is a per-backend field in `backends.yaml`, not a top-level setting.
 
 ### Startup Validation (abort on error, not warning)
 
@@ -324,9 +323,9 @@ Middleware changes (auth enable/disable, CORS origins) always require restart.
 | Backend crash before request | `poll()` returns None | State → `unhealthy`; excluded from routing | 503 `backend_unavailable` |
 | Backend crash mid-request | Broken connection | Close stream; state → `unhealthy` | 502 `stream_error` |
 | Startup timeout | `startup_wait` expires | State → `unhealthy`; log stderr tail | 504 `backend_start_timeout` |
-| Semaphore full | Acquire fails | No queuing | 429 `rate_limit_exceeded` |
+| Semaphore full | Queue timeout after `queue_timeout_sec` | Queues, then rejects | 503 (OpenAI/Gemini) or 529 (Anthropic) |
 | Slots full (llama-server 503) | Backend returns 503 | No retry | 503 `backend_unavailable` |
-| Context overflow | Token estimate > ctx_size | Reject before forwarding | 400 `context_length_exceeded` |
+| Context overflow | Not yet implemented | Forwarded to backend as-is | Backend 4xx passed through |
 | OOM / process exits with signal | Poll fails | State → `unhealthy` | 502 `backend_error` |
 | Bad config on startup | Validation | Abort; print error | N/A |
 | Bad config on `/reload-config` | Validation | Keep current config | 400 (admin endpoint) |
@@ -343,15 +342,15 @@ All must pass on a fresh DGX Spark install.
 | Test | Pass Condition |
 |---|---|
 | `GET /v1/models` | JSON with at least one `id` matching a registered llama.cpp backend |
-| Non-streaming chat | `choices[0].message.content` is a string; response within `request_timeout` |
+| Non-streaming chat | `choices[0].message.content` is a string; response within `proxy.timeout_sec` |
 | SSE streaming | Valid SSE chunks; terminates with `data: [DONE]` |
 | Tool call | `choices[0].message.tool_calls` in OpenAI schema |
 | `response_format: json_schema` | Response is valid JSON matching schema |
-| `developer` role message | Rewritten to `system`; no error returned |
-| Lazy start | Backend not running; request starts it; response succeeds within `startup_wait + request_timeout` |
+| `developer` role message | **Deferred** — not yet implemented |
+| Lazy start | Backend not running; request starts it; response succeeds within `startup_wait + proxy.timeout_sec` |
 | Startup timeout | Backend never becomes healthy; client receives 504 within `startup_wait + 5s` |
-| Context overflow | Request with >ctx_size tokens returns 400 before reaching backend |
-| Semaphore saturation | Requests beyond `max_concurrent_requests` receive 429 |
+| Context overflow | **Deferred** — no preflight check yet; backend 4xx is passed through |
+| Semaphore saturation | Requests beyond `max_concurrent_requests` queue for `queue_timeout_sec`, then receive 503/529 |
 | OpenClaw end-to-end | `baseURL=http://localhost:9001/v1`; chat + tool call works |
 | OpenCode end-to-end | `baseURL=http://localhost:9001/v1`; chat works |
 | `/reload-config` | Routing threshold change takes effect without restart |
