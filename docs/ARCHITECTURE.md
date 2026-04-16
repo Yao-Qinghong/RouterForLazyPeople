@@ -153,12 +153,20 @@ Selection runs in strict priority order. The first matching rule wins.
 2. `model_aliases` entry — alias resolves to a backend key, then treated as rule 1.
 3. `[route:key]` prefix in first message content — same rules as rule 1.
 4. Automatic classification:
-   - a. Classify tier from payload (see Tier Classification below).
-   - b. Select candidates: backends matching the classified tier, sorted by benchmark score then engine rank. Unhealthy backends are pushed to the end (not excluded). Capability filtering applies when multiple candidates exist.
-   - c. **If no candidates in the classified tier:** current code falls back to the first registered backend (any tier, no ranking). This is a known limitation — a future version should either return 503 or apply the full ranking logic across all tiers.
-   - d. For each candidate in order: call `ensure_running()` (lazy start). The first backend that starts successfully handles the request.
+    - a. Classify tier from payload (see Tier Classification below).
+    - b. Select candidates: backends matching the classified tier, sorted by benchmark score then engine rank. Unhealthy backends are pushed to the end (not excluded). Capability filtering applies when multiple candidates exist.
+    - c. **Capability filter is fail-open:** If the payload requires tools or JSON schema and no backend in the tier declares support, the filter is skipped and all tier backends remain candidates. The request may route to an incapable backend and fail at the backend level. This is a known limitation.
+    - d. **No-tier fallback is fail-open:** If no backend exists in the classified tier, the code falls back to the first registered backend regardless of tier, capability, or health. This is a known limitation — a future version should return 503 instead.
+    - e. For each candidate in order: call `ensure_running()` (lazy start). The first backend that starts successfully handles the request.
 
-**Capability filter (step b):** When multiple candidates exist, payloads with `tools` prefer backends with `capabilities.supports_tools == True`, and payloads with `response_format.type == "json_schema"` prefer `capabilities.supports_json_schema == True`. If no capable backend is found, the filter is skipped (all tier backends remain candidates).
+**Capability filter detail (`select_candidates()` in `routing.py:221`):** When multiple candidates exist in the tier, payloads with `tools` narrow to backends where `capabilities.supports_tools == True`, and payloads with `response_format.type == "json_schema"` narrow to `capabilities.supports_json_schema == True`. If the narrowed list is empty, the filter result is discarded and all tier backends remain candidates. This is a preference, not a hard gate.
+
+**Known fail-open risks:**
+- A tool-calling request can route to a small model that does not support tools. The backend will likely return malformed output, not a clean error.
+- A JSON-schema request can route to a model without grammar/schema support. The backend may return unstructured text.
+- When no tier match exists, the fallback ignores tier, capability, and health entirely.
+
+These are accepted phase-1 limitations. Operators should ensure at least one capable backend exists per tier they expect to use, or use explicit `?backend=` routing for tool/schema workloads.
 
 **No automatic cloud fallback:** The router does not distinguish local vs remote backends at the routing level — there is no `local` field. Remote/external backends (e.g. OpenAI API keys) require explicit `?backend=` or `[route:key]` routing by design assumption, not by a code-enforced filter.
 
