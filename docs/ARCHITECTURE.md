@@ -91,7 +91,9 @@ Capabilities are inferred at registration time by `_infer_capabilities(engine, s
 
 ### Model Identity
 
-Backend keys serve as model IDs in `/v1/models` and in response `model` fields. They must be stable across restarts for OpenClaw and OpenCode compatibility.
+Backend keys serve as model IDs in `/v1/models`. They must be stable across restarts for OpenClaw and OpenCode compatibility.
+
+**Response `model` fields:** **not yet implemented** — the proxy forwards backend JSON/SSE output unchanged, so response `model` values may differ from the backend key or alias. Only `/v1/models` endpoint guarantees the backend key as the `id`.
 
 **Key generation rules:**
 
