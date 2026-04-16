@@ -366,18 +366,18 @@ If you need throttling today, put the router behind a reverse proxy or API gatew
 
 ## Supported Engines
 
-By default, only **llama.cpp** is enabled. Other engines can be activated by adding them to `engines_enabled` in `config/settings.yaml`.
+Only **llama.cpp** is tested and working today. Other engines have code paths but are **untested** — enable them at your own risk by adding them to `engines_enabled` in `config/settings.yaml`.
 
-| Engine | Format | Default | Notes |
-|---|---|---|---|
-| **llama.cpp** | GGUF | **enabled** | Best for single-GPU, recommended for most users |
-| **vLLM** | HuggingFace | disabled | High throughput, needs CUDA 12.1+ |
-| **SGLang** | HuggingFace | disabled | Fast structured generation, needs CUDA 12.1+ |
-| **TensorRT-LLM** | TRT engines | disabled | Maximum speed on NVIDIA hardware, needs CUDA 12.2+ |
-| **TensorRT-LLM (Docker)** | HuggingFace / NVFP4 | disabled | Managed Docker fallback for NVFP4 checkpoints |
-| **HuggingFace TGI** | HuggingFace | disabled | Broad model support |
-| **Ollama** | Ollama models | disabled | Connects to running Ollama server |
-| **OpenAI-compatible** | any | disabled | Passthrough to any running server on a port |
+| Engine | Format | Default | Status | Notes |
+|---|---|---|---|---|
+| **llama.cpp** | GGUF | **enabled** | **working** | Best for single-GPU, recommended for most users |
+| **vLLM** | HuggingFace | disabled | untested | High throughput, needs CUDA 12.1+ |
+| **SGLang** | HuggingFace | disabled | untested | Fast structured generation, needs CUDA 12.1+ |
+| **TensorRT-LLM** | TRT engines | disabled | untested | Maximum speed on NVIDIA hardware, needs CUDA 12.2+ |
+| **TensorRT-LLM (Docker)** | HuggingFace / NVFP4 | disabled | untested | Managed Docker fallback for NVFP4 checkpoints |
+| **HuggingFace TGI** | HuggingFace | disabled | untested | Broad model support |
+| **Ollama** | Ollama models | disabled | untested | Connects to running Ollama server |
+| **OpenAI-compatible** | any | disabled | untested | Passthrough to servers on `discovery.probe_ports` (default: 8080, 8000–8002, 30000) |
 
 Disabled engines are not detected, their models are not discovered, and they cannot be started — even if their binaries are installed. This keeps the router focused and avoids accidental resource use.
 

@@ -33,9 +33,9 @@ Automatic classification behavior:
 - `routing.deep_keywords` prefer the `deep` tier.
 - `routing.mid_keywords` prefer the `mid` tier.
 - Tool/function-calling requests prefer the `deep` tier.
-- Cached `bench` results are used to prefer faster measured backends when the router must choose among compatible fallbacks.
+- Within the selected tier, `_pick()` ranks backends by: (1) capability match (tool support, JSON schema), (2) highest measured TG tok/s from benchmarks, (3) engine capability rank, (4) round-robin among ties.
 - Everything else falls back to `fast`.
-- If a tier is missing, routing falls back to any available backend.
+- If no backend exists in the classified tier, `_pick()` falls back to the first registered backend regardless of tier. This is a known limitation — the fallback is not health-aware or benchmark-ranked. A future version should either return 503 or apply the same ranking logic across all tiers.
 
 Thinking / reasoning behavior:
 
