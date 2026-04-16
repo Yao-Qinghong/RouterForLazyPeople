@@ -29,6 +29,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from router.metrics import RequestRecord, MetricsStore, extract_token_counts
+from router.provider import get_provider
 from router.routing import classify_candidates
 
 if TYPE_CHECKING:
@@ -310,55 +311,77 @@ async def handle_proxy(
             },
         )
 
+    _sem_transferred = False
     try:
-        # ── Try candidates with fallback ──────────────────────
+        # ── Try candidates with startup + request-time fallback ──
         last_error = None
+        last_response = None
         backend_key = candidates[0]
+        is_stream = payload.get("stream", False)
+        original_model = payload.get("model", "")
 
         for candidate in candidates:
             if candidate not in backends:
                 continue
             try:
                 await manager.ensure_running(candidate)
-                backend_key = candidate
-                last_error = None
-                break
             except RuntimeError as e:
                 last_error = e
                 manager.mark_unhealthy(candidate)
                 logger.warning(f"[{candidate}] failed to start, trying next candidate: {e}")
                 continue
 
+            backend_key = candidate
+            last_error = None
+            cfg = backends[backend_key]
+            target_url = f"http://localhost:{cfg['port']}/v1/{path}"
+
+            # Rewrite model name for the backend's engine API
+            provider = get_provider(cfg.get("engine", ""))
+            if provider:
+                payload["model"] = provider.rewrite_model_name(cfg, original_model)
+
+            if is_stream:
+                _sem_transferred = True
+                return await _proxy_stream(
+                    target_url, payload, path, backend_key, cfg,
+                    start_time, request_id, metrics_store, config, manager,
+                    semaphore=_semaphore,
+                )
+
+            # Non-streaming: try request, failover on connection-level failures
+            async with manager.request_lease(backend_key):
+                response = await _proxy_nonstream(
+                    target_url, payload, path, backend_key, cfg,
+                    start_time, request_id, metrics_store, config,
+                )
+            if response.status_code in (502, 504):
+                manager.mark_unhealthy(backend_key)
+                logger.warning(
+                    f"[{backend_key}] request failed ({response.status_code}), trying next"
+                )
+                last_response = response
+                continue
+            return response
+
         if last_error:
-            cfg = backends.get(backend_key, {})
             return JSONResponse(
                 status_code=503,
                 content={
                     "error": str(last_error),
                     "backend": backend_key,
-                    "log": cfg.get("log", ""),
+                    "log": backends.get(backend_key, {}).get("log", ""),
                     "request_id": request_id,
                 },
             )
-
-        cfg = backends[backend_key]
-        target_url = f"http://localhost:{cfg['port']}/v1/{path}"
-        is_stream = payload.get("stream", False)
-
-        if is_stream:
-            return await _proxy_stream(
-                target_url, payload, path, backend_key, cfg,
-                start_time, request_id, metrics_store, config, manager,
-            )
-        else:
-            async with manager.request_lease(backend_key):
-                return await _proxy_nonstream(
-                    target_url, payload, path, backend_key, cfg,
-                    start_time, request_id, metrics_store, config,
-                )
+        return last_response or JSONResponse(
+            status_code=503,
+            content={"error": "No backends available", "request_id": request_id},
+        )
 
     finally:
-        _semaphore.release()
+        if not _sem_transferred:
+            _semaphore.release()
 
 
 async def _proxy_nonstream(
@@ -488,6 +511,7 @@ async def _proxy_stream(
     metrics_store: MetricsStore,
     config: "AppConfig",
     manager: "BackendManager" = None,
+    semaphore: asyncio.Semaphore = None,
 ) -> StreamingResponse:
     """Stream the response, capturing TTFT on the first chunk with improved token counting."""
 
@@ -609,6 +633,9 @@ async def _proxy_stream(
                 tokens_per_sec=0.0, status_code=500,
                 error=str(e)[:200],
             ))
+        finally:
+            if semaphore is not None:
+                semaphore.release()
 
     return StreamingResponse(stream_with_metrics(), media_type="text/event-stream")
 
@@ -704,6 +731,7 @@ async def handle_anthropic_proxy(
             }},
         )
 
+    _sem_transferred = False
     try:
         # ── Start backend with fallback ───────────────────────
         backend_key = None
@@ -735,6 +763,11 @@ async def handle_anthropic_proxy(
         cfg        = backends[backend_key]
         oai_payload = anthropic_to_openai(payload)
         target_url  = f"http://localhost:{cfg['port']}/v1/chat/completions"
+
+        # Rewrite model name for the backend's engine API
+        provider = get_provider(cfg.get("engine", ""))
+        if provider:
+            oai_payload["model"] = provider.rewrite_model_name(cfg, oai_payload.get("model", ""))
 
         if is_stream:
             converter = stream_openai_to_anthropic(original_model)
@@ -809,7 +842,10 @@ async def handle_anthropic_proxy(
                     logger.warning(f"[{backend_key}] anthropic stream error: {e}")
                     err = {"type": "error", "error": {"type": "stream_error", "message": str(e)}}
                     yield f"event: error\ndata: {json.dumps(err)}\n\n".encode()
+                finally:
+                    _semaphore.release()
 
+            _sem_transferred = True
             return StreamingResponse(
                 anthropic_stream(),
                 media_type="text/event-stream",
@@ -846,7 +882,15 @@ async def handle_anthropic_proxy(
                         if attempt < max_retries:
                             await asyncio.sleep(config.proxy.retry_backoff_sec * (attempt + 1))
                             continue
-                        raise
+                        total_ms = (time.time() - start_time) * 1000
+                        return JSONResponse(
+                            status_code=502,
+                            content={"type": "error", "error": {
+                                "type": "api_error",
+                                "message": f"Backend '{backend_key}' unreachable: {e}",
+                            }},
+                            headers={"anthropic-version": "2023-06-01"},
+                        )
                     except httpx.TimeoutException:
                         total_ms = (time.time() - start_time) * 1000
                         return JSONResponse(
@@ -888,7 +932,8 @@ async def handle_anthropic_proxy(
                 )
 
     finally:
-        _semaphore.release()
+        if not _sem_transferred:
+            _semaphore.release()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -949,6 +994,7 @@ async def handle_gemini_proxy(
     except asyncio.TimeoutError:
         return JSONResponse(status_code=503, content={"error": {"message": "Overloaded"}})
 
+    _sem_transferred = False
     try:
         backend_key = None
         last_error = None
@@ -974,6 +1020,11 @@ async def handle_gemini_proxy(
         cfg = backends[backend_key]
         oai_payload = gemini_to_openai(payload, is_stream=is_stream)
         target_url = f"http://localhost:{cfg['port']}/v1/chat/completions"
+
+        # Rewrite model name for the backend's engine API
+        provider = get_provider(cfg.get("engine", ""))
+        if provider:
+            oai_payload["model"] = provider.rewrite_model_name(cfg, oai_payload.get("model", ""))
 
         if is_stream:
             converter = stream_openai_to_gemini(model)
@@ -1019,12 +1070,24 @@ async def handle_gemini_proxy(
                         ))
                 except Exception as e:
                     logger.warning(f"[{backend_key}] gemini stream error: {e}")
+                finally:
+                    _semaphore.release()
 
+            _sem_transferred = True
             return StreamingResponse(gemini_stream(), media_type="text/event-stream")
         else:
             async with manager.request_lease(backend_key):
-                client = get_client(cfg["port"], config.proxy.timeout_sec)
-                resp = await client.post(target_url, json=oai_payload)
+                try:
+                    client = get_client(cfg["port"], config.proxy.timeout_sec)
+                    resp = await client.post(target_url, json=oai_payload)
+                except httpx.ConnectError as e:
+                    return JSONResponse(status_code=502, content={
+                        "error": {"message": f"Backend '{backend_key}' unreachable: {e}"}
+                    })
+                except httpx.TimeoutException:
+                    return JSONResponse(status_code=504, content={
+                        "error": {"message": f"Backend timed out after {config.proxy.timeout_sec}s"}
+                    })
                 resp_status = resp.status_code
                 try:
                     oai_body = resp.json()
@@ -1046,4 +1109,5 @@ async def handle_gemini_proxy(
                 return JSONResponse(content=gemini_body, status_code=resp_status)
 
     finally:
-        _semaphore.release()
+        if not _sem_transferred:
+            _semaphore.release()

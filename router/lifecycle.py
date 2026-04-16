@@ -221,7 +221,7 @@ class BackendManager:
             return False
 
         # Clear any process squatting on our port (zombie from previous start, or unrelated)
-        self._kill_port(cfg["port"], key)
+        self._check_port_conflict(cfg["port"], key)
 
         try:
             cmd = self._build_cmd(key, trt_config)
@@ -259,7 +259,7 @@ class BackendManager:
         os.makedirs(docker_cfg["log_dir"], exist_ok=True)
 
         # Clear any process on the target port (stale container or zombie)
-        self._kill_port(cfg["port"], key)
+        self._check_port_conflict(cfg["port"], key)
 
         cmd = self._build_cmd(key)
         log_file = self._open_log(key)
@@ -392,23 +392,21 @@ class BackendManager:
             f"Check {cfg['log']}"
         )
 
-    def _kill_port(self, port: int, key: str) -> bool:
+    def _check_port_conflict(self, port: int, key: str):
         """
-        Kill any process currently listening on *port* so we can bind it.
-        This clears both port conflicts from unrelated programs and zombie
-        processes left over from a previous failed backend start.
-        Returns True if something was killed (caller should sleep briefly).
+        Check for port conflicts before binding.
+
+        Only kills our own zombie processes (tracked PIDs from previous starts).
+        For foreign processes, raises RuntimeError with a clear message so the
+        user can resolve the conflict — never blindly kills unrelated services.
         """
-        # Quick check: is the port actually occupied?
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(0.5)
             if s.connect_ex(("127.0.0.1", port)) != 0:
-                return False  # Port is free — nothing to do
+                return  # Port is free
 
-        logger.info(f"[{key}] Port {port} already in use — finding and killing occupying process")
-        killed_any = False
-
-        # Try lsof first (macOS + most Linux distributions)
+        # Identify who's on the port
+        occupant_pids: set[int] = set()
         try:
             r = subprocess.run(
                 ["lsof", "-t", "-i", f"TCP:{port}", "-s", "TCP:LISTEN"],
@@ -416,37 +414,41 @@ class BackendManager:
             )
             for pid_str in r.stdout.split():
                 if pid_str.isdigit():
-                    pid = int(pid_str)
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                        logger.info(f"[{key}] Killed PID {pid} (was on port {port})")
-                        killed_any = True
-                    except ProcessLookupError:
-                        pass
-                    except PermissionError:
-                        logger.warning(
-                            f"[{key}] Permission denied killing PID {pid} on port {port} — "
-                            f"stop that process manually and retry"
-                        )
+                    occupant_pids.add(int(pid_str))
         except FileNotFoundError:
-            # lsof not available — fall back to fuser (Linux)
-            try:
-                result = subprocess.run(
-                    ["fuser", "-k", f"{port}/tcp"],
-                    capture_output=True, timeout=5, check=False,
-                )
-                killed_any = result.returncode == 0
-                if killed_any:
-                    logger.info(f"[{key}] fuser killed process on port {port}")
-            except FileNotFoundError:
-                logger.warning(
-                    f"[{key}] Cannot free port {port}: neither lsof nor fuser is available. "
-                    f"Kill the occupying process manually."
-                )
+            pass  # lsof not available
 
-        if killed_any:
-            time.sleep(1.0)  # Give the OS time to release the port
-        return killed_any
+        # Only kill our own tracked zombie processes
+        our_pids = {p.pid for p in self.processes.values() if hasattr(p, "pid")}
+        our_zombies = occupant_pids & our_pids
+
+        for pid in our_zombies:
+            try:
+                os.kill(pid, signal.SIGKILL)
+                logger.info(f"[{key}] Killed own zombie PID {pid} on port {port}")
+            except (ProcessLookupError, PermissionError):
+                pass
+
+        if our_zombies:
+            time.sleep(1.0)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.5)
+                if s.connect_ex(("127.0.0.1", port)) != 0:
+                    return  # Port freed after killing zombie
+
+        # Port still occupied by something foreign
+        foreign = sorted(occupant_pids - our_zombies)
+        if foreign:
+            raise RuntimeError(
+                f"Port {port} is already in use by PID(s) {foreign}. "
+                f"Stop the conflicting process or change the port for '{key}' "
+                f"in config/backends.yaml."
+            )
+        raise RuntimeError(
+            f"Port {port} is already in use by an unknown process. "
+            f"Run 'lsof -i TCP:{port}' to identify it, then stop it "
+            f"or change the port for '{key}' in config/backends.yaml."
+        )
 
     def _evict_for_vram(self, needed_gb: float, exclude_key: str = "") -> bool:
         """

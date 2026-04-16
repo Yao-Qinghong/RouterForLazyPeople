@@ -80,6 +80,8 @@ class TestClassify:
         payload = {"messages": [{"content": "[route:deep] test message"}]}
         result = classify(payload, BACKENDS_BASIC, _make_config())
         assert result == "deep"
+        # Verify the prefix is stripped from the message before forwarding
+        assert payload["messages"][0]["content"] == "test message"
 
     def test_explicit_route_unknown_key(self):
         payload = {"messages": [{"content": "[route:nonexistent] test"}]}
