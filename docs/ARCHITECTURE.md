@@ -89,6 +89,30 @@ Capabilities are inferred at registration time by `_infer_capabilities(engine, s
 - Medium models (>=8 GB or 13B+ names): `supports_tools=True, supports_json_schema=True, code_quality="good"`
 - Small models: `supports_tools=False, supports_json_schema=False, code_quality="weak"`
 
+### Model Identity
+
+Backend keys serve as model IDs in `/v1/models` and in response `model` fields. They must be stable across restarts for OpenClaw and OpenCode compatibility.
+
+**Key generation rules:**
+
+| Source | Key format | Example |
+|---|---|---|
+| `backends.yaml` (manual) | The YAML key verbatim | `fast`, `deep`, `my-llama` |
+| GGUF auto-discovery | `_slug(filename, path)` | `qwen3-5-35b-a3b-ud-q4-k-xl` |
+| HuggingFace auto-discovery | `_slug("hf-" + dirname, path)` | `hf-meta-llama-3-1-8b` |
+| TRT-LLM auto-discovery | `_slug("trt-" + dirname, path)` | `trt-nemotron-nano` |
+| Ollama | `"ollama-" + slugified_name` | `ollama-llama3` |
+| LM Studio (external) | `"lmstudio"` | `lmstudio` |
+| Probed ports (external) | `"local-" + port` | `local-8080` |
+
+**`_slug(name, path)`** (`discovery.py:94`): lowercase, replace `[^a-z0-9]` with `-`, strip leading/trailing `-`. If longer than 40 chars, truncate to 35 and append `-` + first 4 hex of MD5(path).
+
+**Alias exposure:** Configured `model_aliases` (e.g. `gpt-4: deep`) are listed as additional entries in `/v1/models` alongside their target backend key. Both the alias and the canonical key are valid `model` values in requests.
+
+**Collision rule:** Manual backends (`backends.yaml`) win on key collision with auto-discovered backends. Among auto-discovered sources, the merge order is `{**gguf, **hf, **trt}`, so on slug collision TRT-LLM > HF > GGUF takes the winning config.
+
+**Stability guarantee:** For a given model file at a given path, the slug is deterministic. Moving or renaming the file changes the key. Manual `backends.yaml` keys are fully operator-controlled and always stable.
+
 ### Error Responses
 
 Error shapes vary by route. There is no single normalized envelope today.
