@@ -267,6 +267,16 @@ For SSE streaming: `proxy.timeout_sec` covers time to first token. After first t
 | Connection refused | State → `unhealthy`. Return 503 `backend_unavailable`. |
 | Process exited mid-stream | Return 502 `stream_error`. State → `unhealthy`. |
 
+### Known Gaps (day-2 controls not yet implemented)
+
+These are behaviors the llama.cpp contract does not yet specify or enforce. They are tracked as open questions (#5–#8 in the Open Questions section).
+
+- **Slot alignment:** The router semaphore (`max_concurrent_requests`, default 20) and llama-server slot count (`--parallel`, default 1) are independent. With default settings, the semaphore admits 20 concurrent requests but llama-server can only serve 1 at a time — the rest queue inside llama-server and may time out. Operators should either set `extra_args: ["--parallel", "20"]` in `backends.yaml` or reduce `max_concurrent_requests` to 1.
+- **Stream-idle timeout:** After the first SSE token arrives, there is no per-chunk timeout. A hung backend that stops emitting tokens will hold the connection and semaphore slot until `proxy.timeout_sec` expires (default 300s) or the client disconnects.
+- **Client disconnect:** When a client closes the connection mid-stream, the proxy stops forwarding but does not cancel the backend request. llama-server continues generating tokens until completion, wasting GPU compute.
+- **Repeated-failure backoff:** If a backend fails to start repeatedly (e.g. missing model file, OOM), each incoming request retries `ensure_running()` from scratch with no backoff or circuit-breaker. Under load this produces a retry storm.
+- **Health probe specificity:** The readiness probe accepts any HTTP 200 from `/health`. It does not verify the response body (`{"status": "ok"}`) or that the correct model is loaded. A healthy but wrong-model llama-server would pass the probe.
+
 ---
 
 ## OpenClaw / OpenCode Compatibility
