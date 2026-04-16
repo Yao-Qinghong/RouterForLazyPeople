@@ -51,39 +51,42 @@ Deferred (not phase-1 targets):
 
 ## Core Domain Objects
 
-### BackendDescriptor
+### BackendConfig
+
+The actual runtime type is `BackendConfig` in `router/config.py`. Key fields:
 
 ```python
 @dataclass
-class BackendDescriptor:
-    key: str            # unique slug, e.g. "llama-mistral-7b"
-    engine: str         # "llama.cpp" | "vllm" | "ollama" | "openai" | ...
-    tier: str           # "fast" | "mid" | "deep"
-    host: str
-    port: int
-    model_path: str | None   # absolute path for managed engines; None for external
-    ctx_size: int            # context window in tokens
-    n_parallel: int          # parallel slots (llama.cpp --parallel); default 1
-    idle_timeout: int        # seconds before idle eviction; 0 = never
-    is_external: bool        # True → router does not own the process
-    capabilities: Capabilities
+class BackendConfig:
+    engine: str = "llama.cpp"
+    port: int = 8080
+    model: str = ""              # absolute path for GGUF / HF checkpoint
+    model_dir: str = ""          # directory for multi-file models
+    tier: str = ""               # "fast" | "mid" | "deep" (auto-assigned if empty)
+    ctx_size: int = 32768
+    idle_timeout: int = 300      # seconds before idle eviction; 0 = never
+    startup_wait: int = 30       # seconds to wait for /health on start
+    auto_discovered: bool = False
+    capabilities: BackendCapabilities = ...
 ```
 
-### Capabilities
+External backends (LM Studio, Ollama, running servers) use sentinel process objects (`_ExternalSentinel`, `_OllamaSentinel`) instead of `Popen`; they are not distinguished by a boolean field.
+
+### BackendCapabilities
 
 ```python
 @dataclass
-class Capabilities:
-    streaming: bool          # supports SSE streaming
-    tools: bool              # supports tool/function calling
-    structured_output: bool  # supports JSON schema / grammar mode
-    embeddings: bool         # supports /v1/embeddings
-    context_limit: int       # hard context ceiling in tokens
-    local: bool              # True if process runs on same node as router
+class BackendCapabilities:
+    supports_tools: bool = False
+    supports_json_schema: bool = False
+    max_context: int = 32768
+    code_quality: str = "good"   # "weak" | "good" | "strong"
 ```
 
-llama.cpp defaults:
-`streaming=True, tools=True, structured_output=True, embeddings=False, context_limit=ctx_size, local=True`
+Capabilities are inferred at registration time by `_infer_capabilities(engine, size_gb, name)`:
+- Large models (>=25 GB or 32B+ names): `supports_tools=True, supports_json_schema=True, code_quality="strong"`
+- Medium models (>=8 GB or 13B+ names): `supports_tools=True, supports_json_schema=True, code_quality="good"`
+- Small models: `supports_tools=False, supports_json_schema=False, code_quality="weak"`
 
 ### Error Responses
 
@@ -154,9 +157,7 @@ Selection runs in strict priority order. The first matching rule wins.
 
 **Capability filter (step b):** When multiple candidates exist, payloads with `tools` prefer backends with `capabilities.supports_tools == True`, and payloads with `response_format.type == "json_schema"` prefer `capabilities.supports_json_schema == True`. If no capable backend is found, the filter is skipped (all tier backends remain candidates).
 
-**Local-first:** `local=True` backends are ranked ahead of `local=False` regardless of benchmark scores.
-
-**No automatic cloud fallback:** Backends with `local=False` are never selected by the automatic classifier.
+**No automatic cloud fallback:** The router does not distinguish local vs remote backends at the routing level — there is no `local` field. Remote/external backends (e.g. OpenAI API keys) require explicit `?backend=` or `[route:key]` routing by design assumption, not by a code-enforced filter.
 
 ### Tier Classification
 
@@ -200,7 +201,7 @@ For SSE streaming: `proxy.timeout_sec` covers time to first token. After first t
 
 ### Concurrency and Slot Policy
 
-- `n_parallel` in backend config sets `--parallel` on llama-server (parallel completion slots).
+- The router does **not** set `--parallel` on llama-server. Parallel slot count is llama-server's default (1) unless the operator adds it via `extra_args` in `backends.yaml`.
 - When semaphore is exhausted: request queues for up to `queue_timeout_sec` (default 30s), then returns 503 (OpenAI/Gemini) or 529 (Anthropic).
 - When llama-server slots are exhausted (backend returns 503): proxy returns 503. Do not retry.
 
