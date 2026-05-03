@@ -30,7 +30,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from router.metrics import RequestRecord, MetricsStore, extract_token_counts
 from router.provider import get_provider
-from router.routing import classify_candidates
+from router.routing import InvalidRouteKey, classify_candidates, extract_route_key
 
 if TYPE_CHECKING:
     from router.config import AppConfig
@@ -260,15 +260,51 @@ async def handle_proxy(
         )
 
     # ── Determine backend ─────────────────────────────────────
-    # Priority: ?backend= param → model alias → classifier candidates with fallback
+    # Priority: ?backend= param → model alias → classifier candidates with fallback.
+    # An explicitly named backend that doesn't exist is a client error (400),
+    # never a retryable outage. Reserve 503 for the classifier-cannot-satisfy
+    # path so SDKs don't auto-retry typos.
+    query_backend = request.query_params.get("backend")
+    if query_backend is not None and query_backend not in backends:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"Unknown backend '{query_backend}'",
+                "type": "invalid_request_error",
+                "param": "backend",
+                "valid_backends": list(backends.keys()),
+                "request_id": request_id,
+            },
+        )
+
+    # Validate and consume `[route:<key>]` early so a typo fails fast with a
+    # 400 (matching `?backend=` semantics) instead of silently leaking to a
+    # backend selected by model_aliases or the classifier.
+    try:
+        route_key = extract_route_key(payload, backends)
+    except InvalidRouteKey as e:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"Unknown route key '{e.key}'",
+                "type": "invalid_request_error",
+                "param": "route",
+                "valid_backends": e.valid_backends,
+                "request_id": request_id,
+            },
+        )
+
+    # Priority order matches docs/ARCHITECTURE.md:
+    #   1. ?backend=  →  2. model_aliases  →  3. [route:key]  →  4. classifier
     explicit_key = (
-        request.query_params.get("backend")
+        query_backend
         or resolve_requested_model(
             payload.get("model", ""),
             backends,
             config.model_aliases,
             manager,
         )
+        or route_key
     )
 
     if explicit_key:
@@ -279,15 +315,24 @@ async def handle_proxy(
             healthy_fn=manager.is_healthy,
         )
 
-    # Validate at least first candidate exists
-    if not candidates or (len(candidates) == 1 and candidates[0] not in backends):
+    # No candidate could satisfy the request's tier / capability requirements.
+    # Treat this as service-unavailable (503) per docs/ARCHITECTURE.md so
+    # clients retry rather than treating it as a request-shape error.
+    if not candidates or not any(c in backends for c in candidates):
+        attempted = candidates[0] if candidates else ""
         return JSONResponse(
-            status_code=400,
+            status_code=503,
             content={
-                "error": f"Unknown backend '{candidates[0] if candidates else ''}'",
+                "error": (
+                    f"No backend available for routing decision '{attempted}'"
+                    if attempted else "No backend available for this request"
+                ),
+                "type": "service_unavailable",
                 "valid_backends": list(backends.keys()),
+                "retry_after": config.proxy.queue_timeout_sec,
                 "request_id": request_id,
             },
+            headers={"Retry-After": str(config.proxy.queue_timeout_sec)},
         )
 
     _audit_request(request_id, candidates[0], path, payload, config, api_key_name)
@@ -683,7 +728,40 @@ async def handle_anthropic_proxy(
     is_stream      = payload.get("stream", False)
 
     # ── Determine backend candidates ─────────────────────────
-    explicit_key = request.query_params.get("backend")
+    # Explicit ?backend= must point at a registered key. A typo there is a
+    # client error (400) — never silently fall back to the classifier, that
+    # would route the request to the wrong backend.
+    query_backend = request.query_params.get("backend")
+    if query_backend is not None and query_backend not in backends:
+        return JSONResponse(
+            status_code=400,
+            content={"type": "error", "error": {
+                "type": "invalid_request_error",
+                "message": f"Unknown backend '{query_backend}'. "
+                           f"Valid backends: {list(backends.keys())}",
+            }},
+            headers={"anthropic-version": "2023-06-01"},
+        )
+
+    # Validate and consume `[route:<key>]` before falling into model-name
+    # routing. Otherwise the Anthropic-specific `model_to_backend()` heuristic
+    # would silently override (or mask a typo in) an explicit prefix.
+    try:
+        route_key = extract_route_key(payload, backends)
+    except InvalidRouteKey as e:
+        return JSONResponse(
+            status_code=400,
+            content={"type": "error", "error": {
+                "type": "invalid_request_error",
+                "message": f"Unknown route key '{e.key}'. "
+                           f"Valid backends: {e.valid_backends}",
+            }},
+            headers={"anthropic-version": "2023-06-01"},
+        )
+
+    # Priority order matches docs/ARCHITECTURE.md:
+    #   1. ?backend=  →  2. model_aliases  →  3. [route:key]  →  Anthropic heuristic
+    explicit_key = query_backend
     if not explicit_key:
         explicit_key = resolve_requested_model(
             original_model,
@@ -691,6 +769,8 @@ async def handle_anthropic_proxy(
             config.model_aliases,
             manager,
         )
+    if not explicit_key:
+        explicit_key = route_key
     if not explicit_key:
         explicit_key = model_to_backend(original_model)
 
@@ -703,14 +783,22 @@ async def handle_anthropic_proxy(
             healthy_fn=manager.is_healthy,
         )
 
+    # No candidate could satisfy the request's tier / capability requirements.
+    # Per docs/ARCHITECTURE.md the Anthropic surface returns 503 (Anthropic uses
+    # api_error for service-unavailable conditions; 529 stays reserved for the
+    # backpressure path).
     if not candidates or not any(c in backends for c in candidates):
         return JSONResponse(
-            status_code=400,
+            status_code=503,
             content={"type": "error", "error": {
-                "type": "invalid_request_error",
+                "type": "api_error",
                 "message": f"No backend available for model '{original_model}'. "
                            f"Valid backends: {list(backends.keys())}",
             }},
+            headers={
+                "anthropic-version": "2023-06-01",
+                "Retry-After": str(config.proxy.queue_timeout_sec),
+            },
         )
 
     # ── Backpressure ──────────────────────────────────────────
@@ -966,10 +1054,44 @@ async def handle_gemini_proxy(
     except Exception:
         return JSONResponse(status_code=400, content={"error": {"message": "Invalid JSON body"}})
 
-    # Determine backend candidates
+    # Determine backend candidates. Explicit ?backend= must name a registered
+    # key — a typo there is a client error (400 INVALID_ARGUMENT) instead of
+    # silently falling through to the classifier, which would route to the
+    # wrong backend.
+    query_backend = request.query_params.get("backend")
+    if query_backend is not None and query_backend not in backends:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "message": f"Unknown backend '{query_backend}'. "
+                           f"Valid backends: {list(backends.keys())}",
+            }},
+        )
+
+    # Validate and consume `[route:<key>]` before falling into Gemini's
+    # model-name heuristic. Otherwise a typo in the prefix could be silently
+    # masked by `gemini_model_to_backend()`.
+    try:
+        route_key = extract_route_key(payload, backends)
+    except InvalidRouteKey as e:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {
+                "code": 400,
+                "status": "INVALID_ARGUMENT",
+                "message": f"Unknown route key '{e.key}'. "
+                           f"Valid backends: {e.valid_backends}",
+            }},
+        )
+
+    # Priority order matches docs/ARCHITECTURE.md:
+    #   1. ?backend=  →  2. model_aliases  →  3. [route:key]  →  Gemini heuristic
     explicit_key = (
-        request.query_params.get("backend")
+        query_backend
         or resolve_requested_model(model, backends, config.model_aliases, manager)
+        or route_key
         or gemini_model_to_backend(model)
     )
     if explicit_key and explicit_key in backends:

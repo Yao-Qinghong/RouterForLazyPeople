@@ -43,7 +43,10 @@ Automatic classification behavior:
 - Tool/function-calling requests prefer the `deep` tier.
 - Within the selected tier, `_pick()` ranks backends by: (1) capability match (tool support, JSON schema), (2) highest measured TG tok/s from benchmarks, (3) engine capability rank, (4) round-robin among ties.
 - Everything else falls back to `fast`.
-- If no backend exists in the classified tier, `_pick()` falls back to the first registered backend regardless of tier. This is a known limitation — the fallback is not health-aware or benchmark-ranked. A future version should either return 503 or apply the same ranking logic across all tiers.
+- If no backend exists in the classified tier, the router returns a service-unavailable error (503 on OpenAI/Anthropic, 400 on Gemini) rather than silently routing to a backend in a different tier. Direct backend selection (`?backend=`, configured `model_aliases`, and `[route:key]`) bypasses the tier classifier.
+- If a request requires `tools` or `response_format=json_schema` and no backend in the classified tier declares the matching capability, the router returns the same service-unavailable error rather than routing to an incapable backend.
+- An explicit `?backend=<key>` query parameter or `[route:<key>]` message prefix that does not match any registered backend is a client error (400) on every surface — `invalid_request_error` on OpenAI/Anthropic, `INVALID_ARGUMENT` on Gemini. The router never silently falls back to the classifier or to model-name heuristics when the caller named a backend, so a typo fails fast instead of being routed to a different backend. This 400 is distinct from the classifier-cannot-satisfy 503/400 above, which only applies when no explicit selection was made.
+- A valid `[route:<key>]` prefix is stripped from the payload before forwarding so it never leaks to the backend. The prefix is recognized in OpenAI string content, Anthropic `{"type": "text"}` content blocks, and Gemini `parts[].text` blocks.
 
 Thinking / reasoning behavior:
 

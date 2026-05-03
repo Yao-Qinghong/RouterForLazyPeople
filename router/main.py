@@ -116,6 +116,23 @@ def setup_logging(config: AppConfig):
 # App factory
 # ─────────────────────────────────────────────────────────────
 
+def _ws_api_key(ws: "WebSocket") -> str | None:
+    """Extract an API key from a WebSocket handshake.
+
+    Mirrors AuthMiddleware._extract_key: Authorization: Bearer ..., x-api-key,
+    plus a query string fallback (api_key / access_token) since some browser
+    clients cannot set headers on the WS handshake.
+    """
+    auth = ws.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:].strip() or None
+    header_key = ws.headers.get("x-api-key")
+    if header_key:
+        return header_key
+    qp = ws.query_params
+    return qp.get("api_key") or qp.get("access_token") or None
+
+
 def _quality_warning(cfg: dict) -> str:
     """
     Return a short warning string if a backend is likely too small for
@@ -757,50 +774,141 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
     async def websocket_chat(ws: WebSocket):
         """
         WebSocket endpoint for streaming chat completions.
-        Send a JSON payload, receive streamed chunks as JSON messages.
+
+        Requires the same protections as HTTP inference: API-key auth (when
+        enabled), the shared backpressure semaphore, and the per-backend
+        request lease so the WS path cannot bypass HTTP-side guards.
         """
+        config = ws.app.state.config
+        manager = ws.app.state.manager
+        from router.routing import (
+            InvalidRouteKey,
+            classify as ws_classify,
+            extract_route_key,
+        )
+        from router import proxy as proxy_module
+
+        # ── Auth check (Starlette BaseHTTPMiddleware does not run on WS) ──
+        if config.auth.enabled:
+            keys: dict[str, dict] = {
+                entry["key"]: {
+                    "name": entry.get("name", "unnamed"),
+                    "scope": entry.get("scope", "all"),
+                }
+                for entry in config.auth.api_keys
+            }
+            api_key = _ws_api_key(ws)
+            info = keys.get(api_key) if api_key else None
+            if info is None:
+                await ws.close(code=1008, reason="Invalid or missing API key")
+                return
+            if info["scope"] not in ("inference", "all"):
+                await ws.close(code=1008, reason="Insufficient scope")
+                return
+
+        # Ensure the shared semaphore exists (mirrors handle_proxy lazy init).
+        if proxy_module._semaphore is None:
+            proxy_module.init_semaphore(config.proxy.max_concurrent_requests)
+
         await ws.accept()
         try:
             while True:
                 data = await ws.receive_json()
                 data["stream"] = True
 
-                manager = ws.app.state.manager
-                config = ws.app.state.config
-                from router.routing import classify as ws_classify
+                backends = manager.snapshot_backends()
+                requested = data.pop("backend", None)
 
-                backend_key = data.pop("backend", None) or ws_classify(data, manager.backends, config)
-                if backend_key not in manager.backends:
-                    await ws.send_json({"error": f"Unknown backend '{backend_key}'"})
+                # Validate and consume any `[route:<key>]` prefix BEFORE the
+                # top-level `backend` short-circuit. Otherwise a payload like
+                # `{"backend": "fast", "messages": [{"content": "[route:fast] hi"}]}`
+                # would leak the control prefix to the backend, and a typo
+                # like `[route:does-not-exist]` would not fail fast. This
+                # mirrors the HTTP proxy handlers.
+                try:
+                    route_key = extract_route_key(data, backends)
+                except InvalidRouteKey as e:
+                    await ws.send_json({"error": {
+                        "type": "invalid_request_error",
+                        "param": "route",
+                        "message": f"Unknown route key '{e.key}'",
+                        "valid_backends": e.valid_backends,
+                    }})
+                    continue
+
+                # An explicit top-level `backend` field is the WS analog of
+                # `?backend=`. A typo there is a permanent client error — never
+                # surface it as `service_unavailable`, which would invite SDKs
+                # to retry the typo as if the server were temporarily down.
+                if requested is not None and requested not in backends:
+                    await ws.send_json({"error": {
+                        "type": "invalid_request_error",
+                        "param": "backend",
+                        "message": f"Unknown backend '{requested}'",
+                        "valid_backends": list(backends.keys()),
+                    }})
+                    continue
+
+                # Priority: top-level `backend` (≈ ?backend=) → [route:key] → classify
+                if requested:
+                    backend_key = requested
+                elif route_key:
+                    backend_key = route_key
+                else:
+                    backend_key = ws_classify(data, backends, config)
+                if not backend_key or backend_key not in backends:
+                    # Classifier had nothing to satisfy the request — retryable
+                    # once another backend is registered.
+                    await ws.send_json({"error": {
+                        "type": "service_unavailable",
+                        "message": "No backend available for this request",
+                    }})
+                    continue
+
+                # ── Backpressure (shared with HTTP) ──────────────────
+                try:
+                    await asyncio.wait_for(
+                        proxy_module._semaphore.acquire(),
+                        timeout=config.proxy.queue_timeout_sec,
+                    )
+                except asyncio.TimeoutError:
+                    await ws.send_json({"error": {
+                        "type": "overloaded",
+                        "message": "Router overloaded — too many concurrent requests",
+                        "retry_after": config.proxy.queue_timeout_sec,
+                    }})
                     continue
 
                 try:
-                    await manager.ensure_running(backend_key)
-                except RuntimeError as e:
-                    await ws.send_json({"error": str(e)})
-                    continue
+                    try:
+                        await manager.ensure_running(backend_key)
+                    except RuntimeError as e:
+                        await ws.send_json({"error": {"type": "backend_start_failed", "message": str(e)}})
+                        continue
 
-                cfg = manager.backends[backend_key]
-                manager.last_used[backend_key] = __import__("time").time()
-                target_url = f"http://localhost:{cfg['port']}/v1/chat/completions"
+                    cfg = backends[backend_key]
+                    target_url = f"http://localhost:{cfg['port']}/v1/chat/completions"
 
-                try:
-                    async with httpx.AsyncClient(timeout=config.proxy.timeout_sec) as client:
-                        async with client.stream("POST", target_url, json=data) as resp:
-                            async for chunk in resp.aiter_bytes():
-                                for line in chunk.decode("utf-8", errors="replace").splitlines():
-                                    line = line.strip()
-                                    if line.startswith("data:"):
-                                        data_str = line[5:].strip()
-                                        if data_str == "[DONE]":
-                                            await ws.send_json({"done": True})
-                                        else:
-                                            try:
-                                                await ws.send_json(json.loads(data_str))
-                                            except Exception:
-                                                pass
-                except Exception as e:
-                    await ws.send_json({"error": str(e)})
+                    try:
+                        async with manager.request_lease(backend_key):
+                            async with httpx.AsyncClient(timeout=config.proxy.timeout_sec) as client:
+                                async with client.stream("POST", target_url, json=data) as resp:
+                                    async for chunk in resp.aiter_bytes():
+                                        for line in chunk.decode("utf-8", errors="replace").splitlines():
+                                            line = line.strip()
+                                            if line.startswith("data:"):
+                                                data_str = line[5:].strip()
+                                                if data_str == "[DONE]":
+                                                    await ws.send_json({"done": True})
+                                                else:
+                                                    try:
+                                                        await ws.send_json(json.loads(data_str))
+                                                    except Exception:
+                                                        pass
+                    except Exception as e:
+                        await ws.send_json({"error": {"type": "stream_error", "message": str(e)}})
+                finally:
+                    proxy_module._semaphore.release()
 
         except WebSocketDisconnect:
             pass

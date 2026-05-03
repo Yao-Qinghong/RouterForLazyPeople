@@ -26,6 +26,21 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from router.config import AppConfig
 
+
+class InvalidRouteKey(Exception):
+    """Raised when ``[route:<key>]`` names a backend that is not registered.
+
+    Direct selection (``?backend=``, ``model_aliases``, ``[route:key]``) is
+    validated. The proxy maps this to a surface-specific 400 client error
+    rather than silently falling through to automatic classification — a
+    typo must not be allowed to land on a different backend.
+    """
+
+    def __init__(self, key: str, valid_backends: list[str]):
+        self.key = key
+        self.valid_backends = valid_backends
+        super().__init__(f"Unknown route key '{key}'")
+
 # ─────────────────────────────────────────────────────────────
 # Engine priority (lower number = preferred when no benchmark)
 # ─────────────────────────────────────────────────────────────
@@ -160,41 +175,74 @@ def _engine_score(key: str, backends: dict) -> tuple[float, int]:
     return (0.0, priority)
 
 
+def _filter_capable(
+    backends: dict,
+    keys: list[str],
+    signals: "RequestSignals | None",
+) -> list[str]:
+    """Apply hard capability filters in sequence (AND semantics).
+
+    A request that needs both ``tools`` and ``response_format=json_schema``
+    must land on a backend that declares **both** capabilities — applying
+    the filters with ``elif`` would let a tool-capable but schema-incapable
+    backend serve a combined request.
+
+    Returns the (possibly empty) intersection. ``[]`` means no candidate in
+    *keys* satisfies every required capability — callers fail closed by
+    returning ``""`` / ``[]`` from their public API so the proxy maps it to
+    the surface's no-backend error.
+    """
+    if not signals:
+        return keys
+
+    filtered = keys
+
+    if signals.has_tools:
+        filtered = [
+            k for k in filtered
+            if getattr(backends[k].get("capabilities"), "supports_tools", False)
+        ]
+        if not filtered:
+            return []
+
+    if signals.needs_json_schema:
+        filtered = [
+            k for k in filtered
+            if getattr(backends[k].get("capabilities"), "supports_json_schema", False)
+        ]
+        if not filtered:
+            return []
+
+    return filtered
+
+
 def _pick(backends: dict, preferred: str, signals: RequestSignals = None) -> str:
     """
     Return the best backend for the preferred tier.
 
     Selection order:
-      1. Filter by capability match (tools, JSON schema) if signals provided
-      2. Highest measured TG tok/s from benchmarks
-      3. Engine capability ranking (trt-llm > vllm > sglang > llama.cpp …)
-      4. Round-robin among backends with identical score (load balancing)
+      1. Direct backend-key match (caller named a registered backend key directly).
+      2. Filter to the preferred tier.
+      3. Capability filter (tools, JSON schema) — fail-closed if signals provided.
+      4. Highest measured TG tok/s from benchmarks.
+      5. Engine capability ranking (trt-llm > vllm > sglang > llama.cpp …).
+      6. Round-robin among backends with identical score (load balancing).
 
-    Falls back gracefully if the preferred tier has no backends.
+    Returns "" when the preferred tier or required capability cannot be
+    satisfied. Callers map "" to a deterministic service-unavailable error
+    rather than silently routing to a wrong-tier or incapable backend.
     """
+    # Direct key match preserves explicit ?backend=/alias/[route:key] semantics.
+    if preferred in backends:
+        return preferred
+
     tier_backends = _backends_for_tier(backends, preferred)
-
     if not tier_backends:
-        # Exact key match (e.g., user explicitly named a backend key)
-        if preferred in backends:
-            return preferred
-        # Last resort: use any registered backend
-        if backends:
-            return next(iter(backends))
-        return preferred  # caller returns 400
+        return ""
 
-    # Capability-aware filtering: prefer backends matching request needs
-    if signals and len(tier_backends) > 1:
-        if signals.has_tools:
-            capable = [k for k in tier_backends
-                       if getattr(backends[k].get("capabilities"), "supports_tools", False)]
-            if capable:
-                tier_backends = capable
-        elif signals.needs_json_schema:
-            capable = [k for k in tier_backends
-                       if getattr(backends[k].get("capabilities"), "supports_json_schema", False)]
-            if capable:
-                tier_backends = capable
+    tier_backends = _filter_capable(backends, tier_backends, signals)
+    if not tier_backends:
+        return ""
 
     if len(tier_backends) == 1:
         return tier_backends[0]
@@ -230,28 +278,25 @@ def select_candidates(
     *healthy_fn*, when provided, is called with a backend key and should
     return False for recently-failed backends.  Unhealthy backends are
     sorted to the end so they are only tried as a last resort.
-    """
-    tier_backends = _backends_for_tier(backends, preferred)
 
-    if not tier_backends:
-        if preferred in backends:
-            return [preferred]
-        if backends:
-            return list(backends.keys())[:limit]
+    Fail-closed semantics: returns ``[]`` when the preferred tier has no
+    backends or when a hard capability signal (tools / JSON schema) cannot
+    be satisfied by any tier backend. Callers map ``[]`` to a deterministic
+    service-unavailable error rather than silently routing to a wrong-tier
+    or incapable backend. A direct backend-key match (``preferred in
+    backends``) still wins so explicit ``?backend=``, model-alias, and
+    ``[route:key]`` selections continue to work.
+    """
+    if preferred in backends:
         return [preferred]
 
-    # Capability-aware filtering
-    if signals and len(tier_backends) > 1:
-        if signals.has_tools:
-            capable = [k for k in tier_backends
-                       if getattr(backends[k].get("capabilities"), "supports_tools", False)]
-            if capable:
-                tier_backends = capable
-        elif signals.needs_json_schema:
-            capable = [k for k in tier_backends
-                       if getattr(backends[k].get("capabilities"), "supports_json_schema", False)]
-            if capable:
-                tier_backends = capable
+    tier_backends = _backends_for_tier(backends, preferred)
+    if not tier_backends:
+        return []
+
+    tier_backends = _filter_capable(backends, tier_backends, signals)
+    if not tier_backends:
+        return []
 
     ranked = sorted(tier_backends, key=lambda k: _engine_score(k, backends))
 
@@ -268,19 +313,76 @@ def select_candidates(
 # Main classifier
 # ─────────────────────────────────────────────────────────────
 
+def _strip_route_prefix(text: str, backends: dict) -> "tuple[str, str | None]":
+    """Strip a leading ``[route:<key>]`` prefix from *text*.
+
+    Returns ``(stripped_text, key)`` when the prefix is present and the key
+    is a registered backend. Returns ``(text, None)`` when no prefix is
+    present. Raises :class:`InvalidRouteKey` when the prefix names an
+    unregistered backend so the caller can fail fast with a 400.
+    """
+    if not text.startswith("[route:") or "]" not in text:
+        return text, None
+    key = text.split("]", 1)[0].replace("[route:", "").strip()
+    if key in backends:
+        prefix_end = text.index("]") + 1
+        return text[prefix_end:].lstrip(), key
+    raise InvalidRouteKey(key, list(backends.keys()))
+
+
+def extract_route_key(payload: dict, backends: dict) -> "str | None":
+    """Scan a request payload for a ``[route:<key>]`` prefix.
+
+    Handles the three content shapes the router accepts:
+
+    * OpenAI ``messages[i].content`` as a string
+    * Anthropic ``messages[i].content`` as a list of ``{"type": "text", ...}`` blocks
+    * Gemini ``contents[i].parts[j].text``
+
+    On success the prefix is stripped from the original payload in place so
+    it does not leak to the backend, and the validated backend key is
+    returned. Raises :class:`InvalidRouteKey` when a prefix is present but
+    names an unregistered backend — proxies map this to a surface-specific
+    400 error rather than silently routing to a different backend.
+    """
+    for m in payload.get("messages", []):
+        c = m.get("content", "")
+        if isinstance(c, str):
+            stripped, key = _strip_route_prefix(c, backends)
+            if key is not None:
+                m["content"] = stripped
+                return key
+        elif isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and "text" in part:
+                    stripped, key = _strip_route_prefix(part.get("text", ""), backends)
+                    if key is not None:
+                        part["text"] = stripped
+                        return key
+
+    for content in payload.get("contents", []) or []:
+        if not isinstance(content, dict):
+            continue
+        for part in content.get("parts", []) or []:
+            if isinstance(part, dict) and "text" in part:
+                stripped, key = _strip_route_prefix(part.get("text", ""), backends)
+                if key is not None:
+                    part["text"] = stripped
+                    return key
+
+    return None
+
+
 def _classify_tier(payload: dict, backends: dict, config: "AppConfig"):
     """Determine tier and signals, returning (tier, signals, explicit_key_or_None)."""
     messages = payload.get("messages", [])
 
-    for m in messages:
-        c = m.get("content", "")
-        if isinstance(c, str) and c.startswith("[route:"):
-            key = c.split("]")[0].replace("[route:", "").strip()
-            if key in backends:
-                # Strip the route prefix so it doesn't leak to the backend
-                prefix_end = c.index("]") + 1
-                m["content"] = c[prefix_end:].lstrip()
-                return None, None, key
+    # Honor an inline `[route:<key>]` prefix. The helper raises
+    # :class:`InvalidRouteKey` for an unregistered key so the proxy can
+    # respond with a 400 — never silently fall through to tier classification.
+    route_key = extract_route_key(payload, backends)
+    if route_key is not None:
+        return None, None, route_key
 
     signals = _extract_signals(payload, config)
     tier = "fast"
@@ -325,8 +427,10 @@ def classify(payload: dict, backends: dict, config: "AppConfig") -> str:
     """
     Classify a request payload and return the single best backend key.
 
-    This is the original single-winner API.  For fallback support, use
-    ``classify_candidates()`` which returns an ordered list.
+    Returns ``""`` when no backend can satisfy the request's tier/capability
+    requirements. Callers map ``""`` to a deterministic service-unavailable
+    error rather than silently routing to a wrong-tier or incapable backend.
+    For ranked fallback support, use ``classify_candidates()``.
     """
     candidates = classify_candidates(payload, backends, config, limit=1)
-    return candidates[0] if candidates else next(iter(backends), "")
+    return candidates[0] if candidates else ""

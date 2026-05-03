@@ -4,6 +4,7 @@ import pytest
 from unittest.mock import MagicMock
 from router.config import BackendConfig
 from router.routing import (
+    InvalidRouteKey,
     classify,
     classify_candidates,
     select_candidates,
@@ -83,11 +84,22 @@ class TestClassify:
         # Verify the prefix is stripped from the message before forwarding
         assert payload["messages"][0]["content"] == "test message"
 
-    def test_explicit_route_unknown_key(self):
+    def test_explicit_route_unknown_key_raises(self):
+        """`[route:<typo>]` must fail fast, never fall through to the
+        classifier — direct selection is validated, like `?backend=`."""
         payload = {"messages": [{"content": "[route:nonexistent] test"}]}
-        result = classify(payload, BACKENDS_BASIC, _make_config())
-        # Falls through to default classification
-        assert result in BACKENDS_BASIC
+        with pytest.raises(InvalidRouteKey) as excinfo:
+            classify(payload, BACKENDS_BASIC, _make_config())
+        assert excinfo.value.key == "nonexistent"
+        assert set(excinfo.value.valid_backends) == set(BACKENDS_BASIC)
+        # The original prefix is preserved (not stripped) so error logs
+        # show what the caller actually sent.
+        assert payload["messages"][0]["content"].startswith("[route:nonexistent]")
+
+    def test_explicit_route_unknown_key_raises_from_classify_candidates(self):
+        payload = {"messages": [{"content": "[route:nope] test"}]}
+        with pytest.raises(InvalidRouteKey):
+            classify_candidates(payload, BACKENDS_BASIC, _make_config())
 
     def test_deep_keyword_is_soft_signal(self):
         """Deep keywords push fast→mid, but do NOT force deep alone."""
@@ -117,11 +129,20 @@ class TestClassify:
         result = classify(payload, BACKENDS_BASIC, _make_config())
         assert result == "mid"
 
-    def test_fallback_when_tier_missing(self):
+    def test_classify_returns_empty_when_tier_missing(self):
+        """A missing tier must surface as a deterministic empty result rather
+        than silently routing to the first registered backend (fail-closed)."""
         backends = {"only-backend": BackendConfig(tier="fast", port=8080)}
-        payload = {"messages": [{"content": "analyze this deeply"}]}
+        payload = {"messages": [{"content": "analyze this deeply"}]}  # routes to mid
         result = classify(payload, backends, _make_config())
-        # Should fall back to the only available backend
+        assert result == ""
+
+    def test_classify_direct_backend_key_match_still_works(self):
+        """Explicit [route:key] / ?backend= / alias targeting must keep working
+        even when the named key is in a different tier than the classifier."""
+        backends = {"only-backend": BackendConfig(tier="fast", port=8080)}
+        payload = {"messages": [{"content": "[route:only-backend] anything"}]}
+        result = classify(payload, backends, _make_config())
         assert result == "only-backend"
 
 
@@ -134,14 +155,19 @@ class TestPick:
     def test_single_backend(self):
         assert _pick(BACKENDS_BASIC, "fast") == "fast"
 
-    def test_fallback_to_first(self):
+    def test_no_tier_match_returns_empty(self):
+        """Fail-closed: no backend in tier means no candidate."""
         backends = {"only": BackendConfig(tier="mid", port=8080)}
         result = _pick(backends, "fast")
-        assert result == "only"
+        assert result == ""
 
-    def test_empty_backends(self):
-        result = _pick({}, "fast")
-        assert result == "fast"  # returns preferred, caller handles 400
+    def test_direct_key_match_overrides_missing_tier(self):
+        """If preferred is a registered backend key, return it directly."""
+        backends = {"only": BackendConfig(tier="mid", port=8080)}
+        assert _pick(backends, "only") == "only"
+
+    def test_empty_backends_returns_empty(self):
+        assert _pick({}, "fast") == ""
 
     def test_round_robin_multiple(self):
         backends = {
@@ -277,7 +303,9 @@ class TestCapabilityAwarePick:
         signals = RequestSignals(needs_json_schema=True)
         assert _pick(backends, "mid", signals) == "m2"
 
-    def test_no_capable_backends_falls_back_to_all(self):
+    def test_tools_with_no_capable_backend_returns_empty(self):
+        """Fail-closed: tool-calling requests must not silently route to a
+        backend that does not declare supports_tools."""
         from router.config import BackendCapabilities
         from router.routing import RequestSignals
         backends = {
@@ -287,19 +315,30 @@ class TestCapabilityAwarePick:
                                 capabilities=BackendCapabilities(supports_tools=False)),
         }
         signals = RequestSignals(has_tools=True)
-        result = _pick(backends, "deep", signals)
-        assert result in ("d1", "d2")
+        assert _pick(backends, "deep", signals) == ""
 
-    def test_plain_dict_backends_still_work(self):
-        """Backward compat: backends without capabilities field."""
+    def test_json_schema_with_no_capable_backend_returns_empty(self):
+        """Fail-closed: response_format=json_schema must not silently route to
+        a backend that does not declare supports_json_schema."""
+        from router.config import BackendCapabilities
+        from router.routing import RequestSignals
+        backends = {
+            "m1": BackendConfig(tier="mid", port=8080,
+                                capabilities=BackendCapabilities(supports_json_schema=False)),
+        }
+        signals = RequestSignals(needs_json_schema=True)
+        assert _pick(backends, "mid", signals) == ""
+
+    def test_plain_dict_backends_with_tools_signal_fail_closed(self):
+        """Backends without a capabilities object are treated as not capable —
+        fail-closed semantics still apply."""
         backends = {
             "a": {"tier": "deep", "port": 8080},
             "b": {"tier": "deep", "port": 8081},
         }
         from router.routing import RequestSignals
         signals = RequestSignals(has_tools=True)
-        result = _pick(backends, "deep", signals)
-        assert result in ("a", "b")
+        assert _pick(backends, "deep", signals) == ""
 
 
 # ── Candidate selection & fallback ──────────────────────────
@@ -340,14 +379,31 @@ class TestSelectCandidates:
         assert result[0] == "b"  # healthy first
         assert result[-1] == "a"  # unhealthy last
 
-    def test_fallback_to_any_tier(self):
-        """When preferred tier has no backends, fall back to available ones."""
+    def test_no_tier_match_returns_empty_list(self):
+        """Fail-closed: when the preferred tier has no backends, return []
+        rather than silently falling back to a different tier."""
         backends = {
             "only": BackendConfig(tier="mid", port=8080),
         }
-        result = select_candidates(backends, "fast")
-        # No "fast" tier backends, so falls back to any available
-        assert "only" in result
+        assert select_candidates(backends, "fast") == []
+
+    def test_direct_key_match_returns_single_candidate(self):
+        """Direct backend-key match keeps explicit selection working."""
+        backends = {
+            "only": BackendConfig(tier="mid", port=8080),
+        }
+        assert select_candidates(backends, "only") == ["only"]
+
+    def test_capability_mismatch_returns_empty_list(self):
+        """Fail-closed: tool-calling with no capable backend returns []."""
+        from router.config import BackendCapabilities
+        from router.routing import RequestSignals
+        backends = {
+            "d1": BackendConfig(tier="deep", port=8080,
+                                capabilities=BackendCapabilities(supports_tools=False)),
+        }
+        signals = RequestSignals(has_tools=True)
+        assert select_candidates(backends, "deep", signals) == []
 
 
 class TestClassifyCandidates:
@@ -373,3 +429,147 @@ class TestClassifyCandidates:
         result = classify(payload, BACKENDS_BASIC, config)
         assert isinstance(result, str)
         assert result in BACKENDS_BASIC
+
+    def test_classify_candidates_empty_when_capability_unmet(self):
+        """Tool-calling routes to deep, but if no deep backend supports
+        tools the candidate list is empty (fail-closed)."""
+        from router.config import BackendCapabilities
+        backends = {
+            "deep1": BackendConfig(tier="deep", port=8080,
+                                   capabilities=BackendCapabilities(supports_tools=False)),
+            "fast1": BackendConfig(tier="fast", port=8081,
+                                   capabilities=BackendCapabilities(supports_tools=True)),
+        }
+        payload = {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function"}],
+        }
+        # Even though fast1 supports tools, the request classifies to deep
+        # and must not silently downshift to a different tier.
+        assert classify_candidates(payload, backends, _make_config()) == []
+
+    def test_classify_candidates_empty_when_tier_missing(self):
+        """No backend in the classified tier and no direct key match → []."""
+        backends = {"a": BackendConfig(tier="mid", port=8080)}
+        payload = {"messages": [{"role": "user", "content": "hello"}]}  # → fast
+        assert classify_candidates(payload, backends, _make_config()) == []
+
+
+# ── Combined capability filter (tools AND json_schema) ──────
+
+class TestCombinedCapabilityFilter:
+    """Hard capability signals must AND together: a request that needs both
+    tools and JSON-schema must land on a backend that declares both. The
+    earlier `elif` form silently routed to a tools-only backend, which would
+    drop the structured-output requirement."""
+
+    def setup_method(self):
+        set_benchmark_results({})
+
+    def test_select_candidates_empty_when_no_backend_supports_both(self):
+        from router.config import BackendCapabilities
+        from router.routing import RequestSignals
+        backends = {
+            "tools-only": BackendConfig(
+                tier="deep", port=8080,
+                capabilities=BackendCapabilities(
+                    supports_tools=True, supports_json_schema=False)),
+            "schema-only": BackendConfig(
+                tier="deep", port=8081,
+                capabilities=BackendCapabilities(
+                    supports_tools=False, supports_json_schema=True)),
+        }
+        signals = RequestSignals(has_tools=True, needs_json_schema=True)
+        assert select_candidates(backends, "deep", signals) == []
+
+    def test_select_candidates_returns_only_both_capable(self):
+        from router.config import BackendCapabilities
+        from router.routing import RequestSignals
+        backends = {
+            "tools-only": BackendConfig(
+                tier="deep", port=8080,
+                capabilities=BackendCapabilities(
+                    supports_tools=True, supports_json_schema=False)),
+            "schema-only": BackendConfig(
+                tier="deep", port=8081,
+                capabilities=BackendCapabilities(
+                    supports_tools=False, supports_json_schema=True)),
+            "both": BackendConfig(
+                tier="deep", port=8082,
+                capabilities=BackendCapabilities(
+                    supports_tools=True, supports_json_schema=True)),
+        }
+        signals = RequestSignals(has_tools=True, needs_json_schema=True)
+        result = select_candidates(backends, "deep", signals)
+        assert result == ["both"]
+
+    def test_pick_returns_both_capable(self):
+        from router.config import BackendCapabilities
+        from router.routing import RequestSignals
+        backends = {
+            "tools-only": BackendConfig(
+                tier="deep", port=8080,
+                capabilities=BackendCapabilities(
+                    supports_tools=True, supports_json_schema=False)),
+            "both": BackendConfig(
+                tier="deep", port=8081,
+                capabilities=BackendCapabilities(
+                    supports_tools=True, supports_json_schema=True)),
+        }
+        signals = RequestSignals(has_tools=True, needs_json_schema=True)
+        assert _pick(backends, "deep", signals) == "both"
+
+    def test_pick_empty_when_none_supports_both(self):
+        from router.config import BackendCapabilities
+        from router.routing import RequestSignals
+        backends = {
+            "tools-only": BackendConfig(
+                tier="deep", port=8080,
+                capabilities=BackendCapabilities(
+                    supports_tools=True, supports_json_schema=False)),
+            "schema-only": BackendConfig(
+                tier="deep", port=8081,
+                capabilities=BackendCapabilities(
+                    supports_tools=False, supports_json_schema=True)),
+        }
+        signals = RequestSignals(has_tools=True, needs_json_schema=True)
+        assert _pick(backends, "deep", signals) == ""
+
+    def test_direct_key_bypasses_capability_filter(self):
+        """Direct backend selection (`?backend=`, alias, `[route:key]`) must
+        return the named backend even when it lacks declared capabilities —
+        operators opt in to that target intentionally."""
+        from router.config import BackendCapabilities
+        from router.routing import RequestSignals
+        backends = {
+            "named": BackendConfig(
+                tier="deep", port=8080,
+                capabilities=BackendCapabilities(
+                    supports_tools=False, supports_json_schema=False)),
+        }
+        signals = RequestSignals(has_tools=True, needs_json_schema=True)
+        # Direct selection: preferred IS a registered backend key.
+        assert _pick(backends, "named", signals) == "named"
+        assert select_candidates(backends, "named", signals) == ["named"]
+
+    def test_classify_candidates_empty_for_combined_signals_no_match(self):
+        """End-to-end: a payload with both `tools` and
+        `response_format={"type": "json_schema"}` returns [] when no deep
+        backend supports both, instead of silently dropping the schema
+        requirement on a tools-only backend."""
+        from router.config import BackendCapabilities
+        backends = {
+            "tools-only": BackendConfig(
+                tier="deep", port=8080,
+                capabilities=BackendCapabilities(
+                    supports_tools=True, supports_json_schema=False)),
+        }
+        payload = {
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function",
+                       "function": {"name": "noop", "parameters": {}}}],
+            "response_format": {"type": "json_schema",
+                                "json_schema": {"name": "x",
+                                                "schema": {"type": "object"}}},
+        }
+        assert classify_candidates(payload, backends, _make_config()) == []

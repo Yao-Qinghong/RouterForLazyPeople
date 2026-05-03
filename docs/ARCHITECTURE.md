@@ -127,11 +127,16 @@ Error shapes vary by route. There is no single normalized envelope today.
 
 | Condition | OpenAI | Anthropic | Gemini |
 |---|---|---|---|
-| No backend available | 503 | 503 | 400 |
+| Invalid `?backend=<key>` or `[route:<key>]` (typo / unregistered) | 400 `invalid_request_error` | 400 `invalid_request_error` | 400 `INVALID_ARGUMENT` |
+| No backend available (classifier-cannot-satisfy) | 503 | 503 | 400 |
 | Backend start timeout | 504 | 504 | 504 |
 | Semaphore queue timeout | 503 | 529 | 503 |
 | Backend 4xx (non-streaming) | forward as-is | forward as-is | forward as-is |
 | Backend error (streaming) | SSE error event in 200 | SSE error event in 200 | SSE error event in 200 |
+
+**Why two different error codes for "wrong backend":** `?backend=<typo>` is a permanent client mistake that retrying will not fix — returning 503 with `Retry-After` would mislead SDKs into looping on a typo. The classifier-cannot-satisfy 503/400 is reserved for the case where the caller did not name a backend and the server has no candidate in the matching tier, which can become satisfiable as backends are registered or started.
+
+**WebSocket bridge** (`/v1/chat/completions/ws`): error envelopes match the HTTP/OpenAI distinction but are delivered as in-band JSON messages instead of HTTP status codes (the connection stays open). A top-level `"backend": "<key>"` field in the WS payload is the analog of `?backend=` and is validated the same way — an unregistered key returns `{"error": {"type": "invalid_request_error", "param": "backend", ...}}`, while the classifier-cannot-satisfy case returns `{"error": {"type": "service_unavailable", ...}}`. `[route:<key>]` prefixes inside message content follow the same rules as on the HTTP surfaces.
 
 ---
 
@@ -175,24 +180,21 @@ External backends (`is_external=True`) skip `starting` and enter a `ready/unheal
 
 Selection runs in strict priority order. The first matching rule wins.
 
-1. `?backend=<key>` — resolves to the named backend. The backend is lazily started via `ensure_running()` if not already running. Returns 503 if start fails.
-2. `model_aliases` entry — alias resolves to a backend key, then treated as rule 1.
-3. `[route:key]` prefix in first message content — same rules as rule 1.
+1. `?backend=<key>` — resolves to the named backend. The backend is lazily started via `ensure_running()` if not already running. Returns 503 if start fails. If `<key>` is not a registered backend, the request fails fast with a 400 client error (`invalid_request_error` / `INVALID_ARGUMENT`); the router does **not** fall back to alias or classifier routing in this case, so a typo cannot silently land on a different backend.
+2. `model_aliases` entry — alias resolves to a backend key, then treated as rule 1. An unresolved `model` falls through to rule 4 (not an error) since model-name guesses are part of normal client behavior.
+3. `[route:<key>]` prefix in any message text — validated and stripped from the payload before forwarding so the prefix never leaks to the backend. If `<key>` is not a registered backend, the request fails fast with a 400 client error (`invalid_request_error` / `INVALID_ARGUMENT`); the router does **not** fall back to the heuristic mappers (Anthropic `model_to_backend`, Gemini `gemini_model_to_backend`) or to the classifier in that case. Recognized for OpenAI string content, Anthropic `{"type": "text"}` blocks, and Gemini `parts[].text`.
 4. Automatic classification:
     - a. Classify tier from payload (see Tier Classification below).
     - b. Select candidates: backends matching the classified tier, sorted by benchmark score then engine rank. Unhealthy backends are pushed to the end (not excluded). Capability filtering applies when multiple candidates exist.
-    - c. **Capability filter is fail-open:** If the payload requires tools or JSON schema and no backend in the tier declares support, the filter is skipped and all tier backends remain candidates. The request may route to an incapable backend and fail at the backend level. This is a known limitation.
-    - d. **No-tier fallback is fail-open:** If no backend exists in the classified tier, the code falls back to the first registered backend regardless of tier, capability, or health. This is a known limitation — a future version should return 503 instead.
+    - c. **Capability filter is fail-closed:** If the payload requires `tools` or `response_format=json_schema` and no backend in the classified tier declares the matching capability, `select_candidates()` returns `[]` and the proxy responds with the surface's no-backend error (see Error Responses below). The request is never silently routed to an incapable backend.
+    - d. **No-tier fallback is fail-closed:** If no backend exists in the classified tier and the request did not select a backend directly (`?backend=`, alias, `[route:key]`), `select_candidates()` returns `[]` and the proxy responds with the surface's no-backend error. The router does not silently downshift the request to a different tier.
     - e. For each candidate in order: call `ensure_running()` (lazy start). The first backend that starts successfully handles the request.
 
-**Capability filter detail (`select_candidates()` in `routing.py:221`):** When multiple candidates exist in the tier, payloads with `tools` narrow to backends where `capabilities.supports_tools == True`, and payloads with `response_format.type == "json_schema"` narrow to `capabilities.supports_json_schema == True`. If the narrowed list is empty, the filter result is discarded and all tier backends remain candidates. This is a preference, not a hard gate.
+**Capability filter detail (`select_candidates()` in `routing.py`):** Payloads with `tools` are restricted to tier backends where `capabilities.supports_tools == True`, and payloads with `response_format.type == "json_schema"` are restricted to `capabilities.supports_json_schema == True`. If no tier backend matches, the function returns `[]` and the proxy responds with the surface's no-backend error. This is a hard gate, not a preference.
 
-**Known fail-open risks:**
-- A tool-calling request can route to a small model that does not support tools. The backend will likely return malformed output, not a clean error.
-- A JSON-schema request can route to a model without grammar/schema support. The backend may return unstructured text.
-- When no tier match exists, the fallback ignores tier, capability, and health entirely.
+**Direct selection bypasses the tier/capability gate, but `?backend=` and `[route:key]` are still validated against the registry.** A direct selection that names a registered backend skips both tier and capability filtering — use it for workloads that intentionally target a backend outside the classifier's capability map. A direct selection that names an *unregistered* backend is a 400 client error (see Error Responses), not a fall-through to the classifier.
 
-These are accepted phase-1 limitations. Operators should ensure at least one capable backend exists per tier they expect to use, or use explicit `?backend=` routing for tool/schema workloads.
+**Operator guidance:** Ensure at least one capable backend exists per tier you expect to use for tool-calling or JSON-schema workloads, or wire those workloads to explicit `?backend=` / alias / `[route:key]` selection.
 
 **No automatic cloud fallback:** The router does not distinguish local vs remote backends at the routing level — there is no `local` field. Remote/external backends (e.g. OpenAI API keys) require explicit `?backend=` or `[route:key]` routing by design assumption, not by a code-enforced filter.
 
@@ -490,8 +492,6 @@ Tracked here so they are not buried in normative text. Each item is a decision t
 
 | # | Area | Question | Current behavior | Risk |
 |---|---|---|---|---|
-| 1 | Routing | Should no-tier fallback return 503 instead of routing to the first registered backend? | Falls back to first backend regardless of tier/capability/health | Silent misrouting to wrong-size or incapable model |
-| 2 | Routing | Should capability filter be fail-closed (503) when no capable backend exists? | Filter is skipped; request routes to incapable backend | Malformed tool/schema output instead of clean error |
 | 3 | Lifecycle | Should backend eviction drain in-flight requests before SIGTERM? | No drain; immediate SIGTERM | In-flight requests fail on backend swap |
 | 4 | Lifecycle | Should `mark_unhealthy()` exclude backends entirely instead of deprioritizing? | 60s deprioritization, still tried as last resort | Unhealthy backend serves requests during penalty window |
 | 5 | llama.cpp | Should the router set `--parallel` to match semaphore size? | Not set; llama-server defaults to 1 slot | Concurrent requests queue inside llama-server even when semaphore allows them |
