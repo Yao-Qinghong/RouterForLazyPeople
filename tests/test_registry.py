@@ -1,6 +1,9 @@
-"""Tests for router/registry.py — registry validation."""
+"""Tests for router/registry.py — registry validation and port-conflict avoidance."""
 
-from router.registry import RegistryValidation, validate_registry
+from types import SimpleNamespace
+
+from router import registry as reg
+from router.registry import RegistryValidation, build_backend_registry, validate_registry
 
 
 def _backend(engine="llama.cpp", model=None, model_dir=None, port=None):
@@ -190,3 +193,66 @@ class TestValidateRegistry:
         lines = report.summary_lines()
         assert any("stale" in line and "model path does not exist" in line for line in lines)
         assert any("8200" in line and "dup-a" in line and "dup-b" in line for line in lines)
+
+class TestBuildBackendRegistryPortCollisions:
+    def _config(self, tmp_path):
+        return SimpleNamespace(
+            engines_enabled=["llama.cpp"],
+            data_dir=tmp_path,
+            discovery=SimpleNamespace(port_start=8100, port_end=8200),
+        )
+
+    def test_discovered_port_colliding_with_manual_is_reassigned(
+        self, tmp_path, monkeypatch
+    ):
+        # Manual nemotron sits on 8101. Discovery would assign 8100, 8101,
+        # 8102 sequentially without knowing 8101 is taken — the gemma
+        # entry must get bumped to the next free port (8103) instead of
+        # silently colliding.
+        manual = {
+            "nemotron": {"engine": "llama.cpp", "port": 8101, "model": "/m/nemo.gguf"},
+        }
+        gguf = {
+            "first":  {"engine": "llama.cpp", "port": 8100, "model": "/m/a.gguf"},
+            "gemma":  {"engine": "llama.cpp", "port": 8101, "model": "/m/g.gguf"},
+            "third":  {"engine": "llama.cpp", "port": 8102, "model": "/m/c.gguf"},
+        }
+        monkeypatch.setattr(reg, "load_backends", lambda config: dict(manual))
+        monkeypatch.setattr(reg, "detect_running_servers", lambda config: {})
+        monkeypatch.setattr(reg, "discover_gguf_models", lambda config, c: gguf)
+        monkeypatch.setattr(reg, "discover_hf_models", lambda config, c: {})
+        monkeypatch.setattr(reg, "discover_trtllm_engines", lambda config, c: {})
+        monkeypatch.setattr(reg, "save_discovery_cache", lambda discovered, config: None)
+        monkeypatch.setattr(reg, "load_user_overrides", lambda config: {})
+
+        registry = build_backend_registry(self._config(tmp_path))
+
+        # No port appears twice across the merged registry.
+        ports = [v["port"] for v in registry.values() if isinstance(v, dict)]
+        assert len(ports) == len(set(ports)), f"duplicate ports: {ports}"
+        # Manual nemotron keeps 8101.
+        assert registry["nemotron"]["port"] == 8101
+        # The discovered "gemma" entry that originally collided with the
+        # manual port no longer does.
+        assert registry["gemma"]["port"] != 8101
+
+    def test_discovery_with_no_collision_keeps_assigned_ports(
+        self, tmp_path, monkeypatch
+    ):
+        manual = {"manual-a": {"engine": "llama.cpp", "port": 8500, "model": "/m/x.gguf"}}
+        gguf = {
+            "disc-1": {"engine": "llama.cpp", "port": 8100, "model": "/m/y.gguf"},
+            "disc-2": {"engine": "llama.cpp", "port": 8101, "model": "/m/z.gguf"},
+        }
+        monkeypatch.setattr(reg, "load_backends", lambda config: dict(manual))
+        monkeypatch.setattr(reg, "detect_running_servers", lambda config: {})
+        monkeypatch.setattr(reg, "discover_gguf_models", lambda config, c: gguf)
+        monkeypatch.setattr(reg, "discover_hf_models", lambda config, c: {})
+        monkeypatch.setattr(reg, "discover_trtllm_engines", lambda config, c: {})
+        monkeypatch.setattr(reg, "save_discovery_cache", lambda discovered, config: None)
+        monkeypatch.setattr(reg, "load_user_overrides", lambda config: {})
+
+        registry = build_backend_registry(self._config(tmp_path))
+        assert registry["disc-1"]["port"] == 8100
+        assert registry["disc-2"]["port"] == 8101
+        assert registry["manual-a"]["port"] == 8500

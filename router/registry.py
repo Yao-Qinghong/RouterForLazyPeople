@@ -97,6 +97,39 @@ def build_backend_registry(config: "AppConfig") -> dict:
     manual_paths = {v.get("model", "")     for v in registry.values()}
     manual_paths |= {v.get("model_dir", "") for v in registry.values()}
 
+    # Discovery numbers ports sequentially from port_start without knowing
+    # which ports manual or already-running backends have claimed. If a
+    # discovered backend lands on one of those, fast-forward it to the
+    # next free slot in the appropriate range; otherwise lifecycle starts
+    # would race two backends onto the same port.
+    reserved_ports: set[int] = set()
+    for v in registry.values():
+        p = v.get("port") if hasattr(v, "get") else getattr(v, "port", None)
+        if isinstance(p, int):
+            reserved_ports.add(p)
+
+    def _reassign_port(cfg: dict, counter: list[int], end: int) -> None:
+        p = cfg.get("port")
+        if not isinstance(p, int) or p not in reserved_ports:
+            if isinstance(p, int):
+                reserved_ports.add(p)
+            return
+        while counter[0] in reserved_ports and counter[0] <= end:
+            counter[0] += 1
+        if counter[0] > end:
+            return  # exhausted; validate_registry will surface the collision
+        cfg["port"] = counter[0]
+        reserved_ports.add(counter[0])
+        counter[0] += 1
+
+    main_end = config.discovery.port_end
+    for cfg in gguf.values():
+        _reassign_port(cfg, port_counter, main_end)
+    for cfg in hf.values():
+        _reassign_port(cfg, port_counter, main_end)
+    for cfg in trt.values():
+        _reassign_port(cfg, trt_port_counter, main_end)
+
     discovered_all = {**gguf, **hf, **trt}
     discovered_added = {}
 
