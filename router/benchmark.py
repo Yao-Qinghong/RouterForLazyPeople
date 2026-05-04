@@ -76,6 +76,7 @@ async def measure_backend(
     cfg: dict,
     config: "AppConfig",
     thinking_mode: str = "no_think",
+    backends: dict | None = None,
 ) -> dict:
     """
     Run PP and TG benchmarks against a single backend.
@@ -84,6 +85,10 @@ async def measure_backend(
     router) so results reflect raw model speed, not routing overhead.
 
     Returns a result dict. On failure, sets 'error' field.
+
+    ``backends`` is an optional pre-built registry; when provided, the
+    TG-timeout estimator reuses it instead of rebuilding the registry
+    on every call (which would re-emit per-backend warnings).
     """
     port  = cfg.get("port")
     engine = cfg.get("engine", "llama.cpp")
@@ -123,6 +128,7 @@ async def measure_backend(
     tg_timeout = _estimate_tg_timeout(
         cfg.get("size_gb"), config,
         fallback=config.benchmark.tg_timeout_sec,
+        backends=backends,
     )
     try:
         tg = await _run_tg(base, thinking_mode, timeout=tg_timeout)
@@ -190,6 +196,7 @@ def _estimate_tg_timeout(
     size_gb: float | None,
     config: "AppConfig",
     fallback: int = 300,
+    backends: dict | None = None,
 ) -> int:
     """Estimate a TG timeout using benchmarked models of similar size.
 
@@ -198,6 +205,10 @@ def _estimate_tg_timeout(
     generation time is multiplied by ``_TG_TIMEOUT_SAFETY`` so we don't
     cut it too close.  Returns the configured fallback when no prior
     data exists.
+
+    Pass ``backends`` (a pre-built registry) to avoid rebuilding it
+    inside ``_extract_size_from_result``; otherwise each call re-runs
+    discovery and re-emits stale-path warnings.
     """
     if size_gb is None or size_gb <= 0:
         return fallback
@@ -210,7 +221,7 @@ def _estimate_tg_timeout(
         if tg and tg > 0:
             # Look up this backend's size from the description or
             # from the config registry; fall back to skipping.
-            ref_size = _extract_size_from_result(r, config)
+            ref_size = _extract_size_from_result(r, config, backends=backends)
             if ref_size and ref_size > 0:
                 refs.append((ref_size, tg))
 
@@ -237,15 +248,24 @@ def _estimate_tg_timeout(
     return timeout
 
 
-def _extract_size_from_result(result: dict, config: "AppConfig") -> float | None:
-    """Get the model size_gb for a benchmark result by looking up the backend registry."""
+def _extract_size_from_result(
+    result: dict,
+    config: "AppConfig",
+    backends: dict | None = None,
+) -> float | None:
+    """Get the model size_gb for a benchmark result by looking up the backend registry.
+
+    When ``backends`` is provided we reuse it instead of rebuilding the
+    registry — rebuilding re-runs discovery (and re-emits warnings about
+    stale manual paths) every time the bench loop asks for a size.
+    """
     key = result.get("backend_key")
     if not key:
         return None
-    # Try the live backend registry via config's backends file
     try:
-        from router.registry import build_backend_registry
-        backends = build_backend_registry(config)
+        if backends is None:
+            from router.registry import build_backend_registry
+            backends = build_backend_registry(config)
         cfg = backends.get(key, {})
         if isinstance(cfg, dict):
             return cfg.get("size_gb")

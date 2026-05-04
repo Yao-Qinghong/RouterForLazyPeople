@@ -964,13 +964,34 @@ def cmd_bench(args):
         _print_no_running_bench_help(backends)
         return
 
+    # Validate the merged registry once. This catches the cases that
+    # `load_backends` cannot see post-merge — stale manual model paths
+    # surfaced via discovery and ports reused across manual/discovered
+    # entries — so we can warn once and skip them, instead of hitting
+    # them per backend later in the bench loop.
+    sys.path.insert(0, str(PROJECT_DIR))
+    from router.registry import validate_registry
+    report = validate_registry(backends)
+    if report.has_issues:
+        print("Pre-flight registry validation found issues:")
+        for line in report.summary_lines():
+            print(line)
+        print("These backends will be skipped for this run. Fix config/backends.yaml to clear them.\n")
+
     # Skip external servers (LM Studio, Ollama managed externally)
     skippable = {"openai", "ollama"}
-    runnable  = [k for k in targets if backends[k].get("engine") not in skippable]
+    runnable  = [
+        k for k in targets
+        if backends[k].get("engine") not in skippable
+        and k not in report.invalid_keys
+    ]
     skipped   = [k for k in targets if backends[k].get("engine") in skippable]
+    invalid_targets = [k for k in targets if k in report.invalid_keys]
 
     if skipped:
         print(f"Skipping external servers (not managed by router): {', '.join(skipped)}")
+    if invalid_targets:
+        print(f"Skipping invalid backends: {', '.join(invalid_targets)}")
 
     if not runnable:
         print("No benchmarkable backends found.")
@@ -1053,7 +1074,11 @@ def cmd_bench(args):
                     print("      start... already running  ", end="", flush=True)
 
                 print("benchmark...", end=" ", flush=True)
-                r = await measure_backend(key, cfg, config, thinking_mode=thinking_mode)
+                r = await measure_backend(
+                    key, cfg, config,
+                    thinking_mode=thinking_mode,
+                    backends=backends,
+                )
                 save_result(r, config)
                 saved_count += 1
                 results.append(r)

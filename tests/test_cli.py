@@ -370,6 +370,100 @@ class TestUpdateAndSysinfo:
         assert ["git", "checkout", "--quiet", "oldsha"] in run_calls
         assert llama_bin.read_text() == "old-binary"
 
+    def test_bench_skips_invalid_backends_and_prints_summary(self, monkeypatch, tmp_path, capsys):
+        # Two backends:
+        #  - "stale": manual entry whose model file no longer exists on disk.
+        #    Should be detected by validate_registry and skipped before we
+        #    try to start it.
+        #  - "ok": valid backend; should still run.
+        real_model = tmp_path / "ok.gguf"
+        real_model.write_bytes(b"")
+        backends = {
+            "stale": {
+                "engine": "llama.cpp",
+                "tier": "deep",
+                "port": 8101,
+                "model": str(tmp_path / "missing.gguf"),
+                "log": "/tmp/stale.log",
+            },
+            "ok": {
+                "engine": "llama.cpp",
+                "tier": "fast",
+                "port": 8102,
+                "model": str(real_model),
+                "log": "/tmp/ok.log",
+            },
+        }
+        status = {
+            "stale": {"running": True, "log": "/tmp/stale.log"},
+            "ok": {"running": True, "log": "/tmp/ok.log"},
+        }
+
+        class FakeResponse:
+            def __init__(self, payload):
+                self._payload = payload
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(self._payload).encode()
+
+        class FakePostResponse:
+            def read(self):
+                return b"{}"
+
+        called_for = []
+
+        async def fake_measure_backend(key, cfg, config, thinking_mode="no_think", backends=None):
+            called_for.append(key)
+            return {
+                "backend_key": key,
+                "thinking_mode": thinking_mode,
+                "engine": cfg["engine"],
+                "tier_assigned": cfg["tier"],
+                "tg_tok_s": 42.0,
+                "pp_tok_s": 300.0,
+                "ttft_ms": 500.0,
+                "validated": True,
+            }
+
+        monkeypatch.setattr(
+            "urllib.request.urlopen",
+            lambda url, timeout=5: FakeResponse(backends),
+        )
+        monkeypatch.setattr(cli, "_fetch_router_status", lambda: status)
+        monkeypatch.setattr("router.benchmark.measure_backend", fake_measure_backend)
+        monkeypatch.setattr("router.benchmark.save_result", lambda result, config: None)
+        monkeypatch.setattr("router.benchmark.format_results", lambda results: "formatted")
+        monkeypatch.setattr("router.config.load_config", lambda: SimpleNamespace())
+        monkeypatch.setattr(cli, "_post_router", lambda path, timeout=30: FakePostResponse())
+
+        cli.cmd_bench(
+            argparse.Namespace(
+                results=False,
+                all=True,
+                backend=None,
+                start_stopped=True,
+                keep_running=True,
+                thinking=False,
+                default_thinking=False,
+                list=False,
+            )
+        )
+
+        out = capsys.readouterr().out
+        # Validation summary surfaced once
+        assert "Pre-flight registry validation found issues" in out
+        assert "stale" in out
+        assert "model path does not exist" in out
+        # And the stale backend was actually skipped
+        assert "Skipping invalid backends" in out
+        assert called_for == ["ok"]
+
     def test_bench_treats_trtllm_docker_as_managed_backend(self, monkeypatch, capsys):
         backends = {
             "docker-trt": {
@@ -399,7 +493,7 @@ class TestUpdateAndSysinfo:
             def read(self):
                 return b"{}"
 
-        async def fake_measure_backend(key, cfg, config, thinking_mode="no_think"):
+        async def fake_measure_backend(key, cfg, config, thinking_mode="no_think", backends=None):
             return {
                 "backend_key": key,
                 "thinking_mode": thinking_mode,
