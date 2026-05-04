@@ -154,6 +154,32 @@ class TestValidateRegistry:
         assert 8300 in report.port_conflicts
         assert report.invalid_keys == {"a", "b"}
 
+    def test_trimmed_registry_view_without_paths_is_not_flagged(self):
+        # The `/backends` HTTP endpoint exposes a trimmed view that may
+        # have `model: null` (or omit it entirely) for valid backends.
+        # validate_registry must not treat that as a stale-path failure.
+        backends = {
+            "llama-no-path": {
+                "engine": "llama.cpp",
+                "port": 8400,
+                # no `model` key at all
+            },
+            "llama-null-path": {
+                "engine": "llama.cpp",
+                "port": 8401,
+                "model": None,
+                "model_dir": None,
+            },
+            "vllm-id-only": {
+                "engine": "vllm",
+                "port": 8402,
+                "model": None,
+            },
+        }
+        report = validate_registry(backends)
+        assert not report.has_issues
+        assert report.invalid_keys == set()
+
     def test_summary_lines_format(self, tmp_path):
         backends = {
             "stale": _backend(model=str(tmp_path / "nope.gguf"), port=8100),

@@ -408,6 +408,8 @@ def create_app(settings_path: Path | None = None) -> FastAPI:
                 "engine":          v.get("engine", "llama.cpp"),
                 "description":     v.get("description", k),
                 "port":            v["port"],
+                "model":           v.get("model"),
+                "model_dir":       v.get("model_dir"),
                 "auto_discovered": v.get("auto_discovered", False),
                 "tier":            v.get("tier"),
                 "size_gb":         v.get("size_gb"),

@@ -233,12 +233,11 @@ def validate_registry(backends: dict) -> RegistryValidation:
                 path_to_check = model_str
 
         if path_to_check is None:
-            # Either no path at all, or an HF model ID that we cannot verify
-            # locally. llama.cpp must have a local path; HF-style engines are
-            # allowed to use IDs.
-            if engine in _ALWAYS_LOCAL_PATH_ENGINES and not (model or model_dir):
-                report.missing_paths.append((slug, ""))
-                report.invalid_keys.add(slug)
+            # Nothing concrete to verify on disk: either an HF model ID
+            # (legitimate for vLLM/SGLang/HF) or a registry view that
+            # does not expose path fields (e.g. the trimmed `/backends`
+            # HTTP response). `load_backends()` already raises on truly
+            # missing manual paths, so we don't re-validate here.
             continue
 
         if not os.path.exists(os.path.expanduser(path_to_check)):
